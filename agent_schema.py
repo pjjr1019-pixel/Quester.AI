@@ -93,13 +93,26 @@ def planner_output_schema() -> dict[str, Any]:
 def reasoner_output_schema() -> dict[str, Any]:
     return _object_schema(
         title="compressed_trace_v1",
-        required=("task_id", "tokens", "confidence"),
+        required=(
+            "task_id",
+            "tokens",
+            "expanded_preview",
+            "confidence",
+            "ir_version",
+            "operation_stream",
+            "decode_hints",
+        ),
         properties={
             "task_id": {"type": "string"},
             "tokens": {"type": "array", "items": {"type": "string"}},
             "expanded_preview": {"type": "array", "items": {"type": "string"}},
+            "macros_used": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "number"},
+            "ir_version": {"type": "string"},
             "operation_stream": {"type": "array", "items": {"type": "object"}},
+            "symbol_table_refs": {"type": "array", "items": {"type": "string"}},
+            "context_frames": {"type": "array", "items": {"type": "object"}},
+            "candidate_traces": {"type": "array", "items": {"type": "object"}},
             "decode_hints": {"type": "array", "items": {"type": "object"}},
             "proof_hash": {"type": "string"},
         },
@@ -118,6 +131,15 @@ def critic_output_schema() -> dict[str, Any]:
             "evidence_coverage": {"type": "number"},
             "critic_notes": {"type": "string"},
             "result": {"type": "string"},
+            "verifier_type": {"type": "string"},
+            "proof_hash_match": {"type": "boolean"},
+            "candidate_score": {"type": "number"},
+            "repair_actions": {"type": "array", "items": {"type": "string"}},
+            "degraded_reason": {"type": "string"},
+            "failure_categories": {"type": "array", "items": {"type": "string"}},
+            "provenance_coverage": {"type": "number"},
+            "macro_violations": {"type": "array", "items": {"type": "string"}},
+            "drift_score": {"type": "number"},
         },
     )
 

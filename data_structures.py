@@ -435,6 +435,144 @@ class PerformanceMetric(DictSerializable):
 
 
 @dataclass(slots=True, frozen=True)
+class OptimizerReplaySample(DictSerializable):
+    """Optimizer-facing summary of one completed foreground task."""
+
+    task_id: str
+    trace_proof_hash: str
+    selected_candidate_id: str = ""
+    candidate_ids: tuple[str, ...] = ()
+    candidate_trace_count: int = 0
+    selected_strategy: str = ""
+    selected_verifier: str = ""
+    selected_candidate_score: float = 0.0
+    selected_agreement_score: float = 0.0
+    selected_evidence_support_score: float = 0.0
+    provenance_coverage: float = 1.0
+    evidence_coverage: float = 1.0
+    final_adjudication: CritiqueResult = CritiqueResult.VALID
+    is_valid: bool = False
+    proof_hash_match: bool = True
+    failure_categories: tuple[str, ...] = ()
+    suggested_repair_actions: tuple[str, ...] = ()
+    applied_repair_actions: tuple[str, ...] = ()
+    answer_text: str = ""
+    latency_s: float = 0.0
+    vram_usage_gb: float = 0.0
+    iterations: int = 0
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.task_id.strip()), "OptimizerReplaySample.task_id must not be empty.")
+        _require(
+            0.0 <= self.selected_candidate_score <= 1.0,
+            "OptimizerReplaySample.selected_candidate_score must be between 0 and 1.",
+        )
+        _require(
+            0.0 <= self.selected_agreement_score <= 1.0,
+            "OptimizerReplaySample.selected_agreement_score must be between 0 and 1.",
+        )
+        _require(
+            0.0 <= self.selected_evidence_support_score <= 1.0,
+            "OptimizerReplaySample.selected_evidence_support_score must be between 0 and 1.",
+        )
+        _require(
+            0.0 <= self.provenance_coverage <= 1.0,
+            "OptimizerReplaySample.provenance_coverage must be between 0 and 1.",
+        )
+        _require(
+            0.0 <= self.evidence_coverage <= 1.0,
+            "OptimizerReplaySample.evidence_coverage must be between 0 and 1.",
+        )
+        _require(self.candidate_trace_count >= 0, "OptimizerReplaySample.candidate_trace_count must be >= 0.")
+        _require(self.latency_s >= 0.0, "OptimizerReplaySample.latency_s must be >= 0.")
+        _require(self.vram_usage_gb >= 0.0, "OptimizerReplaySample.vram_usage_gb must be >= 0.")
+        _require(self.iterations >= 0, "OptimizerReplaySample.iterations must be >= 0.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OptimizerReplaySample:
+        return cls(
+            task_id=str(data["task_id"]),
+            trace_proof_hash=str(data.get("trace_proof_hash", "")),
+            selected_candidate_id=str(data.get("selected_candidate_id", "")),
+            candidate_ids=tuple(str(item) for item in data.get("candidate_ids", [])),
+            candidate_trace_count=int(data.get("candidate_trace_count", 0)),
+            selected_strategy=str(data.get("selected_strategy", "")),
+            selected_verifier=str(data.get("selected_verifier", "")),
+            selected_candidate_score=float(data.get("selected_candidate_score", 0.0)),
+            selected_agreement_score=float(data.get("selected_agreement_score", 0.0)),
+            selected_evidence_support_score=float(data.get("selected_evidence_support_score", 0.0)),
+            provenance_coverage=float(data.get("provenance_coverage", 1.0)),
+            evidence_coverage=float(data.get("evidence_coverage", 1.0)),
+            final_adjudication=_parse_enum(CritiqueResult, data.get("final_adjudication", CritiqueResult.VALID)),
+            is_valid=bool(data.get("is_valid", False)),
+            proof_hash_match=bool(data.get("proof_hash_match", True)),
+            failure_categories=tuple(str(item) for item in data.get("failure_categories", [])),
+            suggested_repair_actions=tuple(str(item) for item in data.get("suggested_repair_actions", [])),
+            applied_repair_actions=tuple(str(item) for item in data.get("applied_repair_actions", [])),
+            answer_text=str(data.get("answer_text", "")),
+            latency_s=float(data.get("latency_s", 0.0)),
+            vram_usage_gb=float(data.get("vram_usage_gb", 0.0)),
+            iterations=int(data.get("iterations", 0)),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class OptimizerReplayEvaluation(DictSerializable):
+    """Offline replay evaluation for one proposal against one persisted sample."""
+
+    proposal_id: str
+    task_id: str
+    trace_proof_hash: str
+    compression_gain: float
+    proof_hash_stability: float
+    critique_validity: float
+    latency_ratio: float
+    memory_ratio: float
+    aggregate_score: float
+    accepted: bool
+    rejection_reason: str = ""
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.proposal_id.strip()), "OptimizerReplayEvaluation.proposal_id must not be empty.")
+        _require(bool(self.task_id.strip()), "OptimizerReplayEvaluation.task_id must not be empty.")
+        _require(0.0 <= self.compression_gain <= 1.0, "OptimizerReplayEvaluation.compression_gain must be between 0 and 1.")
+        _require(
+            0.0 <= self.proof_hash_stability <= 1.0,
+            "OptimizerReplayEvaluation.proof_hash_stability must be between 0 and 1.",
+        )
+        _require(
+            0.0 <= self.critique_validity <= 1.0,
+            "OptimizerReplayEvaluation.critique_validity must be between 0 and 1.",
+        )
+        _require(self.latency_ratio >= 0.0, "OptimizerReplayEvaluation.latency_ratio must be >= 0.")
+        _require(self.memory_ratio >= 0.0, "OptimizerReplayEvaluation.memory_ratio must be >= 0.")
+        _require(
+            0.0 <= self.aggregate_score <= 1.0,
+            "OptimizerReplayEvaluation.aggregate_score must be between 0 and 1.",
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OptimizerReplayEvaluation:
+        return cls(
+            proposal_id=str(data["proposal_id"]),
+            task_id=str(data["task_id"]),
+            trace_proof_hash=str(data.get("trace_proof_hash", "")),
+            compression_gain=float(data.get("compression_gain", 0.0)),
+            proof_hash_stability=float(data.get("proof_hash_stability", 0.0)),
+            critique_validity=float(data.get("critique_validity", 0.0)),
+            latency_ratio=float(data.get("latency_ratio", 0.0)),
+            memory_ratio=float(data.get("memory_ratio", 0.0)),
+            aggregate_score=float(data.get("aggregate_score", 0.0)),
+            accepted=bool(data.get("accepted", False)),
+            rejection_reason=str(data.get("rejection_reason", "")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class EvidenceItem(DictSerializable):
     """Single evidence object retrieved from local/web sources."""
 
@@ -853,6 +991,65 @@ class CanonicalReasoningGraph(DictSerializable):
 
 
 @dataclass(slots=True, frozen=True)
+class CandidateTrace(DictSerializable):
+    """One bounded deep-mode candidate kept in canonical IR form."""
+
+    candidate_id: str
+    answer_text: str
+    strategy: str
+    verifier_type: str = ""
+    verified: bool = False
+    total_score: float = 0.0
+    agreement_score: float = 0.0
+    evidence_support_score: float = 0.0
+    proof_hash_stability: float = 1.0
+    degraded_reason: str = ""
+    supporting_evidence_ids: tuple[str, ...] = ()
+    tokens: tuple[str, ...] = ()
+    expanded_preview: tuple[str, ...] = ()
+    operation_stream: tuple[OperationStep, ...] = ()
+    decode_hints: tuple[DecodeHint, ...] = ()
+    proof_hash: str = ""
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.candidate_id.strip()), "CandidateTrace.candidate_id must not be empty.")
+        _require(bool(self.answer_text.strip()), "CandidateTrace.answer_text must not be empty.")
+        _require(0.0 <= self.total_score <= 1.0, "CandidateTrace.total_score must be between 0 and 1.")
+        _require(0.0 <= self.agreement_score <= 1.0, "CandidateTrace.agreement_score must be between 0 and 1.")
+        _require(
+            0.0 <= self.evidence_support_score <= 1.0,
+            "CandidateTrace.evidence_support_score must be between 0 and 1.",
+        )
+        _require(
+            0.0 <= self.proof_hash_stability <= 1.0,
+            "CandidateTrace.proof_hash_stability must be between 0 and 1.",
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CandidateTrace:
+        return cls(
+            candidate_id=str(data["candidate_id"]),
+            answer_text=str(data["answer_text"]),
+            strategy=str(data.get("strategy", "")),
+            verifier_type=str(data.get("verifier_type", "")),
+            verified=bool(data.get("verified", False)),
+            total_score=float(data.get("total_score", 0.0)),
+            agreement_score=float(data.get("agreement_score", 0.0)),
+            evidence_support_score=float(data.get("evidence_support_score", 0.0)),
+            proof_hash_stability=float(data.get("proof_hash_stability", 1.0)),
+            degraded_reason=str(data.get("degraded_reason", "")),
+            supporting_evidence_ids=tuple(str(item) for item in data.get("supporting_evidence_ids", [])),
+            tokens=tuple(str(item) for item in data.get("tokens", [])),
+            expanded_preview=tuple(str(item) for item in data.get("expanded_preview", [])),
+            operation_stream=tuple(OperationStep.from_dict(item) for item in data.get("operation_stream", [])),
+            decode_hints=tuple(DecodeHint.from_dict(item) for item in data.get("decode_hints", [])),
+            proof_hash=str(data.get("proof_hash", "")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class CompressedTrace(DictSerializable):
     """Compressed reasoning chain used by critic and compressor."""
 
@@ -869,6 +1066,7 @@ class CompressedTrace(DictSerializable):
     symbol_table_refs: tuple[str, ...] = ()
     evidence_handles: tuple[str, ...] = ()
     context_frames: tuple[ContextFrame, ...] = ()
+    candidate_traces: tuple[CandidateTrace, ...] = ()
     proof_hash: str = ""
     decode_hints: tuple[DecodeHint, ...] = ()
     created_at: datetime = field(default_factory=utc_now)
@@ -892,6 +1090,7 @@ class CompressedTrace(DictSerializable):
                 "symbol_table_refs",
                 "evidence_handles",
                 "context_frames",
+                "candidate_traces",
                 "proof_hash",
                 "decode_hints",
             ),
@@ -943,6 +1142,9 @@ class CompressedTrace(DictSerializable):
         context_frames = tuple(
             ContextFrame.from_dict(item) for item in data.get("context_frames", [])
         )
+        candidate_traces = tuple(
+            CandidateTrace.from_dict(item) for item in data.get("candidate_traces", [])
+        )
         decode_hints = tuple(DecodeHint.from_dict(item) for item in data.get("decode_hints", []))
         created_at = _parse_datetime(data.get("created_at", utc_now()))
         symbol_table_refs = tuple(str(item) for item in data.get("symbol_table_refs", []))
@@ -961,6 +1163,7 @@ class CompressedTrace(DictSerializable):
             operation_stream = _restore_reasoner_stub_operation_stream(
                 operation_stream=operation_stream,
                 evidence_handles=evidence_handles,
+                context_frames=context_frames,
             )
         expanded_preview = tuple(str(item) for item in data.get("expanded_preview", []))
         if not expanded_preview and canonical_graph_builder:
@@ -1008,6 +1211,7 @@ class CompressedTrace(DictSerializable):
             symbol_table_refs=symbol_table_refs,
             evidence_handles=evidence_handles,
             context_frames=context_frames,
+            candidate_traces=candidate_traces,
             proof_hash=str(data.get("proof_hash", "")),
             decode_hints=decode_hints,
             created_at=created_at,
@@ -1237,11 +1441,28 @@ def _derive_decode_hints(
     operation_stream: tuple[OperationStep, ...],
 ) -> tuple[DecodeHint, ...]:
     if builder == "reasoner_stub_v1":
+        emit_step = next((step for step in reversed(operation_stream) if step.opcode == "emit"), None)
+        metadata = {}
+        if emit_step is not None:
+            for key in (
+                "candidate_id",
+                "answer_text",
+                "selected_strategy",
+                "selected_verifier",
+                "candidate_score",
+                "verified",
+                "degraded_reason",
+                "candidate_count",
+                "supporting_evidence_ids",
+            ):
+                if key in emit_step.metadata:
+                    metadata[key] = emit_step.metadata[key]
         return (
             DecodeHint(
                 hint_id="d0",
                 template="verified_answer",
                 entity_ids=("a",),
+                metadata=metadata,
             ),
         )
     if builder == "macro_engine_v1":
@@ -1290,12 +1511,80 @@ def _restore_reasoner_stub_operation_stream(
     *,
     operation_stream: tuple[OperationStep, ...],
     evidence_handles: tuple[str, ...],
+    context_frames: tuple[ContextFrame, ...],
 ) -> tuple[OperationStep, ...]:
+    context_metadata = dict(context_frames[0].metadata) if context_frames else {}
+    selected_candidate_id = str(context_metadata.get("cid", "")).strip()
+    selected_answer = str(context_metadata.get("ta", "")).strip()
+    selected_strategy = str(context_metadata.get("sa", "")).strip()
+    selected_verifier = str(context_metadata.get("sv", "")).strip()
+    degraded_reason = str(context_metadata.get("dr", "")).strip()
+    supporting_evidence_ids = tuple(
+        str(item) for item in context_metadata.get("si", ()) if str(item).strip()
+    )
+    try:
+        candidate_score = float(context_metadata.get("ss", 0.0))
+    except (TypeError, ValueError):
+        candidate_score = 0.0
+    try:
+        candidate_count = max(1, int(context_metadata.get("cc", 1)))
+    except (TypeError, ValueError):
+        candidate_count = 1
+    verified = bool(context_metadata.get("vv", False))
     restored: list[OperationStep] = []
     for index, step in enumerate(operation_stream):
         metadata = dict(step.metadata)
         if "source_token" not in metadata:
-            metadata["source_token"] = "@match_local_evidence" if index == 0 else "@compose_answer"
+            if step.opcode == "lookup":
+                metadata["source_token"] = "@match_local_evidence"
+            elif step.opcode == "compare":
+                metadata["source_token"] = "@compare_candidates"
+            elif step.opcode in {"infer", "check"}:
+                metadata["source_token"] = "@select_verified_candidate"
+            else:
+                metadata["source_token"] = "@compose_answer"
+        if step.opcode == "bind":
+            if selected_candidate_id and "candidate_id" not in metadata:
+                metadata["candidate_id"] = selected_candidate_id
+            if selected_strategy and "selected_strategy" not in metadata:
+                metadata["selected_strategy"] = selected_strategy
+            if selected_verifier and "selected_verifier" not in metadata:
+                metadata["selected_verifier"] = selected_verifier
+            if "candidate_score" not in metadata:
+                metadata["candidate_score"] = candidate_score
+            if "verified" not in metadata:
+                metadata["verified"] = verified
+        if step.opcode == "check":
+            if selected_candidate_id and "candidate_id" not in metadata:
+                metadata["candidate_id"] = selected_candidate_id
+            if selected_verifier and "tool_check" not in metadata:
+                metadata["tool_check"] = selected_verifier
+            if "candidate_count" not in metadata:
+                metadata["candidate_count"] = candidate_count
+        if step.opcode == "cite":
+            if "evidence_count" not in metadata:
+                metadata["evidence_count"] = len(evidence_handles)
+        if step.opcode == "confidence_update" and "confidence" not in metadata and context_frames:
+            metadata["confidence"] = round(context_frames[0].confidence, 2)
+        if step.opcode == "emit":
+            if selected_candidate_id and "candidate_id" not in metadata:
+                metadata["candidate_id"] = selected_candidate_id
+            if selected_answer and "answer_text" not in metadata:
+                metadata["answer_text"] = selected_answer
+            if selected_strategy and "selected_strategy" not in metadata:
+                metadata["selected_strategy"] = selected_strategy
+            if selected_verifier and "selected_verifier" not in metadata:
+                metadata["selected_verifier"] = selected_verifier
+            if "candidate_score" not in metadata:
+                metadata["candidate_score"] = candidate_score
+            if "verified" not in metadata:
+                metadata["verified"] = verified
+            if degraded_reason and "degraded_reason" not in metadata:
+                metadata["degraded_reason"] = degraded_reason
+            if "candidate_count" not in metadata:
+                metadata["candidate_count"] = candidate_count
+            if supporting_evidence_ids and "supporting_evidence_ids" not in metadata:
+                metadata["supporting_evidence_ids"] = list(supporting_evidence_ids)
         restored.append(
             OperationStep(
                 op_id=step.op_id,
@@ -1427,6 +1716,45 @@ def _rebuild_reasoner_stub_graph(
     created_at: datetime,
 ) -> CanonicalReasoningGraph:
     context_metadata = dict(context_frames[0].metadata) if context_frames else {}
+    emit_step = next((step for step in reversed(operation_stream) if step.opcode == "emit"), None)
+    bind_step = next((step for step in operation_stream if step.opcode == "bind"), None)
+    selected_answer = ""
+    selected_strategy = ""
+    selected_verifier = ""
+    degraded_reason = ""
+    selected_verified = False
+    candidate_score = 0.0
+    candidate_count = 1
+    if emit_step is not None:
+        selected_answer = str(emit_step.metadata.get("answer_text", "")).strip()
+        selected_strategy = str(emit_step.metadata.get("selected_strategy", "")).strip()
+        selected_verifier = str(emit_step.metadata.get("selected_verifier", "")).strip()
+        degraded_reason = str(emit_step.metadata.get("degraded_reason", "")).strip()
+        selected_verified = bool(emit_step.metadata.get("verified", False))
+        try:
+            candidate_score = float(emit_step.metadata.get("candidate_score", 0.0))
+        except (TypeError, ValueError):
+            candidate_score = 0.0
+        raw_candidate_count = emit_step.metadata.get("candidate_count", context_metadata.get("cc", 1))
+        try:
+            candidate_count = max(1, int(raw_candidate_count))
+        except (TypeError, ValueError):
+            candidate_count = 1
+    if not selected_answer:
+        selected_answer = str(context_metadata.get("ta", "")).strip()
+    if not selected_strategy:
+        selected_strategy = str(context_metadata.get("sa", "")).strip()
+    if not selected_verifier:
+        selected_verifier = str(context_metadata.get("sv", "")).strip()
+    if not degraded_reason:
+        degraded_reason = str(context_metadata.get("dr", "")).strip()
+    if not selected_verified:
+        selected_verified = bool(context_metadata.get("vv", False))
+    if candidate_score <= 0.0:
+        try:
+            candidate_score = float(context_metadata.get("ss", 0.0))
+        except (TypeError, ValueError):
+            candidate_score = 0.0
     agent = SemanticAgent(
         agent_id="ag0",
         component="reasoner",
@@ -1473,21 +1801,41 @@ def _rebuild_reasoner_stub_graph(
                 "sym_answer",
             ),
             evidence_handles=evidence_handles,
-            attributes={
-                "symbol_refs": [
-                    ref
-                    for ref in symbol_table_refs
-                    if ref == "sym_question" or (ref.startswith("sym_evidence_") and ref != "sym_evidence_set")
-                ]
-            },
+            attributes=_compact_payload(
+                {
+                    "symbol_refs": [
+                        ref
+                        for ref in symbol_table_refs
+                        if ref == "sym_question" or (ref.startswith("sym_evidence_") and ref != "sym_evidence_set")
+                    ],
+                    "candidate_count": candidate_count,
+                    "selected_strategy": selected_strategy,
+                    "selected_verifier": selected_verifier,
+                    "candidate_score": candidate_score,
+                    "verified": selected_verified,
+                },
+                drop_empty=("selected_strategy", "selected_verifier"),
+            ),
             created_at=created_at,
         ),
         SemanticEntity(
             entity_id="a",
             entity_type="answer_fragment",
-            value="sym_answer",
+            value=selected_answer or "sym_answer",
             evidence_handles=evidence_handles,
             confidence=confidence,
+            attributes=_compact_payload(
+                {
+                    "symbol_ref": bind_step.output_ref if bind_step is not None and bind_step.output_ref else "sym_answer",
+                    "strategy": selected_strategy,
+                    "verifier": selected_verifier,
+                    "candidate_score": candidate_score,
+                    "verified": selected_verified,
+                    "degraded_reason": degraded_reason,
+                    "candidate_count": candidate_count,
+                },
+                drop_empty=("strategy", "verifier", "degraded_reason"),
+            ),
             created_at=created_at,
         ),
         ]
@@ -1647,11 +1995,23 @@ class CritiqueReport(DictSerializable):
     evidence_coverage: float
     critic_notes: str = ""
     result: CritiqueResult = CritiqueResult.VALID
+    verifier_type: str = ""
+    proof_hash_match: bool = True
+    candidate_score: float = 0.0
+    repair_actions: tuple[str, ...] = ()
+    degraded_reason: str = ""
+    failure_categories: tuple[str, ...] = ()
+    provenance_coverage: float = 1.0
+    macro_violations: tuple[str, ...] = ()
+    drift_score: float = 0.0
     created_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
         _require(bool(self.task_id.strip()), "CritiqueReport.task_id must not be empty.")
         _require(0.0 <= self.evidence_coverage <= 1.0, "evidence_coverage must be between 0 and 1.")
+        _require(0.0 <= self.candidate_score <= 1.0, "candidate_score must be between 0 and 1.")
+        _require(0.0 <= self.provenance_coverage <= 1.0, "provenance_coverage must be between 0 and 1.")
+        _require(0.0 <= self.drift_score <= 1.0, "drift_score must be between 0 and 1.")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> CritiqueReport:
@@ -1667,6 +2027,15 @@ class CritiqueReport(DictSerializable):
             evidence_coverage=float(data.get("evidence_coverage", 0.0)),
             critic_notes=str(data.get("critic_notes", "")),
             result=_parse_enum(CritiqueResult, data.get("result", CritiqueResult.VALID)),
+            verifier_type=str(data.get("verifier_type", "")),
+            proof_hash_match=bool(data.get("proof_hash_match", True)),
+            candidate_score=float(data.get("candidate_score", 0.0)),
+            repair_actions=tuple(str(item) for item in data.get("repair_actions", [])),
+            degraded_reason=str(data.get("degraded_reason", "")),
+            failure_categories=tuple(str(item) for item in data.get("failure_categories", [])),
+            provenance_coverage=float(data.get("provenance_coverage", 1.0)),
+            macro_violations=tuple(str(item) for item in data.get("macro_violations", [])),
+            drift_score=float(data.get("drift_score", 0.0)),
             created_at=_parse_datetime(data.get("created_at", utc_now())),
         )
 
@@ -1910,6 +2279,24 @@ def coerce_task_result(value: TaskResult | Mapping[str, Any]) -> TaskResult:
     if isinstance(value, TaskResult):
         return value
     return TaskResult.from_dict(value)
+
+
+def coerce_optimizer_replay_sample(
+    value: OptimizerReplaySample | Mapping[str, Any],
+) -> OptimizerReplaySample:
+    """Convert mapping payloads to OptimizerReplaySample while preserving existing values."""
+    if isinstance(value, OptimizerReplaySample):
+        return value
+    return OptimizerReplaySample.from_dict(value)
+
+
+def coerce_optimizer_replay_evaluation(
+    value: OptimizerReplayEvaluation | Mapping[str, Any],
+) -> OptimizerReplayEvaluation:
+    """Convert mapping payloads to OptimizerReplayEvaluation while preserving existing values."""
+    if isinstance(value, OptimizerReplayEvaluation):
+        return value
+    return OptimizerReplayEvaluation.from_dict(value)
 
 
 def coerce_runtime_event(value: RuntimeEvent | Mapping[str, Any]) -> RuntimeEvent:

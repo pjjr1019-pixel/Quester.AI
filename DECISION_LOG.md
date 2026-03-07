@@ -86,6 +86,41 @@ These choices are locked before Phase 1 to prevent architecture churn.
 - The first live structured-output path is the planner: one model attempt, at most one repair attempt, then deterministic fallback.
 - Parsed planner output must be normalized back onto the real user question and active `ResourceBudget` so model drift cannot rewrite runtime budget policy.
 
+## Phase 7 Structured Reasoner/Critic Rule (2026-03-07)
+
+- `ReasoningService` may accept schema-constrained `CompressedTrace` JSON, but it must normalize the result back onto the real handoff, active runtime subset, symbol-table refs, evidence handles, and proof-hash rules before the trace is trusted.
+- `CritiqueService` must run deterministic structural and runtime-subset checks first; schema-constrained model critique output is only advisory after those checks pass.
+- Both services use the same bounded policy as the planner: one model attempt, at most one repair attempt, then deterministic fallback.
+
+## Phase 7 Deep Candidate Rule (2026-03-07)
+
+- `deep` mode must keep multiple candidate traces as canonical IR artifacts, not only as summary metadata on one selected answer.
+- Candidate selection remains verifier-first: exact tool checks outrank retrieval-grounded fluency, and abstention is preferred over unsupported polish when no candidate clears the threshold.
+- Larger budgets may increase candidate count, but the candidate budget stays explicitly bounded.
+
+## Phase 7 Bounded Verifier Rule (2026-03-07)
+
+- Checkable questions should use deterministic helper execution before optional model fallback.
+- Python code and unit-test helpers stay on a bounded path: limited AST surface, limited line/node budgets, no imports, and no unrestricted attribute access.
+- Critique output must surface machine-readable failure categories and repair actions so orchestration can repair or abstain without guessing.
+
+## Phase 7 Acceptance Rule (2026-03-07)
+
+- Phase 7 is only considered complete when `fast` and `deep` reasoning stay bounded, `deep` mode persists candidate traces, the critic selects or abstains from verifier-backed state, the orchestrator can repair or abstain without free-form guesswork, and final answer rendering comes from verified trace state with citations.
+- Future phases may extend the verifier/toolset, but they should not reopen the Phase 7 handoff contracts or reintroduce free-form text as the primary reasoning artifact.
+
+## Phase 8 Replay Gate Rule (2026-03-07)
+
+- `SelfOptimizer` remains proposal-only by default; replay evaluation may score proposals, but it must not activate live macro/runtime changes until explicit activation logging and rollback records exist.
+- Replay input should come from persisted task results, reasoning traces, critique outcomes, and performance metrics rather than ad hoc in-memory snapshots.
+- Replay scope stays bounded by a configurable history window so optimizer work cannot become the dominant memory consumer.
+
+## Phase 8 Optimizer Metric Rule (2026-03-07)
+
+- The offline optimizer contract is locked to five metrics: compression gain, proof-hash stability, critique validity, latency ratio, and memory ratio.
+- Default replay weights are `0.30 / 0.25 / 0.25 / 0.10 / 0.10` in that order, with a default minimum simulation score of `0.55`.
+- Default replay gates cap both latency and memory ratios at `1.15`; proposals may pass replay evaluation, but proposal approval remains false until the later activation path exists.
+
 ### 0.5.5 Development Mode Default
 - `stub_mode=true` by default for first-pass implementation and tests
 

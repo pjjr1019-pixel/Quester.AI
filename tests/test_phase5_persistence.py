@@ -26,6 +26,7 @@ from data_structures import (
     MacroProposal,
     OperationStep,
     OpcodeEntry,
+    OptimizerReplaySample,
     PerformanceMetric,
     Plan,
     PlanStep,
@@ -256,6 +257,7 @@ class StorageManagerTypedPersistenceTests(unittest.IsolatedAsyncioTestCase):
         traces = await self.storage.list_reasoning_traces(task_id=result.task_id)
         metrics = await self.storage.list_performance_metrics(task_id=result.task_id)
         proof_hashes = await self.storage.list_proof_hashes(task_id=result.task_id)
+        replay_samples = await self.storage.list_optimizer_replay_samples(task_id=result.task_id)
         stored_macro = await self.storage.get_macro("compose_answer")
 
         self.assertEqual(stored_result, result)
@@ -265,6 +267,13 @@ class StorageManagerTypedPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(traces, (result.reasoning,))
         self.assertEqual(metrics, result.metrics)
         self.assertEqual(proof_hashes[-1].proof_hash, result.reasoning.proof_hash)
+        self.assertEqual(len(replay_samples), 1)
+        self.assertIsInstance(replay_samples[0], OptimizerReplaySample)
+        self.assertEqual(replay_samples[0].task_id, result.task_id)
+        self.assertEqual(replay_samples[0].trace_proof_hash, result.reasoning.proof_hash)
+        self.assertEqual(replay_samples[0].final_adjudication, result.critique.result)
+        self.assertEqual(replay_samples[0].latency_s, result.metrics[0].time)
+        self.assertEqual(replay_samples[0].iterations, result.metrics[0].iterations)
         self.assertEqual(stored_macro, result.compression[0].macro)
         self.assertTrue((self.test_logs / self.test_config.storage.trace_log_name).exists())
         self.assertTrue((self.test_logs / self.test_config.storage.status_log_name).exists())

@@ -9,10 +9,14 @@ Current repo state:
 - Phase 6B core macro runtime is implemented: `macro_engine.py` now performs deterministic nested macro expansion, parameterized motif compression, macro proof fingerprinting, canonical normalization, recursion-guarded replay, and normalized round-trip verification.
 - Phase 6C selective-context loading is implemented: `reasoner.py` and `critic.py` now load only the task-scoped active runtime subset they need, and storage bootstraps the compact built-in opcode/decoder lexicon required for fresh runtimes.
 - Phase 6 is complete: persisted traces now use a compact builder-backed storage form, canonical graphs now model evidence items, intermediate bindings, macro definitions, typed activities, and agent/backend ownership, and the density benchmark is locked by tests.
-- The Phase 7 boundary pass is implemented: foreground agents now delegate to shared service modules, Researcher -> Reasoner and Reasoner -> Critic use explicit typed handoffs, and boundary-only schema helpers lock the structured-output path for future model-backed work.
-- Phase 7.2 is implemented: `planner_service.py` now uses a shared schema-constrained JSON helper with one bounded repair attempt and deterministic fallback, so planner output is locked to typed `Plan` decoding instead of free-form text.
+- Phase 7 is functionally complete in stub mode: foreground agents stay thin, Planner/Reasoner/Critic/Compressor all use bounded schema-constrained JSON paths with deterministic fallback, and typed handoffs lock the Researcher -> Reasoner -> Critic boundary.
+- `reasoning_service.py` now supports bounded `fast` and `deep` modes; `deep` mode materializes multiple candidate traces in canonical IR, scores them with verifier/evidence/agreement/proof-hash signals, and stays budget-bounded.
+- `critique_service.py` now performs hybrid strict verification with bounded arithmetic, Python-expression, Python-code, unit-test, evidence-count, and retrieval-grounding helpers, emits machine-readable failure categories and repair actions, and degrades or abstains instead of polishing weak answers.
+- `translation_service.py` now renders final answers strictly from verified state with templates and source citations, and `orchestrator.py` now applies a bounded repair loop plus richer dashboard/runtime-event metadata.
+- `compression_service.py` now proposes graph-path, candidate-subproof, and symbol-bundle macros in addition to token/opcode motifs, so compression is no longer limited to exact-token aliasing.
+- Phase 8 prep is in place: `storage.py` persists optimizer replay samples, `config.py` locks the offline optimizer metric contract, and `self_optimizer.py` evaluates proposals against a bounded replay window while remaining proposal-only.
 - Stub mode is the default and is the supported path for local tests.
-- Remaining near-term work is the real Phase 7 foreground-agent replacement work behind those boundaries and the full dashboard.
+- Remaining near-term work is Phase 8 activation audit trails and rollback records, plus expanding the dashboard from its current minimal event console.
 
 ## Requirements
 
@@ -149,8 +153,7 @@ This repo is not feature-complete yet.
 
 Known planned areas:
 - the current real web fallback is intentionally narrow and uses MediaWiki as the default provider
-- Phase 7 fast/deep candidate reasoning, tool-backed verification, and structured-output foreground agents are not implemented yet
-- the Phase 7 boundary layer is in place, but planner/reasoner/critic still use deterministic stub behavior behind those contracts
 - the dashboard is still a minimal event console
+- optional structured-output and solver dependencies (`jsonschema`, `outlines`, `msgspec`, `z3-solver`) remain deliberately off the default path
 
 The authoritative roadmap is in [`Masterplan.txt`](./Masterplan.txt).

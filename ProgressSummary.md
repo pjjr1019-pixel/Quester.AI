@@ -6,7 +6,8 @@ Last updated: March 7, 2026
 
 - Phases 0.5, 1, 2, 3, and 4 are complete.
 - The compatibility contract is mostly enforced and covered by tests.
-- Phase 5 is functionally complete except for deferred `sqlite-vec` follow-up, Phase 6 is complete, and the Phase 7 boundary pass is now in place.
+- Phase 5 is functionally complete except for deferred `sqlite-vec` follow-up, Phase 6 is complete, and Phase 7 is functionally complete in stub mode.
+- Phase 8 preparation is now in place: replay-grade optimizer persistence, a locked offline metric contract, and a bounded replay evaluation harness exist, while live activation and rollback remain deferred.
 
 ## Completed in the current checkpoint
 
@@ -100,6 +101,22 @@ Last updated: March 7, 2026
   - `structured_generation.py` now provides one bounded schema-constrained JSON generation path with one repair attempt and deterministic fallback.
   - `planner_service.py` now uses `agent_schema.py` plus the shared structured-generation helper to parse a typed `Plan` from model JSON, normalize it to the real budget/question inputs, and fall back to the deterministic planner path if generation or repair fails.
   - `tests/test_phase7_boundaries.py` now covers valid JSON, one repair attempt, and bounded fallback for the planner output path.
+- Completed the next Phase 7 foreground replacements on the same path:
+  - `reasoning_service.py` now uses the shared structured-generation helper and `agent_schema.py` to accept schema-constrained `CompressedTrace` JSON, normalize it back onto the real handoff, active runtime subset, symbol-table refs, and proof-hash rules, and fall back to the deterministic IR builder if generation or repair fails.
+  - `critique_service.py` now runs deterministic verifier checks first and only then accepts schema-constrained `CritiqueReport` JSON from the model path, with one bounded repair attempt and deterministic fallback if JSON decoding fails.
+  - `tests/test_phase7_boundaries.py` now covers valid JSON, bounded repair, and fallback for both reasoner and critic structured-output paths.
+- Completed the remaining stub-mode Phase 7 behavior:
+  - `reasoning_service.py` now supports bounded `fast` and `deep` modes, materializes bounded candidate traces in canonical IR, and scales candidate count with the active budget.
+  - `verification_tools.py` and `critique_service.py` now cover arithmetic, Python expression, Python code execution, unit-test style checks, evidence count, and evidence-grounding verification with bounded deterministic helpers.
+  - `data_structures.py` and `agent_schema.py` now carry additive Phase 7 metadata for candidate traces, failure categories, provenance coverage, macro violations, and drift score.
+  - `translation_service.py` now renders final answers from verified state with source citations, and `orchestrator.py` now applies bounded repair actions and emits richer reasoning/critique metadata into runtime events for the dashboard path.
+  - `compression_service.py` now proposes candidate-subproof, graph-path, and symbol-bundle macros in addition to token/opcode motifs, so graph-backed compression is no longer absent from the foreground path.
+- Completed the pre-Phase 8 optimizer gate:
+  - `data_structures.py` now defines `OptimizerReplaySample` and `OptimizerReplayEvaluation` so replay inputs and simulation outputs stay typed.
+  - `storage.py` now derives replay samples directly from persisted `TaskResult` objects and stores offline replay evaluations in dedicated repositories.
+  - `config.py` now locks the replay history cap, proposal limit, weighted metric contract, and latency/memory gates for offline optimizer scoring.
+  - `self_optimizer.py` now evaluates validated macro proposals against bounded persisted replay samples and traces, records those evaluations, and keeps every proposal proposal-only.
+  - `tests/test_phase5_persistence.py`, `tests/test_phase7_boundaries.py`, and `tests/test_phase2_contracts.py` now cover replay-sample persistence, replay-evaluation persistence, and metric-contract validation.
 
 ## Phase 5 items completed
 
@@ -142,7 +159,7 @@ Last updated: March 7, 2026
 ## Verified state
 
 - Full test suite passes: `python -m pytest -q -ra`
-- Current passing count: `75 passed`
+- Current passing count: `103 passed`
 
 ## Main gaps remaining
 
@@ -150,7 +167,7 @@ Last updated: March 7, 2026
 
 ## Recommended next steps
 
-1. Continue Phase `7` with `7.4` and `7.6`: move reasoner and critic onto the same schema-constrained path now that the planner helper and repair loop are proven.
-2. Keep `5.0.6` deferred infrastructure, not the next coding target.
-3. Keep the real web provider policy unchanged: do not broaden beyond MediaWiki until the persisted evidence/provenance path has seen more use.
-4. Use the finished Phase 6 runtime and the new Phase 7 boundary contracts as the base for `fast` / `deep` reasoning and verifier-backed candidate selection rather than reopening the compression architecture again.
+1. Continue Phase `8` with activation audit trails and explicit rollback records before any live macro activation logic is considered.
+2. Expand the dashboard from the current event console into a richer operator view over verifier type, candidate score, repair actions, degraded reasons, replay scores, and citations.
+3. Keep `5.0.6` deferred infrastructure, not the next coding target.
+4. Keep the real web provider policy unchanged: do not broaden beyond MediaWiki until the persisted evidence/provenance path has seen more use.

@@ -1,0 +1,281 @@
+# Repo Audit and 300-Suggestion
+
+## Summary
+- Audit the repo against its current local state on March 7, 2026, not against stale assumptions: `python -m pytest -q -ra` is green (`81 passed`), Phase 7 structured planner/reasoner/critic boundaries are implemented, and deep-mode reasoning, tool-backed critic verification, the full dashboard, and real optimizer behavior are still open.
+- Replace the current `suggestions.txt` generic 200-item list with a new 250-item audit that is mostly repo-grounded but allows a final band of broader future ideas.
+- Keep the task analysis-only: no Python/runtime/config/test changes, only the rewritten suggestion document.
+
+## Public Interfaces / Deliverables
+- No public Python APIs, dataclasses, schemas, or runtime behavior change.
+- `suggestions.txt` becomes the canonical deliverable and is fully rewritten.
+
+## Implementation Changes
+- Ground the audit in the actual repo surfaces: runtime core, contracts, tests, docs, roadmap, and the current in-progress Phase 7 edits.
+- Use this fixed output structure in `suggestions.txt`:
+  - Short intro: 4-6 lines summarizing repo state and audit basis.
+  - `P0 Immediate Risks` items `1-50`
+  - `P1 Near-Term Execution` items `51-130`
+  - `P2 Maintainability and Quality` items `131-200`
+  - `P3 Broad Future Ideas` items `201-250`
+- Keep continuous numbering across the whole file.
+- Format every suggestion as one numbered line with fixed tags:
+  - `N. [P?][Subsystem][Code|Roadmap|Idea] suggestion`
+- Use subsystem tags only from this set:
+  - `Architecture`, `Contracts`, `Config`, `ModelRuntime`, `Storage`, `Retrieval`, `Reasoning`, `Critique`, `Compression`, `Optimizer`, `Orchestrator`, `Dashboard`, `Testing`, `Docs`, `DevEx`, `Security`, `UX`, `Roadmap`
+- Make items `1-200` explicitly grounded in current code, tests, docs, or open roadmap gaps.
+- Reserve items `201-250` for broader ideation.
+- Keep each item actionable, specific, and non-duplicative; avoid generic best-practice filler.
+- If a point already exists in `Masterplan.txt`, label it `[Roadmap]` and frame it as prioritization/refinement, not as a newly discovered defect.
+- Do not misstate current status: structured planner/reasoner/critic paths exist already; deep reasoning, tool-backed verification, richer dashboard behavior, and real optimizer logic do not.
+
+## Validation
+- Verify `suggestions.txt` has exactly 250 numbered items with no gaps.
+- Verify section counts are exactly `50 / 80 / 70 / 50`.
+- Spot-check that the highest-priority items map to actual repo hotspots and current roadmap gaps, especially contracts, storage, orchestration, and the new Phase 7 reasoning/critique path.
+- Verify the rewritten file is UTF-8 clean and removes the current mojibake artifacts.
+- Verify no file other than `suggestions.txt` is changed.
+
+## Assumptions
+- Broad ideation is allowed, but the deliverable should still be mostly repo-specific.
+- Passing tests are context, not evidence that architectural or roadmap suggestions are unnecessary.
+- The eventual chat close-out can be a short summary of top themes, but `suggestions.txt` is the source of truth.
+v
+
+## Architecture & Design
+1. Ensure each agent (Planner, Researcher, Reasoner, Critic, Compressor) has a single, clear responsibility.
+2. Use dependency injection for model, storage, and web adapters to improve testability.
+3. Keep all configuration in config.py; avoid hard-coded values elsewhere.
+4. Document all public interfaces with clear input/output/failure docstrings.
+5. Use Python type hints throughout for clarity and static analysis.
+6. Prefer immutable dataclasses (frozen=True) for value objects.
+7. Use __slots__ in dataclasses to reduce memory overhead.
+8. Validate all dataclass inputs at construction or via validate() methods.
+9. Separate orchestration logic from agent logic in orchestrator.py.
+10. Keep the dashboard as a read-only event consumer, not a state owner.
+
+## Resource Management
+11. Enforce VRAM and RAM limits at runtime; fail gracefully if exceeded.
+12. Use asyncio.Semaphore to limit concurrent model and embedding jobs.
+13. Unload or release model sessions after idle timeout.
+14. Bound all queues to prevent unbounded memory growth.
+15. Add resource usage monitoring (RAM, VRAM) to the dashboard.
+
+## Persistence & Storage
+16. Use SQLite for all persistent storage; avoid in-memory-only state.
+17. Store append-only logs as JSONL for traceability.
+18. Separate tables for vectors, source docs, macros, logs, and metrics.
+19. Avoid re-indexing the full corpus on every startup.
+20. Store provenance and source metadata with all evidence.
+
+## Retrieval & Embeddings
+21. Use Chroma PersistentClient as the default vector store.
+22. Support asymmetric query/document encoding if the model allows.
+23. Add metadata filters and reranking to retrieval.
+24. Use FTS5 or similar for lexical candidate generation.
+25. Avoid loading all vectors into memory for each search.
+
+## Macro Engine & Compression
+26. Represent reasoning as a graph/DAG, not just token lists.
+27. Use a compact, typed opcode lexicon for core operations.
+28. Store macro registry and decoder lexicon in machine-readable form.
+29. Add proof-hash and round-trip verification for compressed traces.
+30. Limit macro recursion depth (e.g., 8).
+
+## Agents & Pipeline
+31. Pass ResourceBudget through all agent calls.
+32. Make thinking_minutes affect actual work depth, not just metadata.
+33. Use schema-constrained JSON for all agent outputs.
+34. Validate model outputs before passing to the next stage.
+35. Allow one repair attempt for invalid outputs, then fail structurally.
+
+## Testing & Validation
+36. Write unit tests for every agent with mocked dependencies.
+37. Add end-to-end pipeline tests for at least two example questions.
+38. Test both fast and deep reasoning modes.
+39. Add tests for resource limits, fallback, and degraded modes.
+40. Add regression tests for old serialized payloads.
+
+## Error Handling & Robustness
+41. Define explicit error types for startup, backend, timeout, and OOM.
+42. Add cancellation and retry logic for orchestrator tasks.
+43. Never retry invalid outputs indefinitely.
+44. Surface warnings and degraded-mode events in the dashboard.
+45. Fail clearly when required dependencies or models are missing.
+
+## Dashboard & UI
+46. Use Tkinter for the default GUI to minimize memory use.
+47. Run model and I/O work outside the main UI thread.
+48. Show live status updates using a bounded queue.
+49. Display resource usage and error states clearly.
+50. Show when events are dropped due to queue backpressure.
+
+## Optimization & Self-Improvement
+51. Keep the optimizer proposal-only until simulation/validation is ready.
+52. Persist optimizer proposals and activation decisions.
+53. Cap history windows to avoid memory bloat.
+54. Export only verified deep-mode traces for future training.
+55. Never let the optimizer apply live changes without validation.
+
+## Code Quality & Maintainability
+56. Remove dead code, duplicate logic, and hidden globals.
+57. Keep one public class per module where possible.
+58. Avoid circular dependencies between modules.
+59. Use concise, useful comments—explain non-obvious logic.
+60. Use dependency injection to make components easy to mock and swap.
+
+## Compatibility & Extensibility
+61. Evolve dataclasses additively; never remove or rename fields without defaults.
+62. Keep from_dict() backward-compatible with old payloads.
+63. Add new enum values only when needed; never repurpose existing ones.
+64. Keep ResourceBudget backward-compatible.
+65. Keep run_pipeline() as a compatibility shim until fully deprecated.
+
+## Performance
+66. Profile and optimize hot paths (e.g., JSONL logging, parsing).
+67. Use orjson for JSON if stdlib json becomes a bottleneck.
+68. Avoid loading large registries or corpora into memory unnecessarily.
+69. Use __slots__ and frozen dataclasses for memory efficiency.
+70. Keep all async loops cancellable and bounded.
+
+## Documentation
+71. Maintain a short, clear README with setup, architecture, and resource notes.
+72. Document all public APIs and contracts.
+73. Add architecture diagrams if helpful for onboarding.
+74. Keep comments up to date with code changes.
+75. Document all configuration options in config.py.
+
+## Security & Safety
+76. Sanitize and validate all external inputs (web, user, etc.).
+77. Limit web fetches to bounded, timeout-protected calls.
+78. Never let untrusted code execution (e.g., tool-backed verification) run without sandboxing.
+79. Log all critical errors and warnings for auditability.
+80. Avoid leaking sensitive data in logs or UI.
+
+## Usability & User Experience
+81. Provide clear error messages and recovery actions in the dashboard.
+82. Allow users to cancel long-running tasks safely.
+83. Make the UI responsive even under heavy load.
+84. Show surfaced warnings and degraded states to users.
+85. Provide sample tasks and macros for new users.
+
+## Future-Proofing
+86. Keep macro, opcode, and decoder registries versioned.
+87. Make all storage formats forward- and backward-compatible.
+88. Allow for optional secondary vector stores (e.g., sqlite-vec).
+89. Keep the translation layer separate from reasoning logic.
+90. Plan for future SFT or process-supervision training with verified traces.
+
+## Miscellaneous
+91. Use bounded retries for transient web or backend failures.
+92. Add property-based tests (e.g., with hypothesis) for proof-hash stability.
+93. Export human-readable debug views for IR and provenance graphs.
+94. Keep stub/demo corpora clearly separable from user/runtime data.
+95. Add selective context injection for agents—never load the full registry.
+96. Track and log all surfaced warnings and fallback events.
+97. Add metrics for latency, memory, and correctness to TaskResult.
+98. Keep the system modular and async throughout.
+99. Regularly review and update the Masterplan as the project evolves.
+100. Periodically audit the codebase for adherence to these suggestions and best practices.
+
+# Additional Suggestions for Quester.AI (March 2026)
+
+101. Refactor large functions into smaller, testable units.
+102. Use consistent naming conventions for all classes, methods, and variables.
+103. Add type annotations to all function signatures.
+104. Use Python's logging module instead of print statements for diagnostics.
+105. Add a CONTRIBUTING.md to guide new contributors.
+106. Use pre-commit hooks to enforce code style and linting.
+107. Integrate static analysis tools (e.g., mypy, pylint) into CI.
+108. Add code coverage reporting to CI.
+109. Use black or another auto-formatter for code consistency.
+110. Document all exceptions raised by public methods.
+111. Add a changelog to track project changes.
+112. Use semantic versioning for releases.
+113. Add badges (build, coverage, etc.) to the README.
+114. Use environment variables for sensitive config (API keys, etc.).
+115. Add a .env.example file for environment variable documentation.
+116. Use pathlib for file path manipulations.
+117. Avoid global state; use dependency injection or context objects.
+118. Add a Makefile or scripts for common dev tasks (test, lint, run).
+119. Use context managers for resource cleanup (files, DB connections).
+120. Add retry logic with exponential backoff for transient errors.
+121. Use async/await consistently for I/O-bound operations.
+122. Add timeouts to all network and model calls.
+123. Use dataclasses.asdict() for serialization where possible.
+124. Add __repr__ methods to key classes for easier debugging.
+125. Use Enum for agent/component states instead of plain strings.
+126. Add a LICENSE file and clarify project licensing.
+127. Use pyproject.toml for all build and dependency config.
+128. Pin dependency versions to avoid breakage.
+129. Add dependency update checks to CI.
+130. Use try/except blocks to handle all external API failures.
+131. Add fallback logic for missing optional dependencies.
+132. Use weak references for cache objects to avoid memory leaks.
+133. Add a cache eviction policy for in-memory caches.
+134. Use SQLite WAL mode for better concurrent access.
+135. Add DB schema migrations for future changes.
+136. Use parameterized queries to prevent SQL injection.
+137. Add a DB integrity check on startup.
+138. Use UUIDs for unique IDs instead of sequential ints.
+139. Add a CLI for headless operation and automation.
+140. Support config overrides via CLI flags.
+141. Add a --version flag to the CLI.
+142. Add a --stub-mode flag to force stubbed operation.
+143. Add a --test-mode flag for CI/test runs.
+144. Use a factory pattern for agent instantiation.
+145. Add a registry for available agent types.
+146. Use ABC (abstract base classes) for agent/service interfaces.
+147. Add a plugin system for custom agent extensions.
+148. Use importlib.metadata to discover plugins.
+149. Add a health check endpoint for monitoring.
+150. Add Prometheus metrics export for observability.
+151. Use a thread pool for CPU-bound tasks.
+152. Use asyncio event loop for all async tasks.
+153. Add a watchdog for stuck or long-running tasks.
+154. Add a circuit breaker for repeated backend failures.
+155. Use a bounded thread pool for dashboard UI updates.
+156. Add a UI theme switcher (light/dark mode).
+157. Add keyboard shortcuts for common dashboard actions.
+158. Add tooltips and help text to all UI elements.
+159. Add a search/filter bar to the dashboard logs.
+160. Add a "copy to clipboard" button for results.
+161. Add a "clear logs" button to the dashboard.
+162. Add a "save session" feature for task results.
+163. Add a "load session" feature for previous runs.
+164. Add a "reset to defaults" button in settings.
+165. Add a "report bug" link in the dashboard.
+166. Add a "check for updates" feature.
+167. Add a "feedback" form for user suggestions.
+168. Add a "recent tasks" panel to the dashboard.
+169. Add a "favorite tasks" feature for quick access.
+170. Add a "task history" export (CSV/JSON).
+171. Add a "task import" feature for batch runs.
+172. Add a "task template" system for common queries.
+173. Add a "task scheduler" for recurring jobs.
+174. Add a "resource usage" graph to the dashboard.
+175. Add a "model health" panel to the dashboard.
+176. Add a "storage health" panel to the dashboard.
+177. Add a "web adapter health" panel.
+178. Add a "macro registry" browser in the UI.
+179. Add a "symbol table" viewer in the UI.
+180. Add a "proof hash" inspector in the UI.
+181. Add a "macro proposal" review panel.
+182. Add a "reasoning trace" visualizer.
+183. Add a "compressed trace" explorer.
+184. Add a "provenance graph" viewer.
+185. Add a "performance metrics" dashboard.
+186. Add a "warnings/errors" summary panel.
+187. Add a "deep mode" toggle in the UI.
+188. Add a "fast mode" toggle in the UI.
+189. Add a "resource budget" slider in the UI.
+190. Add a "manual override" for agent selection.
+191. Add a "custom macro" creation tool.
+192. Add a "macro simulation" tool.
+193. Add a "macro validation" tool.
+194. Add a "macro export/import" feature.
+195. Add a "macro version history" viewer.
+196. Add a "macro rollback" feature.
+197. Add a "macro diff" tool for comparing versions.
+198. Add a "macro usage stats" panel.
+199. Add a "macro approval" workflow.
+200. Add a "macro deprecation" notice system.

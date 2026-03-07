@@ -53,9 +53,11 @@ class RuntimeFlags:
 
     stub_mode: bool = True
     allow_web_fallback: bool = True
-    enable_self_optimizer: bool = True
+    enable_self_optimizer: bool = False
     startup_timeout_s: float = 20.0
     shutdown_timeout_s: float = 20.0
+    max_component_retries: int = 1
+    retry_backoff_s: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -249,6 +251,8 @@ class StorageSettings:
     trace_log_name: str = "traces.jsonl"
     web_log_name: str = "web.jsonl"
     status_log_name: str = "status.jsonl"
+    schema_version: int = 1
+    integrity_check_on_start: bool = True
 
 
 @dataclass(frozen=True)
@@ -265,6 +269,16 @@ class SelfOptimizerSettings:
     """Background optimizer behavior."""
 
     cycle_interval_s: float = 30.0
+    replay_history_limit: int = 64
+    proposal_limit: int = 5
+    compression_gain_weight: float = 0.30
+    proof_hash_stability_weight: float = 0.25
+    critique_validity_weight: float = 0.25
+    latency_weight: float = 0.10
+    memory_weight: float = 0.10
+    minimum_simulation_score: float = 0.55
+    max_latency_ratio: float = 1.15
+    max_memory_ratio: float = 1.15
 
 
 @dataclass(frozen=True)
@@ -316,6 +330,10 @@ class AppConfig:
             raise ValueError("startup_timeout_s must be positive.")
         if self.preflight.flags.shutdown_timeout_s <= 0:
             raise ValueError("shutdown_timeout_s must be positive.")
+        if self.preflight.flags.max_component_retries < 0:
+            raise ValueError("max_component_retries must be zero or positive.")
+        if self.preflight.flags.retry_backoff_s < 0:
+            raise ValueError("retry_backoff_s must be zero or positive.")
         if self.backend_runtime.request_timeout_s <= 0:
             raise ValueError("request_timeout_s must be positive.")
         if self.backend_runtime.idle_unload_after_s <= 0:
@@ -413,6 +431,31 @@ class AppConfig:
             raise ValueError("web_log_name must not be empty.")
         if not self.storage.status_log_name.strip():
             raise ValueError("status_log_name must not be empty.")
+        if self.storage.schema_version < 1:
+            raise ValueError("storage.schema_version must be positive.")
+        if self.self_optimizer.cycle_interval_s <= 0:
+            raise ValueError("self_optimizer.cycle_interval_s must be positive.")
+        if self.self_optimizer.replay_history_limit < 1:
+            raise ValueError("self_optimizer.replay_history_limit must be positive.")
+        if self.self_optimizer.proposal_limit < 1:
+            raise ValueError("self_optimizer.proposal_limit must be positive.")
+        if not 0.0 <= self.self_optimizer.minimum_simulation_score <= 1.0:
+            raise ValueError("self_optimizer.minimum_simulation_score must be between 0 and 1.")
+        if self.self_optimizer.max_latency_ratio <= 0:
+            raise ValueError("self_optimizer.max_latency_ratio must be positive.")
+        if self.self_optimizer.max_memory_ratio <= 0:
+            raise ValueError("self_optimizer.max_memory_ratio must be positive.")
+        optimizer_weights = (
+            self.self_optimizer.compression_gain_weight,
+            self.self_optimizer.proof_hash_stability_weight,
+            self.self_optimizer.critique_validity_weight,
+            self.self_optimizer.latency_weight,
+            self.self_optimizer.memory_weight,
+        )
+        if any(weight < 0 for weight in optimizer_weights):
+            raise ValueError("self_optimizer metric weights must be zero or positive.")
+        if abs(sum(optimizer_weights) - 1.0) > 1e-6:
+            raise ValueError("self_optimizer metric weights must sum to 1.0.")
 
 
 PREFLIGHT = PreflightConfig()

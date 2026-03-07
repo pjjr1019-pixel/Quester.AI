@@ -338,6 +338,22 @@ class PublicInterfaceChecklistTests(unittest.TestCase):
         self.assertIn("MacroProposal", str(signature(SelfOptimizer.run_cycle).return_annotation))
 
 
+class ConfigValidationTests(unittest.TestCase):
+    """Validate locked configuration contracts remain enforced."""
+
+    def test_optimizer_metric_weights_must_sum_to_one(self) -> None:
+        config = replace(
+            APP_CONFIG,
+            self_optimizer=replace(
+                APP_CONFIG.self_optimizer,
+                compression_gain_weight=0.4,
+            ),
+        )
+
+        with self.assertRaises(ValueError):
+            config.validate()
+
+
 class Phase2TypedPipelineTests(unittest.IsolatedAsyncioTestCase):
     """Validate startup/shutdown and typed pipeline output in stub mode."""
 

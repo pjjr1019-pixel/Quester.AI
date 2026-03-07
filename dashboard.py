@@ -31,6 +31,11 @@ class DashboardService:
         self._root: tk.Tk | None = None
         self._text: tk.Text | None = None
         self._stop_flag = threading.Event()
+        self._dropped_events = 0
+
+    @property
+    def dropped_events(self) -> int:
+        return self._dropped_events
 
     async def start(self) -> None:
         """Start the dashboard service."""
@@ -71,7 +76,11 @@ class DashboardService:
                 _ = self._events.get_nowait()
             except queue.Empty:
                 pass
-            self._events.put_nowait(event)
+            self._dropped_events += 1
+            overflow_event = dict(event)
+            overflow_event["dropped_events"] = self._dropped_events
+            overflow_event["queue_overflow"] = "evicted_oldest"
+            self._events.put_nowait(overflow_event)
 
     def _run_ui(self) -> None:
         try:
@@ -103,4 +112,3 @@ class DashboardService:
                 break
             self._text.insert("end", f"{event.get('timestamp')} | {event}\n")
             self._text.see("end")
-

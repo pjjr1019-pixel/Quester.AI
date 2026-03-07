@@ -224,52 +224,56 @@ Roadmap Adjustment Note (Current Priority Order)
 - [x] 7.0.3 Before coding Phase 7, implement deterministic or stubbed versions of the new agent logic first, then layer real model-backed inference behind the same contracts.
 - [x] 7.0.4 Before coding Phase 7, keep translation to natural language as a final step after verification; do not let free-form text become the primary reasoning state again.
 - [x] 7.0.5 Before coding Phase 7, lock one structured-output path for model-backed agents; Planner, Reasoner, Critic, and Compressor must emit schema-constrained JSON rather than free-form text.
+- [ ] 7.0.5.1 When schema validation moves from parse-only decoding to enforced boundary validation, install `jsonschema` as the first optional structured-output dependency; do not add a heavier schema stack before the current `agent_schema.py` path shows clear limits.
 - [x] 7.0.6 Before coding Phase 7, keep dataclasses as the domain model and use boundary-only schema helpers to generate and validate model I/O contracts.
+- [ ] 7.0.6.1 Keep `outlines` and `msgspec` off the default path unless the current dataclass plus boundary-schema approach proves insufficient; do not replace the Ollama-oriented JSON path or the dataclass domain model just to adopt a library.
 - [x] 7.0.7 Before replacing placeholder foreground-agent behavior, require the Phase 5 persistence layer and the `6A` / `6B` IR checkpoints to be green.
-- [ ] 7.0.8 Before coding Phase 7, optimize for a system-first lightweight reasoner: keep the base policy model small and put most precision gains into structured search, tools, and verification rather than assuming a larger standalone model.
-- [ ] 7.0.9 Before coding Phase 7, prioritize verifiable reasoning domains first (math, code, logic, and retrieval-backed factual synthesis); broad conversational polish is secondary.
-- [ ] 7.0.10 Before coding Phase 7, support at least two bounded reasoning modes: `fast` for low-latency single-path work and `deep` for slower multi-candidate verified reasoning.
-- [ ] 7.1 Replace remaining stub or placeholder agent behavior with real task-aware logic while preserving typed contracts.
+- [x] 7.0.8 Before coding Phase 7, optimize for a system-first lightweight reasoner: keep the base policy model small and put most precision gains into structured search, tools, and verification rather than assuming a larger standalone model.
+- [x] 7.0.9 Before coding Phase 7, prioritize verifiable reasoning domains first (math, code, logic, and retrieval-backed factual synthesis); broad conversational polish is secondary.
+- [x] 7.0.10 Before coding Phase 7, support at least two bounded reasoning modes: `fast` for low-latency single-path work and `deep` for slower multi-candidate verified reasoning.
+- [x] 7.1 Replace remaining stub or placeholder agent behavior with real task-aware logic while preserving typed contracts.
 - [x] 7.2 Implement `PlannerAgent` to return structured `Plan` objects only via schema-constrained output; do not let it return free-form text as its primary output.
-- [ ] 7.3 Implement `ResearcherAgent` to accept a `Plan`, retrieve local evidence first using stable evidence handles and retrieval-tuned embeddings, optionally fetch web evidence, embed/store new content, and return `EvidenceBundle`.
-- [ ] 7.4 Implement `ReasonerAgent` to consume the `Plan` and `EvidenceBundle`, build the canonical reasoning/provenance graph, compile it into the compressed IR, and stay within the `ResourceBudget`.
-- [ ] 7.4.1 In `deep` mode, let the Reasoner generate multiple bounded candidate traces instead of one single trajectory; candidates must stay in the canonical IR, not free-form scratchpads.
-- [ ] 7.4.2 Treat the small model as a proposal generator, not the final authority; final selection must be driven by verifier, evidence, and proof-hash signals.
-- [ ] 7.5 Make the Reasoner reuse the per-task symbol table, active opcode lexicon, and active macro registry subset instead of emitting ad hoc symbolic strings.
-- [ ] 7.6 Implement `CriticAgent` as a hybrid strict verifier: schema validation -> deterministic provenance/IR constraint checks -> deterministic macro/IR expansion -> optional model-assisted semantic fallback only if structural checks pass.
-- [ ] 7.6.1 Add tool-backed verification for checkable tasks: Python execution, code or unit-test execution, and retrieval-grounded checks should be first-class Critic helpers before optional model fallback.
-- [ ] 7.6.2 Keep tool-backed verification bounded and explicit; helper execution must respect the same timeout, retry, and resource policies as the rest of the runtime.
-- [ ] 7.7 Make the Critic validate plan coverage, evidence support, opcode legality, ordering/type/impossibility constraints, macro signature matching, contradiction surfacing, uncertainty preservation, provenance coverage, and proof-hash stability.
-- [ ] 7.7.1 Make the Critic surface whether failures are schema, provenance, proof-hash, or evidence-coverage violations so repair paths stay targeted instead of generic.
-- [ ] 7.7.2 Make the Critic score candidates by verifier result, evidence support, proof-hash stability, and cross-candidate agreement so `deep` mode can select, repair, or abstain instead of always emitting the most fluent answer.
-- [ ] 7.7.3 If no candidate reaches the configured verification threshold, return a structured uncertainty or degraded result rather than a polished but weakly supported answer.
-- [ ] 7.8 Extend `CritiqueReport` as needed to expose drift score, proof-hash match, provenance coverage, macro violations, and repair actions while preserving current compatibility where possible.
-- [ ] 7.9 Implement `CompressorAgent` to learn parameterized graph motifs, frequent subproofs, and symbol-table optimization opportunities; exact-token aliases must not be the main compression strategy.
-- [ ] 7.10 Add a translation layer that expands only the verified output-relevant proof subgraph and renders it to natural language using templates first and LLM surface realization second.
-- [ ] 7.10.1 Keep natural-language generation downstream of candidate selection and verification; the translation layer must render verified state, not invent new reasoning.
-- [ ] 7.11 Keep each agent small and single-purpose; shared concerns like logging, model access, storage, symbol-table management, and proof hashing must stay in shared services.
-- [ ] 7.12 Make budget a real input to foreground agents so work depth changes with the thinking-time policy.
-- [ ] 7.12.1 Let larger thinking budgets increase candidate count, verifier depth, and tool-use budget in `deep` mode without violating the locked RAM and VRAM limits.
-- [ ] 7.13 Do not claim foreground-agent completion while local retrieval, critic verification depth, graph-backed compression, and macro-aware reasoning are still stubbed.
-- [ ] 7.14 If a model output fails schema validation, allow at most one bounded repair attempt before returning a structured failure.
+- [x] 7.3 Implement `ResearcherAgent` to accept a `Plan`, retrieve local evidence first using stable evidence handles and retrieval-tuned embeddings, optionally fetch web evidence, embed/store new content, and return `EvidenceBundle`.
+- [x] 7.4 Implement `ReasonerAgent` to consume the `Plan` and `EvidenceBundle`, build the canonical reasoning/provenance graph, compile it into the compressed IR, and stay within the `ResourceBudget`.
+- [x] 7.4.1 In `deep` mode, let the Reasoner generate multiple bounded candidate traces instead of one single trajectory; candidates must stay in the canonical IR, not free-form scratchpads.
+- [x] 7.4.2 Treat the small model as a proposal generator, not the final authority; final selection must be driven by verifier, evidence, and proof-hash signals.
+- [x] 7.5 Make the Reasoner reuse the per-task symbol table, active opcode lexicon, and active macro registry subset instead of emitting ad hoc symbolic strings.
+- [x] 7.6 Implement `CriticAgent` as a hybrid strict verifier: schema validation -> deterministic provenance/IR constraint checks -> deterministic macro/IR expansion -> optional model-assisted semantic fallback only if structural checks pass.
+- [x] 7.6.1 Add tool-backed verification for checkable tasks: Python execution, code or unit-test execution, and retrieval-grounded checks should be first-class Critic helpers before optional model fallback.
+- [ ] 7.6.1.1 When deterministic contradiction or satisfiability checks become part of the Critic, install `z3-solver` as an optional helper for math, logic, and ordering/constraint validation instead of hand-rolling a full constraint engine first.
+- [x] 7.6.2 Keep tool-backed verification bounded and explicit; helper execution must respect the same timeout, retry, and resource policies as the rest of the runtime.
+- [x] 7.7 Make the Critic validate plan coverage, evidence support, opcode legality, ordering/type/impossibility constraints, macro signature matching, contradiction surfacing, uncertainty preservation, provenance coverage, and proof-hash stability.
+- [x] 7.7.1 Make the Critic surface whether failures are schema, provenance, proof-hash, or evidence-coverage violations so repair paths stay targeted instead of generic.
+- [x] 7.7.2 Make the Critic score candidates by verifier result, evidence support, proof-hash stability, and cross-candidate agreement so `deep` mode can select, repair, or abstain instead of always emitting the most fluent answer.
+- [x] 7.7.3 If no candidate reaches the configured verification threshold, return a structured uncertainty or degraded result rather than a polished but weakly supported answer.
+- [x] 7.8 Extend `CritiqueReport` as needed to expose drift score, proof-hash match, provenance coverage, macro violations, and repair actions while preserving current compatibility where possible.
+- [x] 7.9 Implement `CompressorAgent` to learn parameterized graph motifs, frequent subproofs, and symbol-table optimization opportunities; exact-token aliases must not be the main compression strategy.
+- [x] 7.10 Add a translation layer that expands only the verified output-relevant proof subgraph and renders it to natural language using templates first and LLM surface realization second.
+- [x] 7.10.1 Keep natural-language generation downstream of candidate selection and verification; the translation layer must render verified state, not invent new reasoning.
+- [x] 7.11 Keep each agent small and single-purpose; shared concerns like logging, model access, storage, symbol-table management, and proof hashing must stay in shared services.
+- [x] 7.12 Make budget a real input to foreground agents so work depth changes with the thinking-time policy.
+- [x] 7.12.1 Let larger thinking budgets increase candidate count, verifier depth, and tool-use budget in `deep` mode without violating the locked RAM and VRAM limits.
+- [x] 7.13 Do not claim foreground-agent completion while local retrieval, critic verification depth, graph-backed compression, and macro-aware reasoning are still stubbed.
+- [x] 7.14 If a model output fails schema validation, allow at most one bounded repair attempt before returning a structured failure.
+- [x] 7.14.1 Freeze the Phase 7 acceptance contract: bounded `fast` / `deep`, persisted candidate traces, verifier-backed selection or abstention, repair-aware orchestration, cited translation from verified state, and green tests are the minimum definition of completion.
 
 8. Phase 8 - Implement the Background Self-Optimizer
-- [ ] 8.0.1 Before coding Phase 8, keep the optimizer read-only with respect to live runtime state until replay/simulation infrastructure is in place.
-- [ ] 8.0.2 Before coding Phase 8, lock the evaluation metrics for “better” proposals: compression gain, proof-hash stability, critic validity, latency, and memory cost.
+- [x] 8.0.1 Before coding Phase 8, keep the optimizer read-only with respect to live runtime state until replay/simulation infrastructure is in place.
+- [x] 8.0.2 Before coding Phase 8, lock the evaluation metrics for “better” proposals: compression gain, proof-hash stability, critic validity, latency, and memory cost.
 - [ ] 8.0.3 Before coding Phase 8, define proposal persistence and rollback records first so every activation decision is auditable.
-- [ ] 8.0.4 Before coding Phase 8, cap history windows and replay scope so the optimizer does not become the largest memory consumer in the system.
-- [ ] 8.0.5 Until `8.5` to `8.9` exist, keep the optimizer disabled by default or clearly proposal-only in stub/dev mode; do not treat placeholder cycles as live optimization.
+- [x] 8.0.4 Before coding Phase 8, cap history windows and replay scope so the optimizer does not become the largest memory consumer in the system.
+- [x] 8.0.5 Until `8.5` to `8.9` exist, keep the optimizer disabled by default or clearly proposal-only in stub/dev mode; do not treat placeholder cycles as live optimization.
 - [ ] 8.0.6 Before coding Phase 8, treat any future model improvement as distillation from verified system traces first; do not plan training-from-scratch as the default path.
 - [ ] 8.1 Implement `SelfOptimizer` as a background async service that never blocks the foreground task pipeline.
-- [ ] 8.2 Read reasoning logs, macro usage, critique results, and performance metrics on a schedule.
-- [ ] 8.2.1 Persist candidate-trace sets, verifier scores, agreement scores, tool outputs, and final adjudication so replay and analysis can learn from `deep` mode runs.
+- [x] 8.2 Read reasoning logs, macro usage, critique results, and performance metrics on a schedule.
+- [x] 8.2.1 Persist candidate-trace sets, verifier scores, agreement scores, tool outputs, and final adjudication so replay and analysis can learn from `deep` mode runs.
 - [ ] 8.3 Generate only proposals, never direct live changes.
 - [ ] 8.4 Enforce the lifecycle `propose -> simulate -> validate -> activate`.
-- [ ] 8.5 Build a small simulation harness that reruns sample tasks using candidate macro changes and compares success and efficiency metrics.
+- [x] 8.5 Build a small simulation harness that reruns sample tasks using candidate macro changes and compares success and efficiency metrics.
 - [ ] 8.5.1 Export only verified `deep`-mode traces as datasets for future SFT or process-supervision training; never distill unverified free-form chain-of-thought.
 - [ ] 8.6 Activate a proposal only if it passes validation and improves results without increasing contradiction risk.
 - [ ] 8.7 Keep the currently active macro set immutable during a foreground task run.
-- [ ] 8.8 Replace the current placeholder optimizer cycle with real proposal generation based on persisted reasoning, critique, and performance data.
+- [x] 8.8 Replace the current placeholder optimizer cycle with real proposal generation based on persisted reasoning, critique, and performance data.
 - [ ] 8.8.1 If small-model training is pursued later, begin with distilling verified `deep`-mode behavior into the existing lightweight policy model before considering architecture research or larger local models.
 - [ ] 8.9 Track activation decisions and failed simulations so regressions are visible and rollback is explicit.
 
@@ -330,6 +334,8 @@ Roadmap Adjustment Note (Current Priority Order)
 - [ ] 12.0.3 Before coding Phase 12, add regression fixtures for old serialized payloads and legacy `CompressedTrace` shapes before the IR migration lands.
 - [ ] 12.0.4 Before coding Phase 12, define minimum acceptance thresholds for validity, compression improvement, and bounded resource usage so “passing” is concrete.
 - [x] 12.0.5 Before coding Phase 12, add a reproducible environment manifest (`pyproject.toml` with optional extras) before claiming any real-backend path is supported.
+- [ ] 12.0.5.1 When schema validation, JSONL logging, or structured-generation parsing becomes a measured hot path, install `orjson` as an optional performance dependency; keep stdlib `json` until profiling shows a real bottleneck.
+- [ ] 12.0.5.2 When proof-hash, macro round-trip, and compatibility invariants need stronger generative coverage, install `hypothesis` as the first property-testing dependency instead of expanding only example-based tests.
 - [ ] 12.0.6 Before coding Phase 12, define acceptance criteria for `fast` vs `deep`: `deep` mode must improve correctness on at least one verifiable benchmark family as test-time compute increases.
 - [ ] 12.1 Write unit tests for every agent with mocked model and storage backends.
 - [ ] 12.1.1 Add unit tests for candidate generation, verifier scoring, consensus or adjudication, abstain logic, and tool-backed verification helpers.
@@ -351,6 +357,7 @@ Roadmap Adjustment Note (Current Priority Order)
 - [ ] 12.13 Add explicit tests for the top-level public API checklist so phase completion and interface compliance cannot drift apart.
 - [ ] 12.14 Do not mark the project feature complete while placeholder runtime paths or text-only dashboard behavior remain.
 - [ ] 12.15 Add proof-hash stability tests so semantically equivalent encodings normalize to the same canonical fingerprint.
+- [ ] 12.15.2 If `hypothesis` is installed, add property tests for proof-hash stability, macro round-trip invariants, and structured-payload compatibility fuzzing before broadening lower-value coverage.
 - [ ] 12.15.1 Add candidate-agreement and consensus tests so `deep` mode selection is based on verifier and agreement score rather than text fluency alone.
 - [ ] 12.16 Add failure-path tests for provenance loss, uncertainty erasure, macro signature mismatch, and noncanonical encodings.
 - [x] 12.17 Add selective-context tests proving only active opcode/macro/symbol-table entries are loaded for a task instead of the whole registry.
@@ -365,12 +372,14 @@ Acceptance Checklist
 - [ ] The macro engine supports nested macros and round-trip verification safely.
 - [ ] The compression system uses a canonical graph-backed IR with parameterized macros, proof hashing, and per-task symbol tables instead of plain string-token shorthands.
 - [ ] The Researcher uses local retrieval before web access.
-- [ ] The runtime supports bounded `fast` and `deep` reasoning modes, and `deep` mode can trade latency for higher correctness on verifiable tasks without breaking local resource limits.
-- [ ] For checkable tasks, final answer selection is verifier or tool-backed rather than driven only by text fluency.
-- [ ] Hard unverified cases degrade to structured uncertainty or surfaced warnings instead of confident unsupported answers.
+- [x] The runtime supports bounded `fast` and `deep` reasoning modes, and `deep` mode can trade latency for higher correctness on verifiable tasks without breaking local resource limits.
+- [x] For checkable tasks, final answer selection is verifier or tool-backed rather than driven only by text fluency.
+- [x] Hard unverified cases degrade to structured uncertainty or surfaced warnings instead of confident unsupported answers.
 - [ ] Runtime events and agent statuses are machine-readable, persisted, and shared across storage, orchestrator, and dashboard surfaces.
 - [ ] The Self-Optimizer never applies live changes without simulation and validation.
 - [ ] The dashboard works and shows live progress, logs, macro usage, and results.
+- [ ] The system supports user-controlled `1 min -> 12 h` reasoning budgets and turns extra time into real additional work rather than artificial delay.
+- [ ] Long-horizon reasoning stays hardware-bounded through checkpointing, throttling, and cooperative scheduling instead of saturating CPU, RAM, or VRAM for the full wall-clock budget.
 - [ ] Tests cover unit, integration, resource, failure, and optimization scenarios.
 - [ ] The public interface checklist at the top of this file is fully matched by the codebase.
 - [ ] Placeholder runtime paths have been replaced by real or clearly configured backend behavior.
@@ -378,17 +387,19 @@ Acceptance Checklist
 - [ ] Real-mode prerequisites are reproducible from a manifest plus README, and missing dependencies/services/models fail clearly.
 
 Assumptions and Defaults
+- [ ] Default thinking-time control: user-facing slider with `1 min -> 12 h` range and bounded presets
+- [ ] Default long-horizon policy: above `120 min`, shift from one saturated preset to checkpointed, duty-cycled refinement
 - [ ] Default GUI: `Tkinter`
 - [ ] Default persistence: `SQLite + JSONL`
 - [ ] Default architecture: shared generation backend + shared embedding backend
 - [ ] Default local vector store: `Chroma PersistentClient`
 - [ ] Optional secondary vector store: `sqlite-vec`, deferred until after persistence and event/status work
 - [x] Default retrieval embedding model: `sentence-transformers/intfloat/e5-small-v2`
-- [ ] Default reasoning strategy: system-first lightweight policy model plus verifier and tool stack, not training a new foundation model from scratch
-- [ ] Default reasoning priority: verifiable reasoning and precision before broad conversational polish
-- [ ] Default reasoning modes: bounded `fast` and `deep`
-- [ ] Default `deep`-mode selection policy: generate bounded candidate traces, verify them, then select, repair, or abstain
-- [ ] Default tool-verification policy: use bounded Python or code-test execution for checkable tasks before optional model-only fallback
+- [x] Default reasoning strategy: system-first lightweight policy model plus verifier and tool stack, not training a new foundation model from scratch
+- [x] Default reasoning priority: verifiable reasoning and precision before broad conversational polish
+- [x] Default reasoning modes: bounded `fast` and `deep`
+- [x] Default `deep`-mode selection policy: generate bounded candidate traces, verify them, then select, repair, or abstain
+- [x] Default tool-verification policy: use bounded Python or code-test execution for checkable tasks before optional model-only fallback
 - [ ] Default compression architecture: canonical graph-backed IR compiled into a compact operation stream with parameterized macros and proof hashing
 - [ ] Default model-output policy: schema-constrained JSON at agent boundaries
 - [ ] Default dev calibration profile: `4GB VRAM / 8GB RAM` current laptop while keeping `6GB VRAM / 8GB RAM` as the locked baseline acceptance target
@@ -458,3 +469,21 @@ Assumptions and Defaults
 - [ ] 16.8 Dashboard done gate: UI remains responsive during long-running tasks and displays live logs/status.
 - [ ] 16.9 Resource done gate: target runtime stays within practical limits for 6GB VRAM / 8GB RAM baseline.
 - [ ] 16.10 Release done gate: end-to-end tests pass and acceptance checklist is fully checked.
+
+17. Phase 17 - Long-Horizon Reasoning Control and Time Slider
+- [ ] 17.0.1 Before coding Phase 17, preserve `run_task(question, thinking_minutes)` as the public contract; extend long-horizon behavior additively instead of creating a separate “hours mode” API.
+- [ ] 17.0.2 Before coding Phase 17, treat `12 hours` as a wall-clock budget ceiling, not permission for unbounded full-load compute; long runs must yield, checkpoint, and stay honest to the 6GB VRAM / 8GB RAM target.
+- [ ] 17.0.3 Before coding Phase 17, keep the time slider tied to actual additional work: more candidate batches, verification rounds, research refreshes, and critique passes, not artificial sleeping.
+- [ ] 17.0.4 Before coding Phase 17, replace the current saturated `121-720 min` behavior with a checkpointed long-horizon schedule; per-cycle work stays bounded even when total wall time is large.
+- [ ] 17.1 Extend `ResourceBudget` and `BudgetPolicy` additively with long-horizon fields such as wall-clock budget, cycle budget, checkpoint cadence, duty cycle, cool-down interval, and max resume count while keeping old callers valid.
+- [ ] 17.2 Implement a cooperative long-horizon scheduler that alternates bounded work bursts, persistence, and idle or yield periods so hours-long runs do not monopolize CPU, RAM, or VRAM.
+- [ ] 17.3 Persist long-horizon session state, checkpoints, partial candidate sets, evidence refresh state, and critique summaries so runs can pause, resume, recover, and survive restart.
+- [ ] 17.4 For budgets above `120` minutes, spend extra time on additional candidate batches, verifier rounds, retrieval refreshes, and consensus or adjudication passes instead of only making single prompts larger.
+- [ ] 17.5 Add pause, resume, cancel, and safe shutdown behavior for long-horizon sessions.
+- [ ] 17.6 Add pressure-aware throttling: if RAM, VRAM, thermal headroom, queue pressure, or backend health degrade, reduce duty cycle, shrink batch depth, or pause background work instead of pushing harder.
+- [ ] 17.7 Add a dashboard time-control surface with a `1 min -> 12 h` slider, explicit preset labels, ETA or elapsed time, current phase, checkpoint counters, and a clear distinction between interactive and long-horizon modes.
+- [ ] 17.8 Show what extra time bought: additional evidence gathered, candidate count, verification passes, repairs, abstentions avoided, or confidence improvements.
+- [ ] 17.9 Add end-to-end and resource tests that prove `12h` mode remains bounded on both the 4GB dev profile and the 6GB baseline target, checkpoints resume correctly, and longer budgets can improve at least one verifiable benchmark family.
+- [ ] 17.10 Do not mark Phase 17 complete while `121` minutes and `720` minutes still collapse to the same effective schedule.
+- [ ] 17.11 Keep long-horizon work compatible with future optimizer replay or export flows; checkpoint artifacts must stay machine-readable and only verified final traces may feed future distillation or process-supervision datasets.
+- [ ] 17.12 If a long-horizon run finds no measurable improvement after multiple cycles, allow early stop with a structured explanation rather than consuming the full wall-clock budget pointlessly.

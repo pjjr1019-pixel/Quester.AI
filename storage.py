@@ -18,6 +18,8 @@ from data_structures import (
     DecoderEntry,
     Macro,
     OpcodeEntry,
+    OptimizerReplayEvaluation,
+    OptimizerReplaySample,
     PerformanceMetric,
     ProofHashRecord,
     ReasoningLog,
@@ -28,6 +30,8 @@ from data_structures import (
     coerce_agent_status,
     coerce_compressed_trace,
     coerce_decoder_entry,
+    coerce_optimizer_replay_evaluation,
+    coerce_optimizer_replay_sample,
     coerce_opcode_entry,
     coerce_proof_hash_record,
     coerce_runtime_event,
@@ -1489,6 +1493,158 @@ class PerformanceHistoryRepository(_SQLiteRepository):
         return tuple(PerformanceMetric.from_dict(_json_loads(row["payload_json"])) for row in rows)
 
 
+class OptimizerReplaySampleRepository(_SQLiteRepository):
+    """Replay-grade optimizer input records derived from completed task results."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optimizer_replay_samples (
+                task_id TEXT PRIMARY KEY,
+                trace_proof_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_replay_samples_proof_hash "
+            "ON optimizer_replay_samples (trace_proof_hash);"
+        )
+        conn.commit()
+
+    def upsert(self, sample: OptimizerReplaySample) -> None:
+        conn = self._conn()
+        payload_json = _json_dumps(sample.to_dict())
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO optimizer_replay_samples (
+                    task_id,
+                    trace_proof_hash,
+                    payload_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    trace_proof_hash = excluded.trace_proof_hash,
+                    payload_json = excluded.payload_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    sample.task_id,
+                    sample.trace_proof_hash,
+                    payload_json,
+                    sample.created_at.isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def list(self, *, task_id: str | None = None) -> tuple[OptimizerReplaySample, ...]:
+        conn = self._conn()
+        if task_id is None:
+            query = "SELECT payload_json FROM optimizer_replay_samples ORDER BY created_at, task_id"
+            values: tuple[Any, ...] = ()
+        else:
+            query = "SELECT payload_json FROM optimizer_replay_samples WHERE task_id = ? ORDER BY created_at, task_id"
+            values = (task_id,)
+        with self._lock:
+            cursor = conn.execute(query, values)
+            rows = cursor.fetchall()
+        return tuple(OptimizerReplaySample.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
+class OptimizerReplayEvaluationRepository(_SQLiteRepository):
+    """Persisted offline replay evaluations for proposal-only optimizer cycles."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optimizer_replay_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                trace_proof_hash TEXT NOT NULL,
+                aggregate_score REAL NOT NULL,
+                accepted INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_replay_evaluations_proposal "
+            "ON optimizer_replay_evaluations (proposal_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_replay_evaluations_task "
+            "ON optimizer_replay_evaluations (task_id);"
+        )
+        conn.commit()
+
+    def append_many(self, evaluations: Sequence[OptimizerReplayEvaluation]) -> None:
+        if not evaluations:
+            return
+        conn = self._conn()
+        with self._lock:
+            conn.executemany(
+                """
+                INSERT INTO optimizer_replay_evaluations (
+                    proposal_id,
+                    task_id,
+                    trace_proof_hash,
+                    aggregate_score,
+                    accepted,
+                    payload_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        evaluation.proposal_id,
+                        evaluation.task_id,
+                        evaluation.trace_proof_hash,
+                        evaluation.aggregate_score,
+                        1 if evaluation.accepted else 0,
+                        _json_dumps(evaluation.to_dict()),
+                        evaluation.created_at.isoformat(),
+                    )
+                    for evaluation in evaluations
+                ],
+            )
+            conn.commit()
+
+    def list(
+        self,
+        *,
+        proposal_id: str | None = None,
+        task_id: str | None = None,
+    ) -> tuple[OptimizerReplayEvaluation, ...]:
+        conn = self._conn()
+        clauses: list[str] = []
+        values: list[str] = []
+        if proposal_id is not None:
+            clauses.append("proposal_id = ?")
+            values.append(proposal_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            values.append(task_id)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cursor = conn.execute(
+                f"""
+                SELECT payload_json
+                FROM optimizer_replay_evaluations
+                {where_clause}
+                ORDER BY id
+                """,
+                tuple(values),
+            )
+            rows = cursor.fetchall()
+        return tuple(OptimizerReplayEvaluation.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
 class StorageManager:
     """Owns local persistence lifecycle and additively exposes specialized repositories."""
 
@@ -1521,6 +1677,8 @@ class StorageManager:
         self.proof_hashes = ProofHashRepository(self)
         self.reasoning_history = ReasoningHistoryRepository(self)
         self.performance_history = PerformanceHistoryRepository(self)
+        self.optimizer_replay_samples = OptimizerReplaySampleRepository(self)
+        self.optimizer_replay_evaluations = OptimizerReplayEvaluationRepository(self)
         self.retrieval = LocalRetrievalService(
             settings=self.config.retrieval,
             lexical_store=self.chunks,
@@ -1560,9 +1718,13 @@ class StorageManager:
             self.proof_hashes,
             self.reasoning_history,
             self.performance_history,
+            self.optimizer_replay_samples,
+            self.optimizer_replay_evaluations,
         ):
             repository.create_tables()
 
+        self._verify_schema_version()
+        self._run_integrity_check()
         await self._ensure_default_runtime_lexicon()
 
         self._vector_index = self._start_vector_index()
@@ -1576,6 +1738,27 @@ class StorageManager:
             self._db_path,
             self.vector_index_backend_name,
         )
+
+    def _verify_schema_version(self) -> None:
+        expected_version = int(self.config.storage.schema_version)
+        stored_version = self.kv.get("storage.schema_version")
+        if stored_version is None:
+            self.kv.set("storage.schema_version", expected_version)
+            return
+        if int(stored_version) != expected_version:
+            raise RuntimeError(
+                f"Unsupported storage schema version {stored_version}; expected {expected_version}."
+            )
+
+    def _run_integrity_check(self) -> None:
+        if not self.config.storage.integrity_check_on_start:
+            return
+        conn = self._require_conn()
+        with self._lock:
+            row = conn.execute("PRAGMA integrity_check;").fetchone()
+        result = str(row[0]) if row is not None else ""
+        if result.lower() != "ok":
+            raise RuntimeError(f"SQLite integrity check failed: {result or 'unknown_error'}")
 
     async def _ensure_default_runtime_lexicon(self) -> None:
         """Bootstrap the minimal built-in opcode and decoder registry for fresh runtimes."""
@@ -1783,6 +1966,7 @@ class StorageManager:
         """Persist the final typed task result snapshot."""
         task_result = coerce_task_result(result)
         self.tasks.upsert(task_result)
+        self.optimizer_replay_samples.upsert(self._build_optimizer_replay_sample(task_result))
 
     async def get_task_result(self, task_id: str) -> TaskResult | None:
         """Load one persisted task result by task ID."""
@@ -1793,6 +1977,200 @@ class StorageManager:
         """Return the current persisted task-run count."""
         self._require_conn()
         return self.tasks.count()
+
+    def _build_optimizer_replay_sample(self, task_result: TaskResult) -> OptimizerReplaySample:
+        """Derive one replay-grade optimizer sample from a completed task result."""
+        reasoning = task_result.reasoning
+        critique = task_result.critique
+        context_metadata = dict(reasoning.context_frames[0].metadata) if reasoning.context_frames else {}
+        candidate_by_id = {
+            candidate_trace.candidate_id: candidate_trace
+            for candidate_trace in reasoning.candidate_traces
+        }
+        selected_candidate_id = self._select_replay_candidate_id(
+            reasoning=reasoning,
+            context_metadata=context_metadata,
+        )
+        selected_candidate = candidate_by_id.get(selected_candidate_id)
+        candidate_ids = tuple(candidate_by_id) or ((selected_candidate_id,) if selected_candidate_id else ())
+        metric = task_result.metrics[-1] if task_result.metrics else None
+        return OptimizerReplaySample(
+            task_id=task_result.task_id,
+            trace_proof_hash=reasoning.proof_hash,
+            selected_candidate_id=selected_candidate_id,
+            candidate_ids=candidate_ids,
+            candidate_trace_count=len(reasoning.candidate_traces),
+            selected_strategy=self._select_replay_strategy(
+                context_metadata=context_metadata,
+                candidate=selected_candidate,
+            ),
+            selected_verifier=self._select_replay_verifier(
+                critique_verifier=critique.verifier_type,
+                context_metadata=context_metadata,
+                candidate=selected_candidate,
+            ),
+            selected_candidate_score=self._clamp_score(
+                self._select_replay_score(
+                    critique_score=critique.candidate_score,
+                    context_metadata=context_metadata,
+                    candidate=selected_candidate,
+                )
+            ),
+            selected_agreement_score=self._clamp_score(
+                selected_candidate.agreement_score if selected_candidate is not None else 0.0
+            ),
+            selected_evidence_support_score=self._clamp_score(
+                selected_candidate.evidence_support_score if selected_candidate is not None else critique.evidence_coverage
+            ),
+            provenance_coverage=self._clamp_score(critique.provenance_coverage),
+            evidence_coverage=self._clamp_score(critique.evidence_coverage),
+            final_adjudication=critique.result,
+            is_valid=critique.is_valid,
+            proof_hash_match=critique.proof_hash_match,
+            failure_categories=tuple(dict.fromkeys(str(item) for item in critique.failure_categories if str(item).strip())),
+            suggested_repair_actions=tuple(
+                dict.fromkeys(str(item) for item in critique.repair_actions if str(item).strip())
+            ),
+            applied_repair_actions=self._extract_applied_repair_actions(task_result.warnings),
+            answer_text=task_result.answer_text or self._select_replay_answer(reasoning=reasoning, context_metadata=context_metadata),
+            latency_s=float(metric.time) if metric is not None else 0.0,
+            vram_usage_gb=float(metric.vram_usage) if metric is not None else 0.0,
+            iterations=int(metric.iterations) if metric is not None else 0,
+            created_at=task_result.completed_at,
+        )
+
+    def _select_replay_candidate_id(
+        self,
+        *,
+        reasoning: CompressedTrace,
+        context_metadata: dict[str, Any],
+    ) -> str:
+        selected_candidate_id = str(context_metadata.get("cid", "")).strip()
+        if selected_candidate_id:
+            return selected_candidate_id
+        for step in reversed(reasoning.operation_stream):
+            candidate_id = str(step.metadata.get("candidate_id", "")).strip()
+            if candidate_id:
+                return candidate_id
+        if reasoning.candidate_traces:
+            return reasoning.candidate_traces[0].candidate_id
+        return ""
+
+    def _select_replay_answer(
+        self,
+        *,
+        reasoning: CompressedTrace,
+        context_metadata: dict[str, Any],
+    ) -> str:
+        answer_text = str(context_metadata.get("ta", "")).strip()
+        if answer_text:
+            return answer_text
+        for step in reversed(reasoning.operation_stream):
+            emitted = str(step.metadata.get("answer_text", "")).strip()
+            if emitted:
+                return emitted
+        if reasoning.candidate_traces:
+            return reasoning.candidate_traces[0].answer_text
+        return ""
+
+    def _select_replay_strategy(
+        self,
+        *,
+        context_metadata: dict[str, Any],
+        candidate,
+    ) -> str:
+        strategy = str(context_metadata.get("sa", "")).strip()
+        if strategy:
+            return strategy
+        if candidate is not None and candidate.strategy.strip():
+            return candidate.strategy
+        return ""
+
+    def _select_replay_verifier(
+        self,
+        *,
+        critique_verifier: str,
+        context_metadata: dict[str, Any],
+        candidate,
+    ) -> str:
+        verifier = str(critique_verifier).strip()
+        if verifier:
+            return verifier
+        verifier = str(context_metadata.get("sv", "")).strip()
+        if verifier:
+            return verifier
+        if candidate is not None and candidate.verifier_type.strip():
+            return candidate.verifier_type
+        return ""
+
+    def _select_replay_score(
+        self,
+        *,
+        critique_score: float,
+        context_metadata: dict[str, Any],
+        candidate,
+    ) -> float:
+        if candidate is not None:
+            return float(candidate.total_score)
+        try:
+            context_score = float(context_metadata.get("ss", critique_score))
+        except (TypeError, ValueError):
+            context_score = critique_score
+        return float(context_score)
+
+    def _extract_applied_repair_actions(self, warnings: Sequence[str]) -> tuple[str, ...]:
+        actions: list[str] = []
+        for warning in warnings:
+            if not str(warning).startswith("repair_applied:"):
+                continue
+            payload = str(warning).split(":", 1)[1]
+            actions.extend(
+                item.strip()
+                for item in payload.split(",")
+                if item.strip()
+            )
+        return tuple(dict.fromkeys(actions))
+
+    def _clamp_score(self, value: float) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        return max(0.0, min(1.0, numeric))
+
+    async def record_optimizer_replay_sample(
+        self,
+        sample: OptimizerReplaySample | dict[str, Any],
+    ) -> None:
+        """Persist one optimizer replay sample."""
+        self.optimizer_replay_samples.upsert(coerce_optimizer_replay_sample(sample))
+
+    async def list_optimizer_replay_samples(
+        self,
+        *,
+        task_id: str | None = None,
+    ) -> tuple[OptimizerReplaySample, ...]:
+        """Return persisted replay samples in append order."""
+        self._require_conn()
+        return self.optimizer_replay_samples.list(task_id=task_id)
+
+    async def record_optimizer_replay_evaluations(
+        self,
+        evaluations: Sequence[OptimizerReplayEvaluation | dict[str, Any]],
+    ) -> None:
+        """Persist one or more optimizer replay evaluations."""
+        normalized = tuple(coerce_optimizer_replay_evaluation(item) for item in evaluations)
+        self.optimizer_replay_evaluations.append_many(normalized)
+
+    async def list_optimizer_replay_evaluations(
+        self,
+        *,
+        proposal_id: str | None = None,
+        task_id: str | None = None,
+    ) -> tuple[OptimizerReplayEvaluation, ...]:
+        """Return persisted replay evaluations in append order."""
+        self._require_conn()
+        return self.optimizer_replay_evaluations.list(proposal_id=proposal_id, task_id=task_id)
 
     async def register_macro(self, macro: Macro) -> None:
         """Persist a versioned macro definition."""

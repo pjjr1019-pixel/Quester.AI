@@ -36,13 +36,13 @@ class StructuredGenerationService:
         *,
         prompt: str,
         schema: Mapping[str, Any],
-        parser: Callable[[Mapping[str, Any]], DecodedType],
+        parser: Callable[[Any], DecodedType],
         fallback_factory: Callable[[str | None], DecodedType],
         max_tokens: int | None = None,
     ) -> StructuredDecodeResult[DecodedType]:
         request_prompt = self._build_structured_prompt(prompt=prompt, schema=schema)
         raw_text = await self.model_manager.generate(request_prompt, max_tokens=max_tokens)
-        parsed, error_message = self._try_parse_payload(raw_text, parser)
+        parsed, error_message = self._try_parse_payload(raw_text, schema, parser)
         if parsed is not None:
             return StructuredDecodeResult(
                 value=parsed,
@@ -58,7 +58,7 @@ class StructuredGenerationService:
             error_message=error_message or "unknown_parse_failure",
         )
         repaired_text = await self.model_manager.generate(repair_prompt, max_tokens=max_tokens)
-        repaired, repaired_error = self._try_parse_payload(repaired_text, parser)
+        repaired, repaired_error = self._try_parse_payload(repaired_text, schema, parser)
         if repaired is not None:
             return StructuredDecodeResult(
                 value=repaired,
@@ -101,18 +101,81 @@ class StructuredGenerationService:
     def _try_parse_payload(
         self,
         text: str,
-        parser: Callable[[Mapping[str, Any]], DecodedType],
+        schema: Mapping[str, Any],
+        parser: Callable[[Any], DecodedType],
     ) -> tuple[DecodedType | None, str | None]:
         try:
             payload = self._extract_json_payload(text)
         except ValueError as exc:
             return None, str(exc)
-        if not isinstance(payload, dict):
-            return None, "structured output must decode to a JSON object"
+        try:
+            self._validate_schema(payload, schema)
+        except ValueError as exc:
+            return None, str(exc)
         try:
             return parser(payload), None
         except Exception as exc:  # pragma: no cover - validation path
             return None, str(exc)
+
+    def _validate_schema(
+        self,
+        payload: Any,
+        schema: Mapping[str, Any],
+        *,
+        path: str = "$",
+    ) -> None:
+        schema_type = schema.get("type")
+        if schema_type == "object":
+            if not isinstance(payload, dict):
+                raise ValueError(f"{path} must be an object")
+            required = tuple(str(item) for item in schema.get("required", ()))
+            properties = schema.get("properties", {})
+            additional_properties = bool(schema.get("additionalProperties", True))
+            for field_name in required:
+                if field_name not in payload:
+                    raise ValueError(f"{path}.{field_name} is required")
+            if not additional_properties:
+                unknown_fields = sorted(set(payload) - set(properties))
+                if unknown_fields:
+                    raise ValueError(f"{path} contains unsupported fields: {', '.join(unknown_fields)}")
+            for field_name, field_value in payload.items():
+                field_schema = properties.get(field_name)
+                if isinstance(field_schema, Mapping):
+                    self._validate_schema(field_value, field_schema, path=f"{path}.{field_name}")
+            return
+
+        if schema_type == "array":
+            if not isinstance(payload, list):
+                raise ValueError(f"{path} must be an array")
+            item_schema = schema.get("items")
+            if isinstance(item_schema, Mapping):
+                for index, item in enumerate(payload):
+                    self._validate_schema(item, item_schema, path=f"{path}[{index}]")
+            return
+
+        if schema_type == "string":
+            if not isinstance(payload, str):
+                raise ValueError(f"{path} must be a string")
+            return
+
+        if schema_type == "number":
+            if isinstance(payload, bool) or not isinstance(payload, (int, float)):
+                raise ValueError(f"{path} must be a number")
+            return
+
+        if schema_type == "integer":
+            if isinstance(payload, bool) or not isinstance(payload, int):
+                raise ValueError(f"{path} must be an integer")
+            return
+
+        if schema_type == "boolean":
+            if not isinstance(payload, bool):
+                raise ValueError(f"{path} must be a boolean")
+            return
+
+        if schema_type == "null":
+            if payload is not None:
+                raise ValueError(f"{path} must be null")
 
     def _extract_json_payload(self, text: str) -> Any:
         trimmed = text.strip()
