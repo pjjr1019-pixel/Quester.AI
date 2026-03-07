@@ -25,3 +25,11 @@ class ResourcePressureError(ModelRuntimeError):
 
 class BackendFallbackError(ModelRuntimeError):
     """Raised when fallback was required but no usable fallback exists."""
+
+
+class WebLookupError(RuntimeError):
+    """Base runtime error for bounded web lookup failures."""
+
+
+class WebLookupTimeoutError(WebLookupError):
+    """Raised when a web lookup request exceeds the configured timeout."""

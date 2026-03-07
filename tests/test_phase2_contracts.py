@@ -9,24 +9,41 @@ from inspect import signature
 from pathlib import Path
 
 from config import APP_CONFIG, BudgetPolicy
+from agent_schema import (
+    parse_critic_output,
+    parse_planner_output,
+    parse_reasoner_critic_handoff,
+    parse_reasoner_output,
+    parse_research_reasoner_handoff,
+)
 from data_structures import (
     AgentState,
     AgentStatus,
+    CanonicalReasoningGraph,
     CompressedTrace,
+    ContextFrame,
     CritiqueReport,
     CritiqueResult,
+    DecodeHint,
     EvidenceBundle,
     EvidenceItem,
     KnowledgeVector,
     LifecycleStatus,
     Macro,
     MacroProposal,
+    OperationStep,
     PerformanceMetric,
     Plan,
     PlanStep,
+    ProvenanceBundle,
+    ReasonerCriticHandoff,
     ReasoningLog,
+    ResearchReasonerHandoff,
     ResourceBudget,
     RuntimeEvent,
+    SemanticActivity,
+    SemanticAgent,
+    SemanticEntity,
     SourceType,
     TaskResult,
     TaskState,
@@ -79,6 +96,66 @@ def _build_contract_examples() -> dict[str, object]:
         web_results=(),
         used_web_fallback=False,
     )
+    graph = CanonicalReasoningGraph(
+        entities=(
+            SemanticEntity(
+                entity_id="ent_question",
+                entity_type="question",
+                value=plan.question,
+            ),
+            SemanticEntity(
+                entity_id="ent_answer",
+                entity_type="answer_fragment",
+                value="Typed answer fragment",
+                evidence_handles=(local_item.id,),
+                confidence=0.75,
+            ),
+        ),
+        activities=(
+            SemanticActivity(
+                activity_id="act_reason",
+                activity_type="reason",
+                input_entity_ids=("ent_question",),
+                output_entity_ids=("ent_answer",),
+                agent_id="agent_reasoner",
+                evidence_handles=(local_item.id,),
+            ),
+        ),
+        agents=(
+            SemanticAgent(
+                agent_id="agent_reasoner",
+                component="reasoner",
+                backend="stub_generation",
+                role="foreground_reasoning",
+            ),
+        ),
+        bundles=(
+            ProvenanceBundle(
+                bundle_id="bundle_primary",
+                entity_ids=("ent_question", "ent_answer"),
+                activity_ids=("act_reason",),
+                agent_ids=("agent_reasoner",),
+            ),
+        ),
+    )
+    context_frame = ContextFrame(
+        frame_id="ctx_primary",
+        scope="task",
+        confidence=0.75,
+        provenance_bundle_id="bundle_primary",
+    )
+    operation = OperationStep(
+        op_id="op_emit",
+        opcode="emit",
+        args=("sym_answer",),
+        context_frame_id=context_frame.frame_id,
+        evidence_handles=(local_item.id,),
+    )
+    decode_hint = DecodeHint(
+        hint_id="hint_answer",
+        template="verified_answer",
+        entity_ids=("ent_answer",),
+    )
     trace = CompressedTrace(
         task_id=plan.task_id,
         tokens=("@read_question", "@compose_answer"),
@@ -86,6 +163,14 @@ def _build_contract_examples() -> dict[str, object]:
         macros_used=("@compose_answer",),
         confidence=0.75,
         reasoner_notes="reasoner-note",
+        ir_version="1",
+        canonical_graph=graph,
+        operation_stream=(operation,),
+        symbol_table_refs=("sym_question", "sym_answer"),
+        evidence_handles=(local_item.id,),
+        context_frames=(context_frame,),
+        proof_hash="abc123",
+        decode_hints=(decode_hint,),
     )
     critique = CritiqueReport(
         task_id=plan.task_id,
@@ -112,6 +197,17 @@ def _build_contract_examples() -> dict[str, object]:
         critique=critique,
         compression=(proposal,),
     )
+    research_handoff = ResearchReasonerHandoff.from_inputs(
+        plan=plan,
+        evidence=evidence,
+        budget=budget,
+    )
+    critique_handoff = ReasonerCriticHandoff.from_inputs(
+        plan=plan,
+        evidence=evidence,
+        trace=trace,
+        budget=budget,
+    )
     return {
         "ResourceBudget": budget,
         "PlanStep": plan_step,
@@ -135,7 +231,17 @@ def _build_contract_examples() -> dict[str, object]:
         ),
         "EvidenceItem": local_item,
         "EvidenceBundle": evidence,
+        "SemanticEntity": graph.entities[0],
+        "SemanticActivity": graph.activities[0],
+        "SemanticAgent": graph.agents[0],
+        "ProvenanceBundle": graph.bundles[0],
+        "ContextFrame": context_frame,
+        "OperationStep": operation,
+        "DecodeHint": decode_hint,
+        "CanonicalReasoningGraph": graph,
         "CompressedTrace": trace,
+        "ResearchReasonerHandoff": research_handoff,
+        "ReasonerCriticHandoff": critique_handoff,
         "CritiqueReport": critique,
         "MacroProposal": proposal,
         "TaskResult": task_result,
@@ -153,6 +259,26 @@ class DataStructureRoundTripTests(unittest.TestCase):
             payload = instance.to_dict()
             rebuilt = type(instance).from_dict(payload)
             self.assertEqual(instance, rebuilt, msg=f"Round-trip failed for {name}")
+
+    def test_boundary_schema_helpers_round_trip(self) -> None:
+        examples = _build_contract_examples()
+        self.assertEqual(parse_planner_output(examples["Plan"].to_dict()), examples["Plan"])
+        self.assertEqual(
+            parse_reasoner_output(examples["CompressedTrace"].to_dict()),
+            examples["CompressedTrace"],
+        )
+        self.assertEqual(
+            parse_research_reasoner_handoff(examples["ResearchReasonerHandoff"].to_dict()),
+            examples["ResearchReasonerHandoff"],
+        )
+        self.assertEqual(
+            parse_reasoner_critic_handoff(examples["ReasonerCriticHandoff"].to_dict()),
+            examples["ReasonerCriticHandoff"],
+        )
+        self.assertEqual(
+            parse_critic_output(examples["CritiqueReport"].to_dict()),
+            examples["CritiqueReport"],
+        )
 
 
 class DataStructureValidationTests(unittest.TestCase):

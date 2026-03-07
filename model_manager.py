@@ -181,6 +181,18 @@ class ModelManager:
 
     async def embed(self, text: str) -> list[float]:
         """Run an embedding request through the active bounded backend."""
+        return await self._embed_with_role(text, role="generic")
+
+    async def embed_query(self, text: str) -> list[float]:
+        """Run a retrieval-query embedding request through the active backend."""
+        return await self._embed_with_role(text, role="query")
+
+    async def embed_document(self, text: str) -> list[float]:
+        """Run a retrieval-document embedding request through the active backend."""
+        return await self._embed_with_role(text, role="document")
+
+    async def _embed_with_role(self, text: str, *, role: str) -> list[float]:
+        """Run an embedding request through the active bounded backend."""
         self._require_started()
         async with self._embedding_sem:
             self._active_embedding_jobs += 1
@@ -189,14 +201,14 @@ class ModelManager:
                 backend = await self._ensure_embedding_backend_ready()
                 try:
                     vector = await asyncio.wait_for(
-                        backend.embed(text),
+                        self._dispatch_embedding_request(backend, text=text, role=role),
                         timeout=self.config.backend_runtime.request_timeout_s,
                     )
                 except asyncio.TimeoutError as exc:
                     await self._handle_embedding_failure(ModelTimeoutError("Embedding request timed out."))
                     raise ModelTimeoutError("Embedding request timed out.") from exc
                 except (BackendUnavailableError, BackendStartupError) as exc:
-                    vector = await self._handle_embedding_failure(exc, text=text)
+                    vector = await self._handle_embedding_failure(exc, text=text, role=role)
                 self._mark_used()
                 await self._refresh_health()
                 return vector
@@ -326,6 +338,7 @@ class ModelManager:
         error: Exception,
         *,
         text: str | None = None,
+        role: str = "generic",
     ) -> list[float]:
         self._last_error = str(error)
         if (
@@ -339,7 +352,7 @@ class ModelManager:
             raise error
         backend = await self._ensure_embedding_backend_ready()
         return await asyncio.wait_for(
-            backend.embed(text),
+            self._dispatch_embedding_request(backend, text=text, role=role),
             timeout=self.config.backend_runtime.request_timeout_s,
         )
 
@@ -446,6 +459,8 @@ class ModelManager:
             self._primary_generation_backend = StubGenerationBackend()
             self._primary_embedding_backend = StubEmbeddingBackend(
                 dimensions=self.config.model_tuning.embedding_dimensions,
+                query_prefix=self.config.retrieval.query_prefix,
+                document_prefix=self.config.retrieval.document_prefix,
             )
             self._fallback_generation_backend = None
             self._fallback_embedding_backend = None
@@ -482,14 +497,32 @@ class ModelManager:
             return SentenceTransformersEmbeddingBackend(
                 model_name=model_name,
                 timeout_s=self.config.backend_runtime.request_timeout_s,
+                prefer_asymmetric_embeddings=self.config.retrieval.prefer_asymmetric_embeddings,
+                query_prefix=self.config.retrieval.query_prefix,
+                document_prefix=self.config.retrieval.document_prefix,
             )
         if backend_name == "ollama_embeddings":
             return OllamaEmbeddingBackend(
                 base_url=self.config.backend_runtime.ollama_base_url,
                 model_name=model_name,
                 timeout_s=self.config.backend_runtime.request_timeout_s,
+                query_prefix=self.config.retrieval.query_prefix,
+                document_prefix=self.config.retrieval.document_prefix,
             )
         raise BackendUnavailableError(f"Unsupported embedding backend: {backend_name}")
+
+    async def _dispatch_embedding_request(
+        self,
+        backend: EmbeddingBackendAdapter,
+        *,
+        text: str,
+        role: str,
+    ) -> list[float]:
+        if role == "query":
+            return await backend.embed_query(text)
+        if role == "document":
+            return await backend.embed_document(text)
+        return await backend.embed(text)
 
     def _read_ram_telemetry(self) -> tuple[float | None, float | None]:
         if not self.config.backend_runtime.telemetry_enable_psutil or psutil is None:

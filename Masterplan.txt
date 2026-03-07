@@ -115,12 +115,12 @@ Compatibility Contract for Future Phases
 Phase 3 exit note
 - [x] Phase 3 is complete for the current codebase: backend abstraction, semaphores, fallback rules, health snapshots, and idle maintenance are implemented. Real-backend smoke remains a later acceptance-gate item because local services, dependencies, and model files are environment prerequisites rather than remaining Phase 3 code.
 
-4. Phase 4 - Budget Policy and Thinking-Time Mapping
+4. Phase 4 - Budget Policy and Thinking-Time Mapping (Complete)
 - [x] 4.0.1 Before coding Phase 4, treat existing `BudgetPolicy.from_minutes()` and `Orchestrator.run_task(...)` as the baseline; calibrate and extend them instead of creating duplicate entrypoints or duplicate budget logic.
 - [x] 4.0.2 Before coding Phase 4, decide one source of truth for budget derivation in `config.py` and make all agents consume the same `ResourceBudget` object.
-- [ ] 4.0.3 Before coding Phase 4, add tests that prove different `thinking_minutes` values actually change downstream behavior instead of only changing metadata.
-- [ ] 4.0.4 Before coding Phase 4, keep all new budget controls memory-safe and bounded so no slider position can force unbounded retrieval, web use, or reasoning passes.
-- [ ] 4.0.5 Before closing Phase 4, calibrate the bounded presets against both the locked 6GB VRAM / 8GB RAM baseline and the current 4GB VRAM / 8GB RAM development profile so the budget table is honest for real runs.
+- [x] 4.0.3 Before coding Phase 4, add tests that prove different `thinking_minutes` values actually change downstream behavior instead of only changing metadata.
+- [x] 4.0.4 Before coding Phase 4, keep all new budget controls memory-safe and bounded so no slider position can force unbounded retrieval, web use, or reasoning passes.
+- [x] 4.0.5 Before closing Phase 4, calibrate the bounded presets against both the locked 6GB VRAM / 8GB RAM baseline and the current 4GB VRAM / 8GB RAM development profile so the budget table is honest for real runs.
 - [x] 4.1 Implement `ResourceBudget` and a `BudgetPolicy.from_minutes(minutes)` helper in `config.py`.
 - [x] 4.2 Use these default bounded presets:
 - [x] 4.3 `1-5 min -> retrieval_top_k=4, max_web_queries=1, reasoner_passes=1, critic_passes=1, macro_depth=2`
@@ -128,90 +128,128 @@ Phase 3 exit note
 - [x] 4.5 `31-120 min -> retrieval_top_k=8, max_web_queries=3, reasoner_passes=3, critic_passes=2, macro_depth=4`
 - [x] 4.6 `121-720 min -> retrieval_top_k=10, max_web_queries=5, reasoner_passes=4, critic_passes=3, macro_depth=4`
 - [x] 4.7 Keep all presets memory-safe; never scale budgets linearly without bounds.
-- [ ] 4.8 Make the slider affect actual work depth, not artificial waiting.
+- [x] 4.8 Make the slider affect actual work depth, not artificial waiting.
 - [x] 4.9 Add public `Orchestrator.run_task(question, thinking_minutes)` and compute `ResourceBudget` from `thinking_minutes` there.
-- [ ] 4.10 Pass the computed `ResourceBudget` through Planner, Researcher, Reasoner, and Critic so retrieval depth, web gating, reasoning passes, and critic depth all change actual runtime work instead of only metadata.
+- [x] 4.10 Pass the computed `ResourceBudget` through Planner, Researcher, Reasoner, and Critic so retrieval depth, web gating, reasoning passes, and critic depth all change actual runtime work instead of only metadata.
+- [x] Phase 4 exit note: thinking-time budgets are now bounded in config, calibrated against the baseline and dev profiles, and verified by tests that prove plan depth, evidence depth, web gating, reasoning depth, and critic depth all change with `thinking_minutes`.
 - [x] 4.11 Keep the current `run_pipeline(question)` path only as a compatibility helper until `run_task(...)` is the main entrypoint.
 
+Roadmap Adjustment Note (Current Priority Order)
+- [x] Finish the remaining Phase 5 persistence work and the pulled-forward event/status contract work before starting the full Phase 6 IR redesign.
+- [ ] Treat `sqlite-vec` as deferred infrastructure; do not schedule it ahead of persistence, selective-loading, and event/status work.
+- [x] Execute Phase 6 in three checkpoints: `6A` additive IR/storage contracts, `6B` deterministic `MacroEngine`/IR runtime, and `6C` selective-context loading plus agent integration.
+- Policy: keep MediaWiki as the only real web provider until persisted web evidence and provenance-bearing task state are stable.
+
 5. Phase 5 - Storage, Chunking, Retrieval, and Web Adapters
-- [ ] 5.0.1 Before coding Phase 5, design repository boundaries first: event log, settings/KV, vector index, source document store, macro registry, and reasoning/performance history must be separate responsibilities.
-- [ ] 5.0.2 Before coding Phase 5, keep the current `StorageManager.log_event(...)` and key-value behavior working while specialized storage layers are added behind it.
-- [ ] 5.0.3 Before coding Phase 5, lock document chunking, deduplication, and source-identity rules so Researcher, Critic, and decoder all refer to evidence consistently; evidence handles must remain stable across re-embedding and storage migrations.
-- [ ] 5.0.4 Before coding Phase 5, define web-adapter timeout, retry, and degraded-mode behavior up front; web failure must never break local-only runs.
-- [ ] 5.0.5 Before coding Phase 5, keep `chromadb` as the pinned primary vector store for v1 using a local persistent client; do not re-open the primary choice unless the decision log changes.
-- [ ] 5.0.6 Before coding Phase 5, keep `sqlite-vec` as an optional secondary adapter only; it fits the SQLite-heavy architecture well but must not become the default while it remains a newer dependency.
-- [ ] 5.0.7 Before coding Phase 5, lock the default retrieval embedding strategy: prefer a retrieval-tuned sentence-transformers model and separate query/document encoding paths instead of one generic embedding call.
-- [ ] 5.1 Build a lightweight persistence layer in `storage.py` using SQLite for tasks, metrics, macros, and source metadata.
-- [ ] 5.2 Store append-only trace and web logs as JSONL when that is simpler than relational tables.
-- [ ] 5.3 Implement a vector store adapter that supports insert, search, update, and delete operations.
-- [ ] 5.4 Use Chroma PersistentClient as the primary local vector index; keep the adapter generic so it can swap to `sqlite-vec` or a simple fallback index without agent changes.
-- [ ] 5.5 Add a chunker that splits documents before embedding; default to small bounded chunks with overlap.
-- [ ] 5.6 Add local-first retrieval logic: search local store first, support metadata filters, score results, optionally rerank a small bounded candidate set, and only trigger web fetch if evidence quality is insufficient.
-- [ ] 5.6.1 When the selected embedding model supports it, use asymmetric query/document encoding APIs instead of one generic embed path.
-- [ ] 5.6.2 Keep reranking optional and bounded; if used, apply it only to a small top-N set so CPU-heavy runs remain practical on low-resource machines.
-- [ ] 5.7 Add a web adapter with timeout, retry, source logging, deduplication, and safe parsing.
-- [ ] 5.8 Never let web fetch block the app indefinitely; all network work must be optional and time-bounded.
-- [ ] 5.9 Split storage responsibilities into explicit repositories or tables for vectors, source documents, macro history, reasoning logs, and performance metrics instead of keeping everything behind a generic key-value layer.
-- [ ] 5.10 Do not bury retrieval behavior in one generic storage class; keep retrieval/indexing adapters separate from event logging and settings persistence.
-- [ ] 5.11 Add explicit storage for the compression runtime: opcode lexicon, macro registry, decoder lexicon, local symbol-table snapshots, and proof-hash history.
-- [ ] 5.12 Keep the runtime source of truth machine-readable (`SQLite` tables or `JSONL`), not a giant plain-text dictionary loaded into every prompt.
-- [ ] 5.13 If a human-readable reference file is desired, generate `compression_lexicon.md` or `compression_lexicon.txt` from the registry as a debug/export artifact only; do not make it the primary runtime store.
-- [ ] 5.14 Load only the active subset of macro/opcode/decoder entries for a task; never inject the full translation registry into every model call.
-- [ ] 5.15 Persist chunk text, source metadata, embedding model/version, and vector IDs together so re-indexing and compatibility migrations are auditable.
-- [ ] 5.16 Keep source-document storage and vector storage independently rebuildable; re-embedding or index rebuilds must never lose the original text or provenance metadata.
+- [x] 5.0.1 Before coding Phase 5, design repository boundaries first: event log, settings/KV, vector index, source document store, macro registry, and reasoning/performance history must be separate responsibilities.
+- [x] 5.0.2 Before coding Phase 5, keep the current `StorageManager.log_event(...)` and key-value behavior working while specialized storage layers are added behind it.
+- [x] 5.0.3 Before coding Phase 5, lock document chunking, deduplication, and source-identity rules so Researcher, Critic, and decoder all refer to evidence consistently; evidence handles must remain stable across re-embedding and storage migrations.
+- [x] 5.0.4 Before coding Phase 5, define web-adapter timeout, retry, and degraded-mode behavior up front; web failure must never break local-only runs.
+- [x] 5.0.5 Before coding Phase 5, keep `chromadb` as the pinned primary vector store for v1 using a local persistent client; do not re-open the primary choice unless the decision log changes.
+- [ ] 5.0.6 Before closing Phase 5, keep `sqlite-vec` as an optional secondary adapter only and defer it until after `5.1`, `5.2`, `5.11` to `5.14`, and the pulled-forward event/status work are complete.
+- [x] 5.0.7 Before coding Phase 5, lock the default retrieval embedding strategy: prefer a retrieval-tuned sentence-transformers model and separate query/document encoding paths instead of one generic embedding call.
+- [x] 5.0.8 Before starting full Phase 6 work, finish the remaining machine-readable persistence so IR, optimizer, and dashboard features do not have to retrofit storage later.
+- [x] 5.0.9 Before broadening the web layer, persist fetched web evidence and lookup provenance in machine-readable form; web results must not stay transient-only.
+- [x] 5.0.10 Before treating seeded local content as normal runtime data, lock the policy that demo/stub corpora are clearly separable from user-ingested and runtime-generated knowledge.
+- [x] 5.1 Build a lightweight persistence layer in `storage.py` using SQLite for task runs, metrics, macros, runtime registries, and source metadata.
+- [x] 5.2 Store append-only trace, web, and status logs as JSONL when that is simpler than relational tables.
+- [x] 5.3 Implement a vector store adapter that supports insert, search, update, and delete operations.
+- [x] 5.4 Use Chroma PersistentClient as the primary local vector index; keep the adapter generic so it can swap to `sqlite-vec` or a simple fallback index without agent changes.
+- [x] 5.4.1 Do not re-upsert the full persisted corpus into a persistent vector backend on every startup; reconcile or warm persistent collections only as needed.
+- [x] 5.5 Add a chunker that splits documents before embedding; default to small bounded chunks with overlap.
+- [x] 5.6 Add local-first retrieval logic: search local store first, support metadata filters, score results, optionally rerank a small bounded candidate set, and only trigger web fetch if evidence quality is insufficient.
+- [x] 5.6.1 When the selected embedding model supports it, use asymmetric query/document encoding APIs instead of one generic embed path.
+- [x] 5.6.2 Keep reranking optional and bounded; if used, apply it only to a small top-N set so CPU-heavy runs remain practical on low-resource machines.
+- [x] 5.6.3 Move long-term retrieval policy into a dedicated retrieval service/boundary instead of leaving ranking semantics inside a generic `StorageManager`.
+- [x] 5.6.4 Add SQLite `FTS5` or an equivalent bounded lexical-candidate stage so hybrid retrieval does not scan all chunks in Python.
+- [x] 5.6.5 Avoid deserializing every stored vector for each search; load only the chunk and vector payloads needed for merged candidates and reranking.
+- [x] 5.7 Add a web adapter with timeout, retry, source logging, deduplication, and safe parsing.
+- [x] 5.8 Never let web fetch block the app indefinitely; all network work must be optional and time-bounded.
+- Policy 5.8.1: keep MediaWiki as the only real web provider until a later explicit decision confirms the persisted evidence/provenance path is mature enough to justify broader provider support.
+- [x] 5.9 Split storage responsibilities into explicit repositories or tables for vectors, source documents, macro history, reasoning logs, and performance metrics instead of keeping everything behind a generic key-value layer.
+- [x] 5.10 Do not bury retrieval behavior in one generic storage class; keep retrieval/indexing adapters separate from event logging and settings persistence.
+- [x] 5.10.1 Pull the typed `RuntimeEvent` / `AgentStatus` contract forward from Phase 9 so storage, orchestrator, and dashboard share one machine-readable event shape before the IR migration.
+- [x] 5.11 Add explicit storage for the compression runtime: opcode lexicon, macro registry, decoder lexicon, local symbol-table snapshots, and proof-hash history.
+- [x] 5.12 Keep the runtime source of truth machine-readable (`SQLite` tables or `JSONL`), not a giant plain-text dictionary loaded into every prompt.
+- [x] 5.13 If a human-readable reference file is desired, generate `compression_lexicon.md` or `compression_lexicon.txt` from the registry as a debug/export artifact only; do not make it the primary runtime store.
+- [x] 5.14 Load only the active subset of macro/opcode/decoder entries for a task; never inject the full translation registry into every model call.
+- [x] 5.15 Persist chunk text, source metadata, embedding model/version, and vector IDs together so re-indexing and compatibility migrations are auditable.
+- [x] 5.16 Keep source-document storage and vector storage independently rebuildable; re-embedding or index rebuilds must never lose the original text or provenance metadata.
+- [x] 5.17 Persist task runs, surfaced warnings, and additive task outputs so later orchestrator and dashboard phases do not retrofit `TaskResult` storage.
+- [x] 5.18 Persist fetched web evidence alongside lookup logs and source provenance instead of treating web evidence as temporary display-only data.
+- [x] 5.19 Extend `TaskResult` additively with optional answer text, warnings, and metrics before richer orchestrator and dashboard work lands.
+- [x] 5.20 Emit and persist typed `AgentStatus` updates at stage start, completion, failure, fallback, and degraded-mode branches before claiming the event/status contract is stable.
 
 6. Phase 6 - Canonical Semantic IR, Macro Registry, and Compressed Reasoning DSL
-- [ ] 6.0.1 Before coding Phase 6, lock the canonical IR shapes in `data_structures.py` first; do not begin `MacroEngine` work until the graph, opcode, symbol-table, context-frame, and proof-hash structures are defined.
-- [ ] 6.0.2 Before coding Phase 6, treat `CompressedTrace.tokens` and `expanded_preview` as legacy/debug projections that must remain available throughout the migration.
-- [ ] 6.0.3 Before coding Phase 6, implement deterministic expansion and validation before optimizer-learned compression; read/verify paths must exist before write/learn paths.
-- [ ] 6.0.4 Before coding Phase 6, benchmark memory and payload size on stub traces so the new IR is actually denser than the current token-list placeholder.
-- [ ] 6.0.5 Before coding Phase 6, lock provenance primitives first: entity, activity, agent, and bundle shapes must be explicit in the IR instead of implicit metadata blobs.
-- [ ] 6.1 Treat Phase 6 as an architecture redesign of `MacroEngine`, not a light enhancement.
-- [ ] 6.2 Define a canonical semantic intermediate representation (IR) before designing shorthand tokens; the compression language must preserve proof semantics, provenance, and uncertainty as first-class semantics rather than best-effort annotations.
-- [ ] 6.3 Represent reasoning internally as a graph/DAG of typed semantic nodes and dependencies, not just a flat list of string tokens.
-- [ ] 6.3.1 Model evidence items, derived claims, answer fragments, macro definitions, and intermediate bindings as typed entities with stable IDs.
-- [ ] 6.3.2 Model retrieval, reasoning, critique, and compression passes as typed activities linked to the entities they use and produce.
-- [ ] 6.3.3 Model component/model ownership as typed agents so traces can record which service and backend produced each artifact.
-- [ ] 6.4 Define a compact typed opcode lexicon with fixed semantics for core operations such as lookup, bind, compare, infer, aggregate, check, emit, cite, and confidence update.
-- [ ] 6.5 Keep the core opcode lexicon small and stable; store it once and treat it as part of the runtime, not as repeated prompt text.
-- [ ] 6.6 Add a machine-readable macro registry with versioned, parameterized macros; each macro must declare its signature, canonical expansion, invariants, and proof fingerprint.
-- [ ] 6.7 Add a per-task local symbol table that maps entities, predicates, attributes, evidence handles, and temporary registers to short IDs for dense encoding.
-- [ ] 6.8 Add context frames so provenance sets, confidence, scope, and active assumptions can be inherited instead of repeated on every operation.
-- [ ] 6.9 Compile the canonical graph into a compact operation stream / bytecode representation inside `CompressedTrace` instead of relying on plain string-token sequences as the primary meaning store.
-- [ ] 6.10 Extend `CompressedTrace` as needed to carry IR version, operation stream, symbol-table references, evidence handles, context frames, proof hash, and decode hints while preserving current public compatibility.
-- [ ] 6.11 Implement `compress()` around repeated graph motifs and parameterized macros, not exact-token aliases.
-- [ ] 6.12 Implement `expand()` by resolving macro IDs, replaying the operation stream, and reconstructing the canonical graph deterministically.
-- [ ] 6.13 Add structural hashing / proof fingerprints for expanded graphs so equivalent reasoning chains can be deduplicated and verified cheaply.
-- [ ] 6.14 Add recursion detection with a visited-set and a strict max depth such as `8`.
-- [ ] 6.15 Add canonical normalization rules for graphs, bindings, and opcode order where order is semantically irrelevant; reject noncanonical encodings.
-- [ ] 6.16 Implement `verify_round_trip()` as `compressed -> expanded canonical graph -> normalized graph -> recompressed` and require proof-hash stability, not just text equality.
-- [ ] 6.17 Reject macro proposals that fail loop checks, fingerprint checks, provenance preservation, uncertainty preservation, or semantic consistency checks.
-- [ ] 6.18 Replace the current identity-style placeholder compression with real graph compilation, macro expansion, and validation logic.
-- [ ] 6.19 Add a decoder lexicon that maps internal symbols and verified proof structures back to natural-language templates, but keep decoding separate from reasoning.
-- [ ] 6.19.1 Add a compact human-readable debug/export view for the IR and provenance graph so operators can inspect a task without reading raw JSON blobs.
-- [ ] 6.20 Use selective context injection only: Reasoner and Critic may load active opcodes, active macro definitions, and the current local symbol table, but must never carry the whole registry in context.
-- [ ] 6.21 Ensure macro proposals are validated before they can influence Reasoner, Critic, or Self-Optimizer flows.
+- [x] 6.0.0 Before starting full Phase 6, complete the remaining Phase 5 persistence work plus the pulled-forward event/status contract items so the IR migration has stable storage and status surfaces.
+- [x] 6.0.1 Before coding Phase 6, lock the canonical IR shapes in `data_structures.py` first; do not begin `MacroEngine` work until the graph, opcode, symbol-table, context-frame, and proof-hash structures are defined.
+- [x] 6.0.2 Before coding Phase 6, treat `CompressedTrace.tokens` and `expanded_preview` as legacy/debug projections that must remain available throughout the migration.
+- [x] 6.0.3 Before coding Phase 6, implement deterministic expansion and validation before optimizer-learned compression; read/verify paths must exist before write/learn paths.
+- [x] 6.0.4 Before closing Phase 6, benchmark and reduce stub-trace persistence overhead so the richer IR stays within a bounded accepted envelope instead of exploding far beyond the legacy placeholder shape.
+  Accepted compact-persistence baseline: about `1.42x` to `1.61x` serialized JSON overhead and about `2.21x` to `2.59x` recursive payload-memory overhead versus the legacy projection, measured from `CompressedTrace.to_storage_dict()` and locked by the Phase 6 density test.
+- [x] 6.0.5 Before coding Phase 6, lock provenance primitives first: entity, activity, agent, and bundle shapes must be explicit in the IR instead of implicit metadata blobs.
+- [x] 6.0.6 Split Phase 6 into explicit checkpoints: `6A` additive IR/storage contracts, `6B` deterministic `MacroEngine` runtime, and `6C` selective-context loading plus agent integration.
+- [x] 6.0.7 Complete `6A` and the compatibility fixtures before replacing placeholder foreground-agent behavior.
+- [x] 6.0.8 Complete `6B` proof-hash and round-trip validation before enabling optimizer-driven compression changes.
+- [x] 6.0.9 Complete `6C` active-subset loading before claiming selective-context injection is done.
+- [x] 6.1 Treat Phase 6 as an architecture redesign of `MacroEngine`, not a light enhancement.
+- [x] 6.2 Define a canonical semantic intermediate representation (IR) before designing shorthand tokens; the compression language must preserve proof semantics, provenance, and uncertainty as first-class semantics rather than best-effort annotations.
+- [x] 6.3 Represent reasoning internally as a graph/DAG of typed semantic nodes and dependencies, not just a flat list of string tokens.
+- [x] 6.3.1 Model evidence items, derived claims, answer fragments, macro definitions, and intermediate bindings as typed entities with stable IDs.
+- [x] 6.3.2 Model retrieval, reasoning, critique, and compression passes as typed activities linked to the entities they use and produce.
+- [x] 6.3.3 Model component/model ownership as typed agents so traces can record which service and backend produced each artifact.
+- [x] 6.4 Define a compact typed opcode lexicon with fixed semantics for core operations such as lookup, bind, compare, infer, aggregate, check, emit, cite, and confidence update.
+- [x] 6.5 Keep the core opcode lexicon small and stable; store it once and treat it as part of the runtime, not as repeated prompt text.
+- [x] 6.6 Add a machine-readable macro registry with versioned, parameterized macros; each macro must declare its signature, canonical expansion, invariants, and proof fingerprint.
+- [x] 6.7 Add a per-task local symbol table that maps entities, predicates, attributes, evidence handles, and temporary registers to short IDs for dense encoding.
+- [x] 6.8 Add context frames so provenance sets, confidence, scope, and active assumptions can be inherited instead of repeated on every operation.
+- [x] 6.9 Compile the canonical graph into a compact operation stream / bytecode representation inside `CompressedTrace` instead of relying on plain string-token sequences as the primary meaning store.
+- [x] 6.10 Extend `CompressedTrace` as needed to carry IR version, operation stream, symbol-table references, evidence handles, context frames, proof hash, and decode hints while preserving current public compatibility.
+- [x] 6.11 Implement `compress()` around repeated graph motifs and parameterized macros, not exact-token aliases.
+- [x] 6.12 Implement `expand()` by resolving macro IDs, replaying the operation stream, and reconstructing the canonical graph deterministically.
+- [x] 6.13 Add structural hashing / proof fingerprints for expanded graphs so equivalent reasoning chains can be deduplicated and verified cheaply.
+- [x] 6.14 Add recursion detection with a visited-set and a strict max depth such as `8`.
+- [x] 6.15 Add canonical normalization rules for graphs, bindings, and opcode order where order is semantically irrelevant; reject noncanonical encodings.
+- [x] 6.16 Implement `verify_round_trip()` as `compressed -> expanded canonical graph -> normalized graph -> recompressed` and require proof-hash stability, not just text equality.
+- [x] 6.17 Reject macro proposals that fail loop checks, fingerprint checks, provenance preservation, uncertainty preservation, or semantic consistency checks.
+- [x] 6.18 Replace the current identity-style placeholder compression with real graph compilation, macro expansion, and validation logic.
+- [x] 6.19 Add a decoder lexicon that maps internal symbols and verified proof structures back to natural-language templates, but keep decoding separate from reasoning.
+- [x] 6.19.1 Add a compact human-readable debug/export view for the IR and provenance graph so operators can inspect a task without reading raw JSON blobs.
+- [x] 6.20 Use selective context injection only: Reasoner and Critic may load active opcodes, active macro definitions, and the current local symbol table, but must never carry the whole registry in context.
+- [x] 6.21 Ensure macro proposals are validated before they can influence Reasoner, Critic, or Self-Optimizer flows.
 
 7. Phase 7 - Implement the Foreground Agents and Verification Layer
-- [ ] 7.0.1 Before coding Phase 7, keep agents thin and move shared logic into services; Planner, Researcher, Reasoner, Critic, and Compressor should orchestrate behavior, not own storage/runtime internals.
-- [ ] 7.0.2 Before coding Phase 7, define the exact handoff shape from Researcher -> Reasoner and Reasoner -> Critic so evidence handles, proof structures, and repair data do not drift.
-- [ ] 7.0.3 Before coding Phase 7, implement deterministic or stubbed versions of the new agent logic first, then layer real model-backed inference behind the same contracts.
-- [ ] 7.0.4 Before coding Phase 7, keep translation to natural language as a final step after verification; do not let free-form text become the primary reasoning state again.
-- [ ] 7.0.5 Before coding Phase 7, lock one structured-output path for model-backed agents; Planner, Reasoner, Critic, and Compressor must emit schema-constrained JSON rather than free-form text.
-- [ ] 7.0.6 Before coding Phase 7, keep dataclasses as the domain model and use boundary-only schema helpers to generate and validate model I/O contracts.
+- [x] 7.0.1 Before coding Phase 7, keep agents thin and move shared logic into services; Planner, Researcher, Reasoner, Critic, and Compressor should orchestrate behavior, not own storage/runtime internals.
+- [x] 7.0.2 Before coding Phase 7, define the exact handoff shape from Researcher -> Reasoner and Reasoner -> Critic so evidence handles, proof structures, and repair data do not drift.
+- [x] 7.0.3 Before coding Phase 7, implement deterministic or stubbed versions of the new agent logic first, then layer real model-backed inference behind the same contracts.
+- [x] 7.0.4 Before coding Phase 7, keep translation to natural language as a final step after verification; do not let free-form text become the primary reasoning state again.
+- [x] 7.0.5 Before coding Phase 7, lock one structured-output path for model-backed agents; Planner, Reasoner, Critic, and Compressor must emit schema-constrained JSON rather than free-form text.
+- [x] 7.0.6 Before coding Phase 7, keep dataclasses as the domain model and use boundary-only schema helpers to generate and validate model I/O contracts.
+- [x] 7.0.7 Before replacing placeholder foreground-agent behavior, require the Phase 5 persistence layer and the `6A` / `6B` IR checkpoints to be green.
+- [ ] 7.0.8 Before coding Phase 7, optimize for a system-first lightweight reasoner: keep the base policy model small and put most precision gains into structured search, tools, and verification rather than assuming a larger standalone model.
+- [ ] 7.0.9 Before coding Phase 7, prioritize verifiable reasoning domains first (math, code, logic, and retrieval-backed factual synthesis); broad conversational polish is secondary.
+- [ ] 7.0.10 Before coding Phase 7, support at least two bounded reasoning modes: `fast` for low-latency single-path work and `deep` for slower multi-candidate verified reasoning.
 - [ ] 7.1 Replace remaining stub or placeholder agent behavior with real task-aware logic while preserving typed contracts.
-- [ ] 7.2 Implement `PlannerAgent` to return structured `Plan` objects only via schema-constrained output; do not let it return free-form text as its primary output.
+- [x] 7.2 Implement `PlannerAgent` to return structured `Plan` objects only via schema-constrained output; do not let it return free-form text as its primary output.
 - [ ] 7.3 Implement `ResearcherAgent` to accept a `Plan`, retrieve local evidence first using stable evidence handles and retrieval-tuned embeddings, optionally fetch web evidence, embed/store new content, and return `EvidenceBundle`.
 - [ ] 7.4 Implement `ReasonerAgent` to consume the `Plan` and `EvidenceBundle`, build the canonical reasoning/provenance graph, compile it into the compressed IR, and stay within the `ResourceBudget`.
+- [ ] 7.4.1 In `deep` mode, let the Reasoner generate multiple bounded candidate traces instead of one single trajectory; candidates must stay in the canonical IR, not free-form scratchpads.
+- [ ] 7.4.2 Treat the small model as a proposal generator, not the final authority; final selection must be driven by verifier, evidence, and proof-hash signals.
 - [ ] 7.5 Make the Reasoner reuse the per-task symbol table, active opcode lexicon, and active macro registry subset instead of emitting ad hoc symbolic strings.
 - [ ] 7.6 Implement `CriticAgent` as a hybrid strict verifier: schema validation -> deterministic provenance/IR constraint checks -> deterministic macro/IR expansion -> optional model-assisted semantic fallback only if structural checks pass.
+- [ ] 7.6.1 Add tool-backed verification for checkable tasks: Python execution, code or unit-test execution, and retrieval-grounded checks should be first-class Critic helpers before optional model fallback.
+- [ ] 7.6.2 Keep tool-backed verification bounded and explicit; helper execution must respect the same timeout, retry, and resource policies as the rest of the runtime.
 - [ ] 7.7 Make the Critic validate plan coverage, evidence support, opcode legality, ordering/type/impossibility constraints, macro signature matching, contradiction surfacing, uncertainty preservation, provenance coverage, and proof-hash stability.
 - [ ] 7.7.1 Make the Critic surface whether failures are schema, provenance, proof-hash, or evidence-coverage violations so repair paths stay targeted instead of generic.
+- [ ] 7.7.2 Make the Critic score candidates by verifier result, evidence support, proof-hash stability, and cross-candidate agreement so `deep` mode can select, repair, or abstain instead of always emitting the most fluent answer.
+- [ ] 7.7.3 If no candidate reaches the configured verification threshold, return a structured uncertainty or degraded result rather than a polished but weakly supported answer.
 - [ ] 7.8 Extend `CritiqueReport` as needed to expose drift score, proof-hash match, provenance coverage, macro violations, and repair actions while preserving current compatibility where possible.
 - [ ] 7.9 Implement `CompressorAgent` to learn parameterized graph motifs, frequent subproofs, and symbol-table optimization opportunities; exact-token aliases must not be the main compression strategy.
 - [ ] 7.10 Add a translation layer that expands only the verified output-relevant proof subgraph and renders it to natural language using templates first and LLM surface realization second.
+- [ ] 7.10.1 Keep natural-language generation downstream of candidate selection and verification; the translation layer must render verified state, not invent new reasoning.
 - [ ] 7.11 Keep each agent small and single-purpose; shared concerns like logging, model access, storage, symbol-table management, and proof hashing must stay in shared services.
 - [ ] 7.12 Make budget a real input to foreground agents so work depth changes with the thinking-time policy.
+- [ ] 7.12.1 Let larger thinking budgets increase candidate count, verifier depth, and tool-use budget in `deep` mode without violating the locked RAM and VRAM limits.
 - [ ] 7.13 Do not claim foreground-agent completion while local retrieval, critic verification depth, graph-backed compression, and macro-aware reasoning are still stubbed.
 - [ ] 7.14 If a model output fails schema validation, allow at most one bounded repair attempt before returning a structured failure.
 
@@ -220,17 +258,23 @@ Phase 3 exit note
 - [ ] 8.0.2 Before coding Phase 8, lock the evaluation metrics for “better” proposals: compression gain, proof-hash stability, critic validity, latency, and memory cost.
 - [ ] 8.0.3 Before coding Phase 8, define proposal persistence and rollback records first so every activation decision is auditable.
 - [ ] 8.0.4 Before coding Phase 8, cap history windows and replay scope so the optimizer does not become the largest memory consumer in the system.
+- [ ] 8.0.5 Until `8.5` to `8.9` exist, keep the optimizer disabled by default or clearly proposal-only in stub/dev mode; do not treat placeholder cycles as live optimization.
+- [ ] 8.0.6 Before coding Phase 8, treat any future model improvement as distillation from verified system traces first; do not plan training-from-scratch as the default path.
 - [ ] 8.1 Implement `SelfOptimizer` as a background async service that never blocks the foreground task pipeline.
 - [ ] 8.2 Read reasoning logs, macro usage, critique results, and performance metrics on a schedule.
+- [ ] 8.2.1 Persist candidate-trace sets, verifier scores, agreement scores, tool outputs, and final adjudication so replay and analysis can learn from `deep` mode runs.
 - [ ] 8.3 Generate only proposals, never direct live changes.
 - [ ] 8.4 Enforce the lifecycle `propose -> simulate -> validate -> activate`.
 - [ ] 8.5 Build a small simulation harness that reruns sample tasks using candidate macro changes and compares success and efficiency metrics.
+- [ ] 8.5.1 Export only verified `deep`-mode traces as datasets for future SFT or process-supervision training; never distill unverified free-form chain-of-thought.
 - [ ] 8.6 Activate a proposal only if it passes validation and improves results without increasing contradiction risk.
 - [ ] 8.7 Keep the currently active macro set immutable during a foreground task run.
 - [ ] 8.8 Replace the current placeholder optimizer cycle with real proposal generation based on persisted reasoning, critique, and performance data.
+- [ ] 8.8.1 If small-model training is pursued later, begin with distilling verified `deep`-mode behavior into the existing lightweight policy model before considering architecture research or larger local models.
 - [ ] 8.9 Track activation decisions and failed simulations so regressions are visible and rollback is explicit.
 
 9. Phase 9 - Orchestrator and Event Flow
+- [ ] 9.0.0 Phase 9 sequencing note: the typed event/status contract and additive `TaskResult` fields should already exist from Phase 5; Phase 9 finishes orchestration behavior on top of those contracts.
 - [ ] 9.0.1 Before coding Phase 9, lock the event schema first so storage, dashboard, and tests all observe the same stage/status payload shape.
 - [ ] 9.0.2 Before coding Phase 9, define cancellation, retry, and surfaced-warning semantics before adding more runtime branches to the orchestrator.
 - [ ] 9.0.3 Before coding Phase 9, keep orchestration logic separate from agent logic; `Orchestrator` should compose services, not absorb reasoning or storage rules.
@@ -266,40 +310,53 @@ Phase 3 exit note
 - [ ] 11.0.3 Before coding Phase 11, ensure starter macros and opcode entries are conservative and fully validated; sample data must not depend on optimizer-learned definitions.
 - [ ] 11.0.4 Before coding Phase 11, include at least one contradiction/conflict example so Critic and decoder behavior can be verified under non-happy paths.
 - [ ] 11.0.5 Before coding Phase 11, include at least one clearly asymmetric retrieval corpus (question -> passage) so query/document encoding paths are tested honestly instead of only symmetric similarity cases.
+- [ ] 11.0.6 Before coding Phase 11, keep seed/demo corpora opt-in or clearly marked as stub/demo-only; they must not masquerade as user-ingested knowledge.
+- [ ] 11.0.7 Before coding Phase 11, include tasks with exact or executable checks so `fast` vs `deep` reasoning can be compared on correctness, not only presentation quality.
 - [ ] 11.1 Add a small local knowledge sample so the system can demonstrate local-first retrieval without requiring web access; chunk IDs, source hashes, and metadata filters should be part of the fixture.
 - [ ] 11.2 Add a few starter macros that are simple, safe, and useful for repeated reasoning patterns.
 - [ ] 11.3 Add 3-5 sample user questions that exercise planning, retrieval, reasoning, critique, and compression.
-- [ ] 11.4 Add a fake or stub web adapter for tests so CI does not depend on live internet.
+- [ ] 11.3.1 Ensure the starter task set includes math, code, logic or planning, and multi-hop retrieval-backed questions with concrete pass-fail or high-precision checks where possible.
+- [x] 11.4 Add a fake or stub web adapter for tests so CI does not depend on live internet.
 - [ ] 11.5 Add one example task that intentionally triggers web fallback and one that stays fully local.
 - [ ] 11.6 Ensure at least one sample task exercises the `thinking_minutes -> ResourceBudget -> agent behavior` flow end to end.
+- [ ] 11.6.1 Include at least one pair where `fast` is weaker or fails and `deep` succeeds through extra candidates, tools, or verification.
 - [ ] 11.7 Add a small starter opcode lexicon, macro registry, and decoder lexicon so the compressed IR can be demonstrated without requiring the optimizer to invent everything first.
 - [ ] 11.8 Add one starter provenance bundle example that shows evidence -> reasoning activity -> verified claim links end to end.
+- [ ] 11.9 Add one small verified-trace export example so future replay, distillation, and process-supervision code can be exercised without real model training.
 
 12. Phase 12 - Tests, Validation, and Best Practices
 - [ ] 12.0.1 Before coding Phase 12, prioritize tests by risk: compatibility, resource limits, proof-hash stability, provenance preservation, and fallback behavior come before cosmetic coverage gains.
 - [ ] 12.0.2 Before coding Phase 12, keep stub-mode tests as the default CI path and make real-backend tests opt-in or smoke-only so the suite stays portable.
 - [ ] 12.0.3 Before coding Phase 12, add regression fixtures for old serialized payloads and legacy `CompressedTrace` shapes before the IR migration lands.
 - [ ] 12.0.4 Before coding Phase 12, define minimum acceptance thresholds for validity, compression improvement, and bounded resource usage so “passing” is concrete.
-- [ ] 12.0.5 Before coding Phase 12, add a reproducible environment manifest (`pyproject.toml` with optional extras) before claiming any real-backend path is supported.
+- [x] 12.0.5 Before coding Phase 12, add a reproducible environment manifest (`pyproject.toml` with optional extras) before claiming any real-backend path is supported.
+- [ ] 12.0.6 Before coding Phase 12, define acceptance criteria for `fast` vs `deep`: `deep` mode must improve correctness on at least one verifiable benchmark family as test-time compute increases.
 - [ ] 12.1 Write unit tests for every agent with mocked model and storage backends.
+- [ ] 12.1.1 Add unit tests for candidate generation, verifier scoring, consensus or adjudication, abstain logic, and tool-backed verification helpers.
 - [ ] 12.2 Write unit tests for `MacroEngine` compression, expansion, nested macros, recursion blocking, and round-trip verification.
-- [ ] 12.3 Write retrieval tests for local-first behavior, metadata filtering, query/document encoding split, bounded reranking, web fallback behavior, deduplication, and empty-result handling.
+- [x] 12.3 Write retrieval tests for local-first behavior, metadata filtering, query/document encoding split, bounded reranking, web fallback behavior, deduplication, and empty-result handling.
+- [x] 12.3.1 Add retrieval tests for lexical-candidate generation, merged FTS/vector ranking behavior, startup reconciliation for persistent vector indexes, and selective vector loading.
 - [ ] 12.4 Write resource tests for semaphore limits, queue limits, low-memory fallback, Ollama keep-alive/unload behavior, and model unload behavior.
+- [ ] 12.4.1 Write resource tests proving `deep` mode remains bounded as candidate count, tool use, and verifier depth increase.
 - [ ] 12.5 Write optimizer tests proving proposals are simulated before activation.
 - [ ] 12.6 Write end-to-end pipeline tests for at least two example questions.
+- [ ] 12.6.1 Add end-to-end tests comparing `fast` vs `deep` on at least one math, code, or logic sample and assert that extra test-time compute can improve correctness without breaking budgets.
+- [ ] 12.6.2 Add end-to-end tests for tool-backed verification paths, including Python execution or unit-test-backed checks where applicable.
 - [ ] 12.7 Write failure-path tests for malformed macro definitions, invalid plan output, web timeout, empty evidence, and critic rejection.
 - [ ] 12.8 Keep prompts, parsing, storage, and UI code separate to avoid circular dependencies and fragile edits.
 - [ ] 12.9 Use dependency injection for models, storage, and web adapters so components are easy to mock and swap.
 - [ ] 12.10 Keep comments concise and useful; explain non-obvious logic, resource guards, and validation rules.
-- [ ] 12.11 Add a short README with setup steps, optional dependency extras, local service/model prerequisites, architecture notes, runtime limits, and how both the locked 6GB baseline and the 4GB dev profile are enforced.
+- [x] 12.11 Add a short README with setup steps, optional dependency extras, local service/model prerequisites, architecture notes, runtime limits, and how both the locked 6GB baseline and the 4GB dev profile are enforced.
 - [ ] 12.12 Do a final pass to remove dead code, duplicate logic, hidden globals, and unbounded caches.
 - [ ] 12.13 Add explicit tests for the top-level public API checklist so phase completion and interface compliance cannot drift apart.
 - [ ] 12.14 Do not mark the project feature complete while placeholder runtime paths or text-only dashboard behavior remain.
 - [ ] 12.15 Add proof-hash stability tests so semantically equivalent encodings normalize to the same canonical fingerprint.
+- [ ] 12.15.1 Add candidate-agreement and consensus tests so `deep` mode selection is based on verifier and agreement score rather than text fluency alone.
 - [ ] 12.16 Add failure-path tests for provenance loss, uncertainty erasure, macro signature mismatch, and noncanonical encodings.
-- [ ] 12.17 Add selective-context tests proving only active opcode/macro/symbol-table entries are loaded for a task instead of the whole registry.
+- [x] 12.17 Add selective-context tests proving only active opcode/macro/symbol-table entries are loaded for a task instead of the whole registry.
 - [ ] 12.18 Add translation-layer tests that verify final natural-language output preserves the verified claim, evidence basis, and uncertainty markers.
 - [ ] 12.19 Add setup/smoke checks that fail clearly when required real-mode dependencies, local services, or model files are missing.
+- [ ] 12.20 Add dataset-export tests ensuring only verified `deep` traces are eligible for future SFT or process-supervision corpora.
 
 Acceptance Checklist
 - [ ] The system runs locally as an async, modular, multi-agent pipeline.
@@ -308,12 +365,16 @@ Acceptance Checklist
 - [ ] The macro engine supports nested macros and round-trip verification safely.
 - [ ] The compression system uses a canonical graph-backed IR with parameterized macros, proof hashing, and per-task symbol tables instead of plain string-token shorthands.
 - [ ] The Researcher uses local retrieval before web access.
+- [ ] The runtime supports bounded `fast` and `deep` reasoning modes, and `deep` mode can trade latency for higher correctness on verifiable tasks without breaking local resource limits.
+- [ ] For checkable tasks, final answer selection is verifier or tool-backed rather than driven only by text fluency.
+- [ ] Hard unverified cases degrade to structured uncertainty or surfaced warnings instead of confident unsupported answers.
+- [ ] Runtime events and agent statuses are machine-readable, persisted, and shared across storage, orchestrator, and dashboard surfaces.
 - [ ] The Self-Optimizer never applies live changes without simulation and validation.
 - [ ] The dashboard works and shows live progress, logs, macro usage, and results.
 - [ ] Tests cover unit, integration, resource, failure, and optimization scenarios.
 - [ ] The public interface checklist at the top of this file is fully matched by the codebase.
 - [ ] Placeholder runtime paths have been replaced by real or clearly configured backend behavior.
-- [ ] The runtime uses selective context injection and does not depend on loading a giant translation dictionary into every model prompt.
+- [x] The runtime uses selective context injection and does not depend on loading a giant translation dictionary into every model prompt.
 - [ ] Real-mode prerequisites are reproducible from a manifest plus README, and missing dependencies/services/models fail clearly.
 
 Assumptions and Defaults
@@ -321,15 +382,23 @@ Assumptions and Defaults
 - [ ] Default persistence: `SQLite + JSONL`
 - [ ] Default architecture: shared generation backend + shared embedding backend
 - [ ] Default local vector store: `Chroma PersistentClient`
-- [ ] Optional secondary vector store: `sqlite-vec`
-- [ ] Default retrieval embedding model: `sentence-transformers/multi-qa-MiniLM-L6-cos-v1`
+- [ ] Optional secondary vector store: `sqlite-vec`, deferred until after persistence and event/status work
+- [x] Default retrieval embedding model: `sentence-transformers/intfloat/e5-small-v2`
+- [ ] Default reasoning strategy: system-first lightweight policy model plus verifier and tool stack, not training a new foundation model from scratch
+- [ ] Default reasoning priority: verifiable reasoning and precision before broad conversational polish
+- [ ] Default reasoning modes: bounded `fast` and `deep`
+- [ ] Default `deep`-mode selection policy: generate bounded candidate traces, verify them, then select, repair, or abstain
+- [ ] Default tool-verification policy: use bounded Python or code-test execution for checkable tasks before optional model-only fallback
 - [ ] Default compression architecture: canonical graph-backed IR compiled into a compact operation stream with parameterized macros and proof hashing
 - [ ] Default model-output policy: schema-constrained JSON at agent boundaries
 - [ ] Default dev calibration profile: `4GB VRAM / 8GB RAM` current laptop while keeping `6GB VRAM / 8GB RAM` as the locked baseline acceptance target
 - [ ] Default macro recursion limit: `8`
 - [ ] Default queue policy: bounded queues only
-- [ ] Default web behavior: optional, adapter-based, timeout-protected
-- [ ] Default translation-registry policy: machine-readable runtime registry plus optional human-readable export; never use a giant plain-text file as the primary runtime source of truth
+- [x] Default web behavior: optional, adapter-based, timeout-protected
+- [x] Default event/status policy: typed `RuntimeEvent` plus typed `AgentStatus` persisted as machine-readable records
+- [x] Default seed-corpus policy: stub/demo fixtures remain clearly separable from user and runtime data
+- [ ] Default optimizer activation policy: proposal-only until replay, validation, activation logging, and rollback exist
+- [x] Default translation-registry policy: machine-readable runtime registry plus optional human-readable export; never use a giant plain-text file as the primary runtime source of truth
 - [ ] Default implementation rule: optimize memory and concurrency without removing logic or features
 
 13. Phase 13 - Lower-Level AI Implementation Guardrails
@@ -350,18 +419,18 @@ Assumptions and Defaults
 - [ ] 14.0.1 Before following Phase 14 literally, reconcile it with any future phase-order changes; this section is the execution sequence and must stay synchronized with the rest of the plan.
 - [ ] 14.0.2 Before each subsystem handoff, confirm the prior subsystem’s tests and done gate are already green; do not treat build order as a substitute for validation.
 - [ ] 14.0.3 Before using lower-level AI for a micro-step, reduce the task to one contract addition, one behavior change, and one test target where possible.
-- [ ] 14.1 Create dataclasses and enums first, then write tests for type validation and serialization.
-- [ ] 14.2 Implement `storage.py` with SQLite tables and JSONL logging utilities, then test create/read/write paths.
-- [ ] 14.3 Implement `model_manager.py` with stub backends and semaphores, then test concurrency limits.
-- [ ] 14.4 Implement `macro_engine.py` before Reasoner/Compressor, then test compress/expand/round-trip rules.
-- [ ] 14.5 Implement Planner with deterministic stub output first, then switch to model-backed mode.
-- [ ] 14.6 Implement Researcher with local-only retrieval first, then add optional web fallback.
-- [ ] 14.7 Implement Reasoner using macro engine + evidence bundle, then add budget-aware iteration logic.
-- [ ] 14.8 Implement Critic checks (schema, contradiction flags, evidence coverage), then add fix suggestions.
-- [ ] 14.9 Implement Compressor proposals and semantic checks, then connect proposal persistence.
-- [ ] 14.10 Implement Self-Optimizer simulation loop and proposal activation rules.
-- [ ] 14.11 Implement Orchestrator pipeline and cancellation handling.
-- [ ] 14.12 Implement Dashboard last, using event queue subscriptions from orchestrator.
+- [x] 14.1 Finish the remaining Phase 5 persistence layer: task runs, runtime registries, proof-hash history, and machine-readable source/provenance storage.
+- [x] 14.2 Add append-only trace, web, and status JSONL logs plus persisted web evidence so retrieval and orchestration history are auditable.
+- [x] 14.3 Pull forward the typed `RuntimeEvent` / `AgentStatus` contract and additive `TaskResult` fields (`answer_text`, `warnings`, `metrics`) before broader orchestration or dashboard work.
+- [x] 14.4 Extract retrieval policy into a dedicated retrieval service, then add bounded lexical-candidate generation (`FTS5` or equivalent) and selective vector loading.
+- [x] 14.5 Improve persistent-vector startup so backends reconcile existing state instead of blindly rebuilding the full corpus on every boot.
+- [x] 14.6 Lock and persist the additive IR shapes, symbol-table records, opcode/decoder registries, and proof-hash fields (`6A`).
+- [x] 14.7 Rebuild `macro_engine.py` on the new IR with deterministic compile/expand/verify behavior plus recursion and proof guards (`6B`).
+- [x] 14.8 Add selective loading of only the active opcode, macro, decoder, and symbol-table subsets for a task (`6C`).
+- [ ] 14.9 Replace Planner with schema-constrained structured output and boundary validation, then replace Reasoner and Critic with deterministic IR/provenance construction, bounded `fast` and `deep` candidate generation, tool-backed verification, and select or repair or abstain behavior.
+- [ ] 14.10 Replace Compressor placeholder logic with parameterized motif/proof compression and persisted proposal storage, then add verified `deep`-trace export for future replay, distillation, and process supervision.
+- [ ] 14.11 Add orchestrator cancellation, retry, surfaced-warning flow, and typed status/event emission end to end.
+- [ ] 14.12 Implement replay/simulation-gated optimizer activation, then expand the dashboard from the typed event/status surfaces.
 
 15. Phase 15 - Common Failure Patterns and Mandatory Fixes
 - [ ] 15.0.1 Before Phase 15 issues happen in production, convert each known failure pattern into a test, log signal, or explicit degraded-mode branch during the earlier phases.

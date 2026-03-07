@@ -52,6 +52,22 @@ def _serialize_value(value: Any) -> Any:
     return value
 
 
+def _compact_payload(
+    payload: dict[str, Any],
+    *,
+    drop_empty: tuple[str, ...] = (),
+    drop_defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    compact = dict(payload)
+    for field_name in drop_empty:
+        if compact.get(field_name) in ("", [], {}, None):
+            compact.pop(field_name, None)
+    for field_name, default_value in (drop_defaults or {}).items():
+        if compact.get(field_name) == default_value:
+            compact.pop(field_name, None)
+    return compact
+
+
 class DictSerializable:
     """Small helper mixin for dict conversion."""
 
@@ -197,11 +213,23 @@ class Macro(DictSerializable):
     macro_name: str
     expansion: tuple[str, ...]
     version: int = 1
+    parameters: tuple[str, ...] = ()
+    opcode_pattern: tuple[str, ...] = ()
+    invariants: tuple[str, ...] = ()
+    proof_fingerprint: str = ""
+    semantic_kind: str = "token_macro"
+    is_active: bool = True
+    decoder_template: str = ""
 
     def __post_init__(self) -> None:
         _require(bool(self.macro_name.strip()), "macro_name must not be empty.")
         _require(len(self.expansion) > 0, "expansion must include at least one step.")
         _require(self.version > 0, "version must be positive.")
+        _require(
+            len(set(self.parameters)) == len(self.parameters),
+            "Macro.parameters must not contain duplicates.",
+        )
+        _require(bool(self.semantic_kind.strip()), "semantic_kind must not be empty.")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Macro:
@@ -209,6 +237,124 @@ class Macro(DictSerializable):
             macro_name=str(data["macro_name"]),
             expansion=tuple(str(item) for item in data["expansion"]),
             version=int(data.get("version", 1)),
+            parameters=tuple(str(item) for item in data.get("parameters", [])),
+            opcode_pattern=tuple(str(item) for item in data.get("opcode_pattern", [])),
+            invariants=tuple(str(item) for item in data.get("invariants", [])),
+            proof_fingerprint=str(data.get("proof_fingerprint", "")),
+            semantic_kind=str(data.get("semantic_kind", "token_macro")),
+            is_active=bool(data.get("is_active", True)),
+            decoder_template=str(data.get("decoder_template", "")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class OpcodeEntry(DictSerializable):
+    """Machine-readable opcode registry entry."""
+
+    opcode_name: str
+    description: str
+    category: str = "core"
+    version: int = 1
+    is_active: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.opcode_name.strip()), "opcode_name must not be empty.")
+        _require(bool(self.description.strip()), "description must not be empty.")
+        _require(self.version > 0, "version must be positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OpcodeEntry:
+        return cls(
+            opcode_name=str(data["opcode_name"]),
+            description=str(data["description"]),
+            category=str(data.get("category", "core")),
+            version=int(data.get("version", 1)),
+            is_active=bool(data.get("is_active", True)),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DecoderEntry(DictSerializable):
+    """Machine-readable decoder lexicon entry."""
+
+    decoder_name: str
+    template: str
+    version: int = 1
+    is_active: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.decoder_name.strip()), "decoder_name must not be empty.")
+        _require(bool(self.template.strip()), "template must not be empty.")
+        _require(self.version > 0, "version must be positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DecoderEntry:
+        return cls(
+            decoder_name=str(data["decoder_name"]),
+            template=str(data["template"]),
+            version=int(data.get("version", 1)),
+            is_active=bool(data.get("is_active", True)),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class SymbolTableSnapshot(DictSerializable):
+    """Persisted local symbol-table state for a task."""
+
+    task_id: str
+    symbols: dict[str, str]
+    snapshot_name: str = "active"
+    is_active: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.task_id.strip()), "task_id must not be empty.")
+        _require(bool(self.snapshot_name.strip()), "snapshot_name must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SymbolTableSnapshot:
+        raw_symbols = dict(data.get("symbols", {}))
+        return cls(
+            task_id=str(data["task_id"]),
+            symbols={str(key): str(value) for key, value in raw_symbols.items()},
+            snapshot_name=str(data.get("snapshot_name", "active")),
+            is_active=bool(data.get("is_active", True)),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ProofHashRecord(DictSerializable):
+    """Persisted proof-hash history entry for runtime artifacts."""
+
+    task_id: str
+    artifact_id: str
+    artifact_type: str
+    proof_hash: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.task_id.strip()), "task_id must not be empty.")
+        _require(bool(self.artifact_id.strip()), "artifact_id must not be empty.")
+        _require(bool(self.artifact_type.strip()), "artifact_type must not be empty.")
+        _require(bool(self.proof_hash.strip()), "proof_hash must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ProofHashRecord:
+        return cls(
+            task_id=str(data["task_id"]),
+            artifact_id=str(data["artifact_id"]),
+            artifact_type=str(data["artifact_type"]),
+            proof_hash=str(data["proof_hash"]),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
         )
 
 
@@ -349,6 +495,364 @@ class EvidenceBundle(DictSerializable):
 
 
 @dataclass(slots=True, frozen=True)
+class WebEvidenceRecord(DictSerializable):
+    """Persisted fetched web evidence plus lookup provenance."""
+
+    task_id: str
+    query: str
+    provider: str
+    reason: str
+    evidence: EvidenceItem
+    degraded: bool = False
+    warnings: tuple[str, ...] = ()
+    lookup_metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.task_id.strip()), "WebEvidenceRecord.task_id must not be empty.")
+        _require(bool(self.query.strip()), "WebEvidenceRecord.query must not be empty.")
+        _require(bool(self.provider.strip()), "WebEvidenceRecord.provider must not be empty.")
+        _require(bool(self.reason.strip()), "WebEvidenceRecord.reason must not be empty.")
+        _require(
+            self.evidence.source_type == SourceType.WEB,
+            "WebEvidenceRecord.evidence must use SourceType.WEB.",
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> WebEvidenceRecord:
+        return cls(
+            task_id=str(data["task_id"]),
+            query=str(data["query"]),
+            provider=str(data["provider"]),
+            reason=str(data["reason"]),
+            evidence=EvidenceItem.from_dict(data["evidence"]),
+            degraded=bool(data.get("degraded", False)),
+            warnings=tuple(str(item) for item in data.get("warnings", [])),
+            lookup_metadata=dict(data.get("lookup_metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CompressionRuntimeSubset(DictSerializable):
+    """Active subset of runtime compression registries for one task."""
+
+    task_id: str
+    macros: tuple[Macro, ...] = ()
+    opcodes: tuple[OpcodeEntry, ...] = ()
+    decoders: tuple[DecoderEntry, ...] = ()
+    symbol_table: SymbolTableSnapshot | None = None
+    proof_hashes: tuple[ProofHashRecord, ...] = ()
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.task_id.strip()), "CompressionRuntimeSubset.task_id must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CompressionRuntimeSubset:
+        raw_symbol_table = data.get("symbol_table")
+        symbol_table = None
+        if isinstance(raw_symbol_table, Mapping):
+            symbol_table = SymbolTableSnapshot.from_dict(raw_symbol_table)
+        return cls(
+            task_id=str(data["task_id"]),
+            macros=tuple(Macro.from_dict(item) for item in data.get("macros", [])),
+            opcodes=tuple(OpcodeEntry.from_dict(item) for item in data.get("opcodes", [])),
+            decoders=tuple(DecoderEntry.from_dict(item) for item in data.get("decoders", [])),
+            symbol_table=symbol_table,
+            proof_hashes=tuple(
+                ProofHashRecord.from_dict(item) for item in data.get("proof_hashes", [])
+            ),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class SemanticEntity(DictSerializable):
+    """Typed canonical entity carried inside the reasoning graph."""
+
+    entity_id: str
+    entity_type: str
+    value: str
+    evidence_handles: tuple[str, ...] = ()
+    attributes: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 1.0
+    uncertainty: str = ""
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.entity_id.strip()), "SemanticEntity.entity_id must not be empty.")
+        _require(bool(self.entity_type.strip()), "SemanticEntity.entity_type must not be empty.")
+        _require(bool(self.value.strip()), "SemanticEntity.value must not be empty.")
+        _require(0.0 <= self.confidence <= 1.0, "SemanticEntity.confidence must be between 0 and 1.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _compact_payload(
+            super().to_dict(),
+            drop_empty=("evidence_handles", "attributes", "uncertainty"),
+            drop_defaults={"confidence": 1.0},
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SemanticEntity:
+        return cls(
+            entity_id=str(data["entity_id"]),
+            entity_type=str(data["entity_type"]),
+            value=str(data["value"]),
+            evidence_handles=tuple(str(item) for item in data.get("evidence_handles", [])),
+            attributes=dict(data.get("attributes", {})),
+            confidence=float(data.get("confidence", 1.0)),
+            uncertainty=str(data.get("uncertainty", "")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class SemanticActivity(DictSerializable):
+    """Typed canonical activity linking input and output entities."""
+
+    activity_id: str
+    activity_type: str
+    input_entity_ids: tuple[str, ...] = ()
+    output_entity_ids: tuple[str, ...] = ()
+    agent_id: str = ""
+    evidence_handles: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.activity_id.strip()), "SemanticActivity.activity_id must not be empty.")
+        _require(bool(self.activity_type.strip()), "SemanticActivity.activity_type must not be empty.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _compact_payload(
+            super().to_dict(),
+            drop_empty=("input_entity_ids", "output_entity_ids", "agent_id", "evidence_handles", "metadata"),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SemanticActivity:
+        return cls(
+            activity_id=str(data["activity_id"]),
+            activity_type=str(data["activity_type"]),
+            input_entity_ids=tuple(str(item) for item in data.get("input_entity_ids", [])),
+            output_entity_ids=tuple(str(item) for item in data.get("output_entity_ids", [])),
+            agent_id=str(data.get("agent_id", "")),
+            evidence_handles=tuple(str(item) for item in data.get("evidence_handles", [])),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class SemanticAgent(DictSerializable):
+    """Typed producer/owner identity for graph artifacts."""
+
+    agent_id: str
+    component: str
+    backend: str = ""
+    role: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.agent_id.strip()), "SemanticAgent.agent_id must not be empty.")
+        _require(bool(self.component.strip()), "SemanticAgent.component must not be empty.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _compact_payload(
+            super().to_dict(),
+            drop_empty=("backend", "role", "metadata"),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SemanticAgent:
+        return cls(
+            agent_id=str(data["agent_id"]),
+            component=str(data["component"]),
+            backend=str(data.get("backend", "")),
+            role=str(data.get("role", "")),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ProvenanceBundle(DictSerializable):
+    """Explicit provenance bundle linking entities, activities, and agents."""
+
+    bundle_id: str
+    entity_ids: tuple[str, ...] = ()
+    activity_ids: tuple[str, ...] = ()
+    agent_ids: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.bundle_id.strip()), "ProvenanceBundle.bundle_id must not be empty.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _compact_payload(
+            super().to_dict(),
+            drop_empty=("entity_ids", "activity_ids", "agent_ids", "metadata"),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ProvenanceBundle:
+        return cls(
+            bundle_id=str(data["bundle_id"]),
+            entity_ids=tuple(str(item) for item in data.get("entity_ids", [])),
+            activity_ids=tuple(str(item) for item in data.get("activity_ids", [])),
+            agent_ids=tuple(str(item) for item in data.get("agent_ids", [])),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ContextFrame(DictSerializable):
+    """Inherited scope and confidence applied to a set of operations."""
+
+    frame_id: str
+    scope: str
+    confidence: float
+    provenance_bundle_id: str = ""
+    assumptions: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.frame_id.strip()), "ContextFrame.frame_id must not be empty.")
+        _require(bool(self.scope.strip()), "ContextFrame.scope must not be empty.")
+        _require(0.0 <= self.confidence <= 1.0, "ContextFrame.confidence must be between 0 and 1.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _compact_payload(
+            super().to_dict(),
+            drop_empty=("provenance_bundle_id", "assumptions", "metadata"),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ContextFrame:
+        return cls(
+            frame_id=str(data["frame_id"]),
+            scope=str(data.get("scope", "task")),
+            confidence=float(data.get("confidence", 0.0)),
+            provenance_bundle_id=str(data.get("provenance_bundle_id", "")),
+            assumptions=tuple(str(item) for item in data.get("assumptions", [])),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class OperationStep(DictSerializable):
+    """One compact operation in the canonical reasoning operation stream."""
+
+    op_id: str
+    opcode: str
+    args: tuple[str, ...] = ()
+    output_ref: str = ""
+    context_frame_id: str = ""
+    evidence_handles: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.op_id.strip()), "OperationStep.op_id must not be empty.")
+        _require(bool(self.opcode.strip()), "OperationStep.opcode must not be empty.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _compact_payload(
+            super().to_dict(),
+            drop_empty=("args", "output_ref", "context_frame_id", "evidence_handles", "metadata"),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OperationStep:
+        opcode = str(data.get("opcode", data.get("op", "")))
+        return cls(
+            op_id=str(data.get("op_id", f"op_{opcode or 'unknown'}")),
+            opcode=opcode,
+            args=tuple(str(item) for item in data.get("args", [])),
+            output_ref=str(data.get("output_ref", "")),
+            context_frame_id=str(data.get("context_frame_id", "")),
+            evidence_handles=tuple(str(item) for item in data.get("evidence_handles", [])),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DecodeHint(DictSerializable):
+    """Verified decode hint kept separate from natural-language rendering."""
+
+    hint_id: str
+    template: str
+    entity_ids: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.hint_id.strip()), "DecodeHint.hint_id must not be empty.")
+        _require(bool(self.template.strip()), "DecodeHint.template must not be empty.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _compact_payload(
+            super().to_dict(),
+            drop_empty=("entity_ids", "metadata"),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DecodeHint:
+        return cls(
+            hint_id=str(data["hint_id"]),
+            template=str(data["template"]),
+            entity_ids=tuple(str(item) for item in data.get("entity_ids", [])),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CanonicalReasoningGraph(DictSerializable):
+    """Canonical typed reasoning/provenance graph for compressed traces."""
+
+    entities: tuple[SemanticEntity, ...] = ()
+    activities: tuple[SemanticActivity, ...] = ()
+    agents: tuple[SemanticAgent, ...] = ()
+    bundles: tuple[ProvenanceBundle, ...] = ()
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        entity_ids = tuple(entity.entity_id for entity in self.entities)
+        activity_ids = tuple(activity.activity_id for activity in self.activities)
+        agent_ids = tuple(agent.agent_id for agent in self.agents)
+        bundle_ids = tuple(bundle.bundle_id for bundle in self.bundles)
+        _require(len(set(entity_ids)) == len(entity_ids), "CanonicalReasoningGraph entity IDs must be unique.")
+        _require(
+            len(set(activity_ids)) == len(activity_ids),
+            "CanonicalReasoningGraph activity IDs must be unique.",
+        )
+        _require(len(set(agent_ids)) == len(agent_ids), "CanonicalReasoningGraph agent IDs must be unique.")
+        _require(len(set(bundle_ids)) == len(bundle_ids), "CanonicalReasoningGraph bundle IDs must be unique.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _compact_payload(
+            super().to_dict(),
+            drop_empty=("entities", "activities", "agents", "bundles"),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CanonicalReasoningGraph:
+        return cls(
+            entities=tuple(SemanticEntity.from_dict(item) for item in data.get("entities", [])),
+            activities=tuple(
+                SemanticActivity.from_dict(item) for item in data.get("activities", [])
+            ),
+            agents=tuple(SemanticAgent.from_dict(item) for item in data.get("agents", [])),
+            bundles=tuple(ProvenanceBundle.from_dict(item) for item in data.get("bundles", [])),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class CompressedTrace(DictSerializable):
     """Compressed reasoning chain used by critic and compressor."""
 
@@ -358,6 +862,15 @@ class CompressedTrace(DictSerializable):
     macros_used: tuple[str, ...]
     confidence: float
     reasoner_notes: str = ""
+    ir_version: str = ""
+    canonical_graph: CanonicalReasoningGraph | None = None
+    canonical_graph_builder: str = ""
+    operation_stream: tuple[OperationStep, ...] = ()
+    symbol_table_refs: tuple[str, ...] = ()
+    evidence_handles: tuple[str, ...] = ()
+    context_frames: tuple[ContextFrame, ...] = ()
+    proof_hash: str = ""
+    decode_hints: tuple[DecodeHint, ...] = ()
     created_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
@@ -365,17 +878,762 @@ class CompressedTrace(DictSerializable):
         _require(len(self.tokens) > 0, "CompressedTrace.tokens must not be empty.")
         _require(0.0 <= self.confidence <= 1.0, "CompressedTrace.confidence must be between 0 and 1.")
 
+    def to_dict(self) -> dict[str, Any]:
+        payload = _compact_payload(
+            super().to_dict(),
+            drop_empty=(
+                "expanded_preview",
+                "macros_used",
+                "reasoner_notes",
+                "ir_version",
+                "canonical_graph_builder",
+                "canonical_graph",
+                "operation_stream",
+                "symbol_table_refs",
+                "evidence_handles",
+                "context_frames",
+                "proof_hash",
+                "decode_hints",
+            ),
+        )
+        if self.canonical_graph_builder and "canonical_graph" in payload:
+            payload.pop("canonical_graph", None)
+        if self.canonical_graph_builder and "symbol_table_refs" in payload:
+            payload.pop("symbol_table_refs", None)
+        if self.canonical_graph_builder and "decode_hints" in payload:
+            payload.pop("decode_hints", None)
+        return payload
+
+    def to_storage_dict(self) -> dict[str, Any]:
+        payload = self.to_dict()
+        if self.canonical_graph_builder == "reasoner_stub_v1":
+            for field_name in (
+                "expanded_preview",
+                "reasoner_notes",
+                "evidence_handles",
+            ):
+                payload.pop(field_name, None)
+            raw_steps = payload.get("operation_stream")
+            if isinstance(raw_steps, list):
+                compact_steps: list[dict[str, Any]] = []
+                for index, step in enumerate(raw_steps):
+                    if not isinstance(step, dict):
+                        compact_steps.append(step)
+                        continue
+                    compact_step = dict(step)
+                    compact_step.pop("metadata", None)
+                    if index > 0:
+                        compact_step.pop("evidence_handles", None)
+                    compact_steps.append(compact_step)
+                payload["operation_stream"] = compact_steps
+        return payload
+
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> CompressedTrace:
+        tokens = tuple(str(item) for item in data.get("tokens", data.get("compressed_chain", [])))
+        macros_used = tuple(str(item) for item in data.get("macros_used", []))
+        raw_graph = data.get("canonical_graph", data.get("graph"))
+        canonical_graph = None
+        if isinstance(raw_graph, Mapping):
+            canonical_graph = CanonicalReasoningGraph.from_dict(raw_graph)
+        canonical_graph_builder = str(data.get("canonical_graph_builder", ""))
+        operation_stream = tuple(
+            OperationStep.from_dict(item) for item in data.get("operation_stream", [])
+        )
+        context_frames = tuple(
+            ContextFrame.from_dict(item) for item in data.get("context_frames", [])
+        )
+        decode_hints = tuple(DecodeHint.from_dict(item) for item in data.get("decode_hints", []))
+        created_at = _parse_datetime(data.get("created_at", utc_now()))
+        symbol_table_refs = tuple(str(item) for item in data.get("symbol_table_refs", []))
+        if not symbol_table_refs and canonical_graph_builder:
+            symbol_table_refs = _derive_symbol_table_refs(
+                builder=canonical_graph_builder,
+                operation_stream=operation_stream,
+            )
+        evidence_handles = tuple(str(item) for item in data.get("evidence_handles", []))
+        if not evidence_handles and canonical_graph_builder:
+            evidence_handles = _derive_evidence_handles(
+                builder=canonical_graph_builder,
+                operation_stream=operation_stream,
+            )
+        if canonical_graph_builder == "reasoner_stub_v1":
+            operation_stream = _restore_reasoner_stub_operation_stream(
+                operation_stream=operation_stream,
+                evidence_handles=evidence_handles,
+            )
+        expanded_preview = tuple(str(item) for item in data.get("expanded_preview", []))
+        if not expanded_preview and canonical_graph_builder:
+            expanded_preview = _derive_expanded_preview(
+                builder=canonical_graph_builder,
+                tokens=tokens,
+            )
+        if not decode_hints and canonical_graph_builder:
+            decode_hints = _derive_decode_hints(
+                builder=canonical_graph_builder,
+                operation_stream=operation_stream,
+            )
+        reasoner_notes = str(data.get("reasoner_notes", ""))
+        if not reasoner_notes and canonical_graph_builder:
+            reasoner_notes = _derive_reasoner_notes(
+                builder=canonical_graph_builder,
+                context_frames=context_frames,
+                symbol_table_refs=symbol_table_refs,
+            )
+        if canonical_graph is None and canonical_graph_builder:
+            canonical_graph = _rebuild_derived_canonical_graph(
+                builder=canonical_graph_builder,
+                task_id=str(data["task_id"]),
+                confidence=float(data.get("confidence", 0.0)),
+                tokens=tokens,
+                macros_used=macros_used,
+                operation_stream=operation_stream,
+                symbol_table_refs=symbol_table_refs,
+                evidence_handles=evidence_handles,
+                context_frames=context_frames,
+                decode_hints=decode_hints,
+                created_at=created_at,
+            )
         return cls(
             task_id=str(data["task_id"]),
-            tokens=tuple(str(item) for item in data.get("tokens", data.get("compressed_chain", []))),
-            expanded_preview=tuple(str(item) for item in data.get("expanded_preview", [])),
-            macros_used=tuple(str(item) for item in data.get("macros_used", [])),
+            tokens=tokens,
+            expanded_preview=expanded_preview,
+            macros_used=macros_used,
             confidence=float(data.get("confidence", 0.0)),
-            reasoner_notes=str(data.get("reasoner_notes", "")),
+            reasoner_notes=reasoner_notes,
+            ir_version=str(data.get("ir_version", "")),
+            canonical_graph=canonical_graph,
+            canonical_graph_builder=canonical_graph_builder,
+            operation_stream=operation_stream,
+            symbol_table_refs=symbol_table_refs,
+            evidence_handles=evidence_handles,
+            context_frames=context_frames,
+            proof_hash=str(data.get("proof_hash", "")),
+            decode_hints=decode_hints,
+            created_at=created_at,
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ResearchReasonerHandoff(DictSerializable):
+    """Locked handoff contract between Researcher and Reasoner."""
+
+    plan: Plan
+    evidence: EvidenceBundle
+    budget: ResourceBudget
+    evidence_handles: tuple[str, ...]
+    reasoning_mode: str = "fast"
+    final_text_policy: str = "post_verification"
+    output_contract: str = "compressed_trace_v1"
+    implementation_mode: str = "deterministic_stub"
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(
+            self.plan.task_id == self.evidence.task_id,
+            "ResearchReasonerHandoff plan and evidence task IDs must match.",
+        )
+        _require(bool(self.reasoning_mode.strip()), "ResearchReasonerHandoff.reasoning_mode must not be empty.")
+        _require(
+            bool(self.final_text_policy.strip()),
+            "ResearchReasonerHandoff.final_text_policy must not be empty.",
+        )
+        _require(
+            bool(self.output_contract.strip()),
+            "ResearchReasonerHandoff.output_contract must not be empty.",
+        )
+        _require(
+            bool(self.implementation_mode.strip()),
+            "ResearchReasonerHandoff.implementation_mode must not be empty.",
+        )
+
+    @classmethod
+    def from_inputs(
+        cls,
+        *,
+        plan: Plan,
+        evidence: EvidenceBundle,
+        budget: ResourceBudget,
+        reasoning_mode: str = "fast",
+        final_text_policy: str = "post_verification",
+        output_contract: str = "compressed_trace_v1",
+        implementation_mode: str = "deterministic_stub",
+    ) -> ResearchReasonerHandoff:
+        evidence_handles = tuple(
+            dict.fromkeys(item.id for item in evidence.local_results + evidence.web_results)
+        )
+        return cls(
+            plan=plan,
+            evidence=evidence,
+            budget=budget,
+            evidence_handles=evidence_handles,
+            reasoning_mode=reasoning_mode,
+            final_text_policy=final_text_policy,
+            output_contract=output_contract,
+            implementation_mode=implementation_mode,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ResearchReasonerHandoff:
+        plan = Plan.from_dict(data["plan"])
+        evidence = EvidenceBundle.from_dict(data["evidence"])
+        default_handles = tuple(
+            dict.fromkeys(item.id for item in evidence.local_results + evidence.web_results)
+        )
+        return cls(
+            plan=plan,
+            evidence=evidence,
+            budget=ResourceBudget.from_dict(data["budget"]),
+            evidence_handles=tuple(str(item) for item in data.get("evidence_handles", default_handles)),
+            reasoning_mode=str(data.get("reasoning_mode", "fast")),
+            final_text_policy=str(data.get("final_text_policy", "post_verification")),
+            output_contract=str(data.get("output_contract", "compressed_trace_v1")),
+            implementation_mode=str(data.get("implementation_mode", "deterministic_stub")),
             created_at=_parse_datetime(data.get("created_at", utc_now())),
         )
+
+
+@dataclass(slots=True, frozen=True)
+class ReasonerCriticHandoff(DictSerializable):
+    """Locked handoff contract between Reasoner and Critic."""
+
+    plan: Plan
+    evidence: EvidenceBundle
+    trace: CompressedTrace
+    budget: ResourceBudget
+    evidence_handles: tuple[str, ...]
+    proof_hash: str
+    required_opcode_names: tuple[str, ...]
+    required_macro_names: tuple[str, ...]
+    required_decoder_names: tuple[str, ...]
+    repair_attempt_count: int = 0
+    repair_history: tuple[str, ...] = ()
+    final_text_policy: str = "post_verification"
+    output_contract: str = "critique_report_v1"
+    implementation_mode: str = "deterministic_stub"
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(
+            self.plan.task_id == self.evidence.task_id == self.trace.task_id,
+            "ReasonerCriticHandoff task IDs must match across plan, evidence, and trace.",
+        )
+        _require(
+            self.repair_attempt_count >= 0,
+            "ReasonerCriticHandoff.repair_attempt_count must be non-negative.",
+        )
+        _require(
+            bool(self.final_text_policy.strip()),
+            "ReasonerCriticHandoff.final_text_policy must not be empty.",
+        )
+        _require(
+            bool(self.output_contract.strip()),
+            "ReasonerCriticHandoff.output_contract must not be empty.",
+        )
+        _require(
+            bool(self.implementation_mode.strip()),
+            "ReasonerCriticHandoff.implementation_mode must not be empty.",
+        )
+
+    @classmethod
+    def from_inputs(
+        cls,
+        *,
+        plan: Plan,
+        evidence: EvidenceBundle,
+        trace: CompressedTrace,
+        budget: ResourceBudget,
+        repair_attempt_count: int = 0,
+        repair_history: tuple[str, ...] = (),
+        final_text_policy: str = "post_verification",
+        output_contract: str = "critique_report_v1",
+        implementation_mode: str = "deterministic_stub",
+    ) -> ReasonerCriticHandoff:
+        evidence_handles = trace.evidence_handles or tuple(
+            dict.fromkeys(item.id for item in evidence.local_results + evidence.web_results)
+        )
+        return cls(
+            plan=plan,
+            evidence=evidence,
+            trace=trace,
+            budget=budget,
+            evidence_handles=evidence_handles,
+            proof_hash=trace.proof_hash,
+            required_opcode_names=tuple(dict.fromkeys(step.opcode for step in trace.operation_stream if step.opcode)),
+            required_macro_names=tuple(dict.fromkeys(trace.macros_used)),
+            required_decoder_names=tuple(
+                dict.fromkeys(hint.template for hint in trace.decode_hints if hint.template)
+            ),
+            repair_attempt_count=repair_attempt_count,
+            repair_history=repair_history,
+            final_text_policy=final_text_policy,
+            output_contract=output_contract,
+            implementation_mode=implementation_mode,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ReasonerCriticHandoff:
+        plan = Plan.from_dict(data["plan"])
+        evidence = EvidenceBundle.from_dict(data["evidence"])
+        trace = CompressedTrace.from_dict(data["trace"])
+        default_handles = trace.evidence_handles or tuple(
+            dict.fromkeys(item.id for item in evidence.local_results + evidence.web_results)
+        )
+        default_opcodes = tuple(dict.fromkeys(step.opcode for step in trace.operation_stream if step.opcode))
+        default_macros = tuple(dict.fromkeys(trace.macros_used))
+        default_decoders = tuple(
+            dict.fromkeys(hint.template for hint in trace.decode_hints if hint.template)
+        )
+        return cls(
+            plan=plan,
+            evidence=evidence,
+            trace=trace,
+            budget=ResourceBudget.from_dict(data["budget"]),
+            evidence_handles=tuple(str(item) for item in data.get("evidence_handles", default_handles)),
+            proof_hash=str(data.get("proof_hash", trace.proof_hash)),
+            required_opcode_names=tuple(
+                str(item) for item in data.get("required_opcode_names", default_opcodes)
+            ),
+            required_macro_names=tuple(
+                str(item) for item in data.get("required_macro_names", default_macros)
+            ),
+            required_decoder_names=tuple(
+                str(item) for item in data.get("required_decoder_names", default_decoders)
+            ),
+            repair_attempt_count=int(data.get("repair_attempt_count", 0)),
+            repair_history=tuple(str(item) for item in data.get("repair_history", [])),
+            final_text_policy=str(data.get("final_text_policy", "post_verification")),
+            output_contract=str(data.get("output_contract", "critique_report_v1")),
+            implementation_mode=str(data.get("implementation_mode", "deterministic_stub")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+def _derive_symbol_table_refs(
+    *,
+    builder: str,
+    operation_stream: tuple[OperationStep, ...],
+) -> tuple[str, ...]:
+    if builder == "reasoner_stub_v1":
+        bind_step = next((step for step in operation_stream if step.opcode == "bind"), None)
+        if bind_step is not None:
+            refs = [arg for arg in bind_step.args if arg]
+            if bind_step.output_ref:
+                refs.append(bind_step.output_ref)
+            return tuple(refs)
+    if builder == "macro_engine_v1":
+        return tuple(step.output_ref for step in operation_stream if step.output_ref)
+    refs: list[str] = []
+    for step in operation_stream:
+        refs.extend(arg for arg in step.args if arg)
+        if step.output_ref:
+            refs.append(step.output_ref)
+    return tuple(dict.fromkeys(refs))
+
+
+def _derive_decode_hints(
+    *,
+    builder: str,
+    operation_stream: tuple[OperationStep, ...],
+) -> tuple[DecodeHint, ...]:
+    if builder == "reasoner_stub_v1":
+        return (
+            DecodeHint(
+                hint_id="d0",
+                template="verified_answer",
+                entity_ids=("a",),
+            ),
+        )
+    if builder == "macro_engine_v1":
+        emit_refs = tuple(
+            sorted(
+                f"ent_{step.output_ref}"
+                for step in operation_stream
+                if step.opcode == "emit" and step.output_ref
+            )
+        )
+        if emit_refs:
+            return (
+                DecodeHint(
+                    hint_id="hint_verified_answer",
+                    template="verified_answer",
+                    entity_ids=emit_refs,
+                    metadata={"kind": "emit_projection"},
+                ),
+            )
+        if operation_stream and operation_stream[-1].output_ref:
+            return (
+                DecodeHint(
+                    hint_id="hint_trace_summary",
+                    template="compressed_trace_summary",
+                    entity_ids=(f"ent_{operation_stream[-1].output_ref}",),
+                    metadata={"kind": "summary_projection"},
+                ),
+            )
+    return ()
+
+
+def _derive_evidence_handles(
+    *,
+    builder: str,
+    operation_stream: tuple[OperationStep, ...],
+) -> tuple[str, ...]:
+    if builder in {"reasoner_stub_v1", "macro_engine_v1"}:
+        handles: list[str] = []
+        for step in operation_stream:
+            handles.extend(handle for handle in step.evidence_handles if handle)
+        return tuple(dict.fromkeys(handles))
+    return ()
+
+
+def _restore_reasoner_stub_operation_stream(
+    *,
+    operation_stream: tuple[OperationStep, ...],
+    evidence_handles: tuple[str, ...],
+) -> tuple[OperationStep, ...]:
+    restored: list[OperationStep] = []
+    for index, step in enumerate(operation_stream):
+        metadata = dict(step.metadata)
+        if "source_token" not in metadata:
+            metadata["source_token"] = "@match_local_evidence" if index == 0 else "@compose_answer"
+        restored.append(
+            OperationStep(
+                op_id=step.op_id,
+                opcode=step.opcode,
+                args=step.args,
+                output_ref=step.output_ref,
+                context_frame_id=step.context_frame_id,
+                evidence_handles=step.evidence_handles or evidence_handles,
+                metadata=metadata,
+            )
+        )
+    return tuple(restored)
+
+
+def _derive_expanded_preview(
+    *,
+    builder: str,
+    tokens: tuple[str, ...],
+) -> tuple[str, ...]:
+    if builder == "reasoner_stub_v1":
+        review_depth = sum(1 for token in tokens if token.startswith("@review_evidence_"))
+        reasoner_passes = sum(1 for token in tokens if token.startswith("@reason_pass_"))
+        preview = [
+            "Read question and constraints",
+            f"Review {max(1, review_depth)} evidence item(s)",
+        ]
+        for pass_index in range(1, reasoner_passes + 1):
+            preview.append(f"Reasoning pass {pass_index} of {reasoner_passes}")
+        return tuple(preview)
+    return ()
+
+
+def _format_reasoner_stub_notes(
+    *,
+    model_backend: str,
+    evidence_count: int,
+    review_depth: int,
+    reasoner_passes: int,
+    loaded_opcodes: Sequence[str],
+    loaded_macros: Sequence[str],
+    loaded_decoders: Sequence[str],
+    symbol_table_refs: Sequence[str],
+) -> str:
+    return (
+        "reasoner_stub=active\n"
+        f"model_backend={model_backend}\n"
+        f"evidence_count={evidence_count}\n"
+        f"review_depth={review_depth}\n"
+        f"reasoner_passes={reasoner_passes}\n"
+        f"loaded_opcodes={','.join(loaded_opcodes)}\n"
+        f"loaded_macros={','.join(loaded_macros)}\n"
+        f"loaded_decoders={','.join(loaded_decoders)}\n"
+        f"symbol_table_refs={','.join(symbol_table_refs)}"
+    )
+
+
+def _derive_reasoner_notes(
+    *,
+    builder: str,
+    context_frames: tuple[ContextFrame, ...],
+    symbol_table_refs: tuple[str, ...],
+) -> str:
+    if builder != "reasoner_stub_v1" or not context_frames:
+        return ""
+    metadata = dict(context_frames[0].metadata)
+    return _format_reasoner_stub_notes(
+        model_backend=str(metadata.get("mb", metadata.get("model_backend", ""))),
+        evidence_count=int(metadata.get("ec", metadata.get("evidence_count", 0))),
+        review_depth=int(metadata.get("rd", metadata.get("review_depth", 1))),
+        reasoner_passes=int(metadata.get("rp", metadata.get("reasoner_passes", 1))),
+        loaded_opcodes=_metadata_sequence(metadata.get("op", metadata.get("loaded_opcodes", ()))),
+        loaded_macros=_metadata_sequence(metadata.get("mc", metadata.get("loaded_macros", ()))),
+        loaded_decoders=_metadata_sequence(metadata.get("dc", metadata.get("loaded_decoders", ()))),
+        symbol_table_refs=symbol_table_refs,
+    )
+
+
+def _metadata_sequence(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        if not value:
+            return ()
+        return tuple(item for item in value.split(",") if item)
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item) for item in value)
+    return ()
+
+
+def _rebuild_derived_canonical_graph(
+    *,
+    builder: str,
+    task_id: str,
+    confidence: float,
+    tokens: tuple[str, ...],
+    macros_used: tuple[str, ...],
+    operation_stream: tuple[OperationStep, ...],
+    symbol_table_refs: tuple[str, ...],
+    evidence_handles: tuple[str, ...],
+    context_frames: tuple[ContextFrame, ...],
+    decode_hints: tuple[DecodeHint, ...],
+    created_at: datetime,
+) -> CanonicalReasoningGraph | None:
+    if builder == "reasoner_stub_v1":
+        return _rebuild_reasoner_stub_graph(
+            confidence=confidence,
+            operation_stream=operation_stream,
+            symbol_table_refs=symbol_table_refs,
+            evidence_handles=evidence_handles,
+            context_frames=context_frames,
+            created_at=created_at,
+        )
+    if builder == "macro_engine_v1":
+        return _rebuild_macro_engine_graph(
+            task_id=task_id,
+            tokens=tokens,
+            macros_used=macros_used,
+            operation_stream=operation_stream,
+            created_at=created_at,
+        )
+    return None
+
+
+def _rebuild_reasoner_stub_graph(
+    *,
+    confidence: float,
+    operation_stream: tuple[OperationStep, ...],
+    symbol_table_refs: tuple[str, ...],
+    evidence_handles: tuple[str, ...],
+    context_frames: tuple[ContextFrame, ...],
+    created_at: datetime,
+) -> CanonicalReasoningGraph:
+    context_metadata = dict(context_frames[0].metadata) if context_frames else {}
+    agent = SemanticAgent(
+        agent_id="ag0",
+        component="reasoner",
+        backend=str(context_metadata.get("mb", context_metadata.get("model_backend", ""))),
+        role="foreground_reasoning",
+        metadata={"builder": "reasoner_stub_v1"},
+        created_at=created_at,
+    )
+    entities: list[SemanticEntity] = [
+        SemanticEntity(
+            entity_id="q",
+            entity_type="question",
+            value="sym_question",
+            created_at=created_at,
+        ),
+    ]
+    for index, handle in enumerate(evidence_handles, start=1):
+        symbol_ref = f"sym_evidence_{index}"
+        entities.append(
+            SemanticEntity(
+                entity_id=f"ev{index}",
+                entity_type="evidence_item",
+                value=handle,
+                evidence_handles=(handle,),
+                attributes={"symbol_ref": symbol_ref},
+                created_at=created_at,
+            )
+        )
+    entities.extend(
+        [
+            SemanticEntity(
+            entity_id="es",
+            entity_type="evidence_set",
+            value="sym_evidence_set",
+            evidence_handles=evidence_handles,
+            attributes={"count": len(evidence_handles)},
+            created_at=created_at,
+        ),
+        SemanticEntity(
+            entity_id="b0",
+            entity_type="intermediate_binding",
+            value=next(
+                (step.output_ref for step in operation_stream if step.opcode == "bind" and step.output_ref),
+                "sym_answer",
+            ),
+            evidence_handles=evidence_handles,
+            attributes={
+                "symbol_refs": [
+                    ref
+                    for ref in symbol_table_refs
+                    if ref == "sym_question" or (ref.startswith("sym_evidence_") and ref != "sym_evidence_set")
+                ]
+            },
+            created_at=created_at,
+        ),
+        SemanticEntity(
+            entity_id="a",
+            entity_type="answer_fragment",
+            value="sym_answer",
+            evidence_handles=evidence_handles,
+            confidence=confidence,
+            created_at=created_at,
+        ),
+        ]
+    )
+    retrieve_outputs = tuple(entity.entity_id for entity in entities if entity.entity_type == "evidence_item") + ("es",)
+    activities = (
+        SemanticActivity(
+            activity_id="ac0",
+            activity_type="retrieve",
+            input_entity_ids=("q",),
+            output_entity_ids=retrieve_outputs,
+            agent_id=agent.agent_id,
+            evidence_handles=evidence_handles,
+            created_at=created_at,
+        ),
+        SemanticActivity(
+            activity_id="ac1",
+            activity_type="bind",
+            input_entity_ids=("q", "es"),
+            output_entity_ids=("b0",),
+            agent_id=agent.agent_id,
+            evidence_handles=evidence_handles,
+            created_at=created_at,
+        ),
+        SemanticActivity(
+            activity_id="ac2",
+            activity_type="emit",
+            input_entity_ids=("b0",),
+            output_entity_ids=("a",),
+            agent_id=agent.agent_id,
+            evidence_handles=evidence_handles,
+            created_at=created_at,
+        ),
+    )
+    bundle = ProvenanceBundle(
+        bundle_id="pb0",
+        entity_ids=tuple(entity.entity_id for entity in entities),
+        activity_ids=tuple(activity.activity_id for activity in activities),
+        agent_ids=(agent.agent_id,),
+        created_at=created_at,
+    )
+    return CanonicalReasoningGraph(
+        entities=tuple(entities),
+        activities=activities,
+        agents=(agent,),
+        bundles=(bundle,),
+        created_at=created_at,
+    )
+
+
+def _rebuild_macro_engine_graph(
+    *,
+    task_id: str,
+    tokens: tuple[str, ...],
+    macros_used: tuple[str, ...],
+    operation_stream: tuple[OperationStep, ...],
+    created_at: datetime,
+) -> CanonicalReasoningGraph:
+    agent = SemanticAgent(
+        agent_id="agent_macro_engine",
+        component="macro_engine",
+        backend="deterministic_ir",
+        role="compression_runtime",
+        metadata={"task_id": task_id},
+        created_at=created_at,
+    )
+    entities: list[SemanticEntity] = [
+        SemanticEntity(
+            entity_id="ent_input",
+            entity_type="trace_input",
+            value=task_id,
+            attributes={"kind": "macro_engine_input"},
+            created_at=created_at,
+        )
+    ]
+    activities: list[SemanticActivity] = []
+    macro_entity_ids: list[str] = []
+    for index, macro_name in enumerate(macros_used, start=1):
+        entity_id = f"macro_{index:03d}"
+        macro_entity_ids.append(entity_id)
+        entities.append(
+            SemanticEntity(
+                entity_id=entity_id,
+                entity_type="macro_definition",
+                value=macro_name.lstrip("@"),
+                attributes={"token": macro_name},
+                created_at=created_at,
+            )
+        )
+    if macro_entity_ids:
+        activities.append(
+            SemanticActivity(
+                activity_id="act_000_expand",
+                activity_type="macro_expand",
+                input_entity_ids=("ent_input", *macro_entity_ids),
+                output_entity_ids=("ent_input",),
+                agent_id=agent.agent_id,
+                metadata={"token_count": len(tokens)},
+                created_at=created_at,
+            )
+        )
+    previous_entity_id = "ent_input"
+    for index, step in enumerate(operation_stream, start=1):
+        entity_id = f"ent_{step.output_ref or f'step_{index:03d}'}"
+        source_token = str(step.metadata.get("source_token", step.opcode))
+        entities.append(
+            SemanticEntity(
+                entity_id=entity_id,
+                entity_type="answer_fragment" if step.opcode == "emit" else "intermediate_binding",
+                value=source_token,
+                evidence_handles=step.evidence_handles,
+                attributes={
+                    "opcode": step.opcode,
+                    "args": list(step.args),
+                },
+                created_at=created_at,
+            )
+        )
+        activities.append(
+            SemanticActivity(
+                activity_id=f"act_{index:03d}_{step.opcode}",
+                activity_type=step.opcode,
+                input_entity_ids=(previous_entity_id,),
+                output_entity_ids=(entity_id,),
+                agent_id=agent.agent_id,
+                evidence_handles=step.evidence_handles,
+                metadata={"op_id": step.op_id},
+                created_at=created_at,
+            )
+        )
+        previous_entity_id = entity_id
+    bundle = ProvenanceBundle(
+        bundle_id="bundle_macro_engine",
+        entity_ids=tuple(entity.entity_id for entity in entities),
+        activity_ids=tuple(activity.activity_id for activity in activities),
+        agent_ids=(agent.agent_id,),
+        metadata={"task_id": task_id},
+        created_at=created_at,
+    )
+    return CanonicalReasoningGraph(
+        entities=tuple(entities),
+        activities=tuple(activities),
+        agents=(agent,),
+        bundles=(bundle,),
+        created_at=created_at,
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -423,6 +1681,9 @@ class MacroProposal(DictSerializable):
     examples: tuple[str, ...]
     simulation_score: float
     approved: bool
+    validation_passed: bool = False
+    validation_issues: tuple[str, ...] = ()
+    proof_fingerprint: str = ""
     created_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
@@ -439,6 +1700,9 @@ class MacroProposal(DictSerializable):
             examples=tuple(str(item) for item in data.get("examples", [])),
             simulation_score=float(data.get("simulation_score", 0.0)),
             approved=bool(data.get("approved", False)),
+            validation_passed=bool(data.get("validation_passed", False)),
+            validation_issues=tuple(str(item) for item in data.get("validation_issues", [])),
+            proof_fingerprint=str(data.get("proof_fingerprint", "")),
             created_at=_parse_datetime(data.get("created_at", utc_now())),
         )
 
@@ -453,6 +1717,9 @@ class TaskResult(DictSerializable):
     reasoning: CompressedTrace
     critique: CritiqueReport
     compression: tuple[MacroProposal, ...]
+    answer_text: str = ""
+    warnings: tuple[str, ...] = ()
+    metrics: tuple[PerformanceMetric, ...] = ()
     completed_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
@@ -468,6 +1735,11 @@ class TaskResult(DictSerializable):
             critique=CritiqueReport.from_dict(data["critique"]),
             compression=tuple(
                 MacroProposal.from_dict(item) for item in data.get("compression", [])
+            ),
+            answer_text=str(data.get("answer_text", "")),
+            warnings=tuple(str(item) for item in data.get("warnings", [])),
+            metrics=tuple(
+                PerformanceMetric.from_dict(item) for item in data.get("metrics", [])
             ),
             completed_at=_parse_datetime(data.get("completed_at", utc_now())),
         )
@@ -555,11 +1827,75 @@ def coerce_evidence_bundle(value: EvidenceBundle | Mapping[str, Any]) -> Evidenc
     return EvidenceBundle.from_dict(value)
 
 
+def coerce_opcode_entry(value: OpcodeEntry | Mapping[str, Any]) -> OpcodeEntry:
+    """Convert mapping payloads to OpcodeEntry while preserving existing values."""
+    if isinstance(value, OpcodeEntry):
+        return value
+    return OpcodeEntry.from_dict(value)
+
+
+def coerce_decoder_entry(value: DecoderEntry | Mapping[str, Any]) -> DecoderEntry:
+    """Convert mapping payloads to DecoderEntry while preserving existing values."""
+    if isinstance(value, DecoderEntry):
+        return value
+    return DecoderEntry.from_dict(value)
+
+
+def coerce_symbol_table_snapshot(
+    value: SymbolTableSnapshot | Mapping[str, Any],
+) -> SymbolTableSnapshot:
+    """Convert mapping payloads to SymbolTableSnapshot while preserving existing values."""
+    if isinstance(value, SymbolTableSnapshot):
+        return value
+    return SymbolTableSnapshot.from_dict(value)
+
+
+def coerce_proof_hash_record(value: ProofHashRecord | Mapping[str, Any]) -> ProofHashRecord:
+    """Convert mapping payloads to ProofHashRecord while preserving existing values."""
+    if isinstance(value, ProofHashRecord):
+        return value
+    return ProofHashRecord.from_dict(value)
+
+
+def coerce_compression_runtime_subset(
+    value: CompressionRuntimeSubset | Mapping[str, Any],
+) -> CompressionRuntimeSubset:
+    """Convert mapping payloads to CompressionRuntimeSubset while preserving existing values."""
+    if isinstance(value, CompressionRuntimeSubset):
+        return value
+    return CompressionRuntimeSubset.from_dict(value)
+
+
 def coerce_compressed_trace(value: CompressedTrace | Mapping[str, Any]) -> CompressedTrace:
     """Convert mapping payloads to CompressedTrace while preserving existing values."""
     if isinstance(value, CompressedTrace):
         return value
     return CompressedTrace.from_dict(value)
+
+
+def coerce_research_reasoner_handoff(
+    value: ResearchReasonerHandoff | Mapping[str, Any],
+) -> ResearchReasonerHandoff:
+    """Convert mapping payloads to ResearchReasonerHandoff while preserving existing values."""
+    if isinstance(value, ResearchReasonerHandoff):
+        return value
+    return ResearchReasonerHandoff.from_dict(value)
+
+
+def coerce_reasoner_critic_handoff(
+    value: ReasonerCriticHandoff | Mapping[str, Any],
+) -> ReasonerCriticHandoff:
+    """Convert mapping payloads to ReasonerCriticHandoff while preserving existing values."""
+    if isinstance(value, ReasonerCriticHandoff):
+        return value
+    return ReasonerCriticHandoff.from_dict(value)
+
+
+def coerce_web_evidence_record(value: WebEvidenceRecord | Mapping[str, Any]) -> WebEvidenceRecord:
+    """Convert mapping payloads to WebEvidenceRecord while preserving existing values."""
+    if isinstance(value, WebEvidenceRecord):
+        return value
+    return WebEvidenceRecord.from_dict(value)
 
 
 def coerce_critique_report(value: CritiqueReport | Mapping[str, Any]) -> CritiqueReport:
@@ -575,3 +1911,16 @@ def coerce_task_result(value: TaskResult | Mapping[str, Any]) -> TaskResult:
         return value
     return TaskResult.from_dict(value)
 
+
+def coerce_runtime_event(value: RuntimeEvent | Mapping[str, Any]) -> RuntimeEvent:
+    """Convert mapping payloads to RuntimeEvent while preserving existing values."""
+    if isinstance(value, RuntimeEvent):
+        return value
+    return RuntimeEvent.from_dict(value)
+
+
+def coerce_agent_status(value: AgentStatus | Mapping[str, Any]) -> AgentStatus:
+    """Convert mapping payloads to AgentStatus while preserving existing values."""
+    if isinstance(value, AgentStatus):
+        return value
+    return AgentStatus.from_dict(value)

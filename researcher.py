@@ -1,30 +1,47 @@
-"""Researcher agent scaffold."""
+"""Researcher agent with local-first retrieval and bounded web fallback."""
 
 from __future__ import annotations
 
 import logging
 
 from config import APP_CONFIG, AppConfig
-from data_structures import EvidenceBundle, EvidenceItem, Plan, ResourceBudget, SourceType
+from data_structures import EvidenceBundle, Plan, ResourceBudget
 from model_manager import ModelManager
-from prompts import RESEARCHER_PROMPT
+from research_service import ResearchService
 from storage import StorageManager
+from web_adapter import WebSearchAdapter
 
 
 class ResearcherAgent:
-    """Retrieves evidence with local-first behavior."""
+    """Retrieves evidence from local storage before optional web fallback."""
 
     def __init__(
         self,
         model_manager: ModelManager,
         storage: StorageManager,
         config: AppConfig = APP_CONFIG,
+        web_adapter: WebSearchAdapter | None = None,
     ):
         self.model_manager = model_manager
         self.storage = storage
         self.config = config
         self.logger = logging.getLogger("quester.researcher")
+        self.service = ResearchService(
+            model_manager=model_manager,
+            storage=storage,
+            config=config,
+            web_adapter=web_adapter,
+        )
         self._started = False
+
+    @property
+    def web_adapter(self) -> WebSearchAdapter:
+        """Expose the active web adapter for compatibility with tests and callers."""
+        return self.service.web_adapter
+
+    @web_adapter.setter
+    def web_adapter(self, value: WebSearchAdapter) -> None:
+        self.service.web_adapter = value
 
     async def start(self) -> None:
         if self._started:
@@ -32,36 +49,11 @@ class ResearcherAgent:
         self._started = True
 
     async def stop(self) -> None:
+        await self.service.reset()
         self._started = False
 
     async def research(self, plan: Plan, budget: ResourceBudget) -> EvidenceBundle:
         """Return a typed local-first evidence bundle."""
         if not self._started:
             raise RuntimeError("ResearcherAgent must be started before use.")
-        question = plan.question
-        _ = RESEARCHER_PROMPT
-        query_vector = await self.model_manager.embed(question)
-        local_item = EvidenceItem(
-            id="local_stub_1",
-            content=f"Stub local evidence for question: {question}",
-            source_type=SourceType.LOCAL,
-            source_ref="local://stub",
-            score=0.7,
-            metadata={
-                "phase": 2,
-                "retrieval_top_k": budget.retrieval_top_k,
-                "max_web_queries": budget.max_web_queries,
-            },
-            vector_preview=tuple(query_vector[:8]),
-        )
-        evidence = EvidenceBundle(
-            task_id=plan.task_id,
-            local_results=(local_item,),
-            web_results=(),
-            used_web_fallback=False,
-        )
-        await self.storage.log_event(
-            "researcher.local_lookup",
-            {"task_id": plan.task_id, "result_count": len(evidence.local_results)},
-        )
-        return evidence
+        return await self.service.research(plan, budget)

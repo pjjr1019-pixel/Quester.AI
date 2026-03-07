@@ -15,6 +15,11 @@ venv/
 env/
 ENV/
 
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
 # Local runtime data
 logs/
 *.sqlite3

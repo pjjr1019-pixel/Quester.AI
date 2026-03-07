@@ -1,0 +1,31 @@
+{
+  "legacy_input": {
+    "task_id": "legacy-trace-fixture",
+    "compressed_chain": [
+      "@lookup",
+      "@emit"
+    ],
+    "macros_used": [
+      "@emit"
+    ],
+    "confidence": 0.72,
+    "reasoner_notes": "legacy trace fixture"
+  },
+  "stable_projection": {
+    "task_id": "fixture-task",
+    "tokens": [
+      "@lookup",
+      "@emit"
+    ],
+    "expanded_preview": [
+      "Lookup evidence",
+      "Emit answer"
+    ],
+    "macros_used": [
+      "@emit"
+    ],
+    "confidence": 0.72,
+    "reasoner_notes": "fixture trace",
+    "created_at": "2026-03-07T12:00:00+00:00"
+  }
+}

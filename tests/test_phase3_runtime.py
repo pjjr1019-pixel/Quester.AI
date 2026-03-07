@@ -100,6 +100,8 @@ class FakeEmbeddingBackend:
         self.started = False
         self.unloaded = False
         self.calls = 0
+        self.query_calls = 0
+        self.document_calls = 0
 
     async def start(self) -> None:
         if self.start_error is not None:
@@ -111,12 +113,23 @@ class FakeEmbeddingBackend:
         self.started = False
 
     async def embed(self, text: str) -> list[float]:
+        return await self._embed_impl(text, vector=[0.1, 0.2, 0.3])
+
+    async def embed_query(self, text: str) -> list[float]:
+        self.query_calls += 1
+        return await self._embed_impl(text, vector=[1.0, 0.0, 0.0])
+
+    async def embed_document(self, text: str) -> list[float]:
+        self.document_calls += 1
+        return await self._embed_impl(text, vector=[0.0, 1.0, 0.0])
+
+    async def _embed_impl(self, text: str, *, vector: list[float]) -> list[float]:
         _ = text
         if self.embed_error is not None:
             raise self.embed_error
         self.calls += 1
         await asyncio.sleep(self.delay_s)
-        return [0.1, 0.2, 0.3]
+        return vector
 
     async def health(self) -> BackendHealth:
         return BackendHealth(
@@ -211,6 +224,26 @@ class Phase3ModelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(vector, [0.1, 0.2, 0.3])
         self.assertTrue(snapshot.fallback_active)
         self.assertEqual(snapshot.embedding_backend, "fallback_embed")
+
+    async def test_explicit_query_and_document_embedding_paths_are_available(self) -> None:
+        backend = FakeEmbeddingBackend("primary_embed")
+        manager = ModelManager(
+            config=self._build_config(),
+            generation_backend=FakeGenerationBackend("primary_gen"),
+            embedding_backend=backend,
+        )
+        await manager.start()
+        self.addAsyncCleanup(manager.stop)
+
+        query_vector = await manager.embed_query("search text")
+        document_vector = await manager.embed_document("document text")
+        generic_vector = await manager.embed("generic text")
+
+        self.assertEqual(query_vector, [1.0, 0.0, 0.0])
+        self.assertEqual(document_vector, [0.0, 1.0, 0.0])
+        self.assertEqual(generic_vector, [0.1, 0.2, 0.3])
+        self.assertEqual(backend.query_calls, 1)
+        self.assertEqual(backend.document_calls, 1)
 
     async def test_generation_semaphore_limits_concurrency(self) -> None:
         backend = FakeGenerationBackend("slow_gen", delay_s=0.03)

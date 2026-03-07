@@ -62,6 +62,10 @@ class EmbeddingBackendAdapter(Protocol):
 
     async def embed(self, text: str) -> list[float]: ...
 
+    async def embed_query(self, text: str) -> list[float]: ...
+
+    async def embed_document(self, text: str) -> list[float]: ...
+
     async def health(self) -> BackendHealth: ...
 
     async def unload(self) -> bool: ...
@@ -111,9 +115,18 @@ class StubEmbeddingBackend:
 
     backend_name = "stub_embedding"
 
-    def __init__(self, model_name: str = "stub-embedding", dimensions: int = 32) -> None:
+    def __init__(
+        self,
+        model_name: str = "stub-embedding",
+        dimensions: int = 32,
+        *,
+        query_prefix: str = "query: ",
+        document_prefix: str = "passage: ",
+    ) -> None:
         self.model_name = model_name
         self.dimensions = dimensions
+        self.query_prefix = query_prefix
+        self.document_prefix = document_prefix
         self._started = False
 
     async def start(self) -> None:
@@ -123,6 +136,15 @@ class StubEmbeddingBackend:
         self._started = False
 
     async def embed(self, text: str) -> list[float]:
+        return self._embed_with_text(text)
+
+    async def embed_query(self, text: str) -> list[float]:
+        return self._embed_with_text(f"{self.query_prefix}{text}")
+
+    async def embed_document(self, text: str) -> list[float]:
+        return self._embed_with_text(f"{self.document_prefix}{text}")
+
+    def _embed_with_text(self, text: str) -> list[float]:
         digest = hashlib.sha256(text.encode("utf-8")).digest()
         return [digest[index % len(digest)] / 255.0 for index in range(self.dimensions)]
 
@@ -236,10 +258,20 @@ class OllamaEmbeddingBackend:
 
     backend_name = "ollama_embeddings"
 
-    def __init__(self, base_url: str, model_name: str, timeout_s: float) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model_name: str,
+        timeout_s: float,
+        *,
+        query_prefix: str = "",
+        document_prefix: str = "",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
         self.timeout_s = timeout_s
+        self.query_prefix = query_prefix
+        self.document_prefix = document_prefix
         self._started = False
         self._last_error: str | None = None
 
@@ -269,6 +301,12 @@ class OllamaEmbeddingBackend:
         raw_embedding = response.get("embedding", [])
         return [float(value) for value in raw_embedding]
 
+    async def embed_query(self, text: str) -> list[float]:
+        return await self.embed(f"{self.query_prefix}{text}")
+
+    async def embed_document(self, text: str) -> list[float]:
+        return await self.embed(f"{self.document_prefix}{text}")
+
     async def health(self) -> BackendHealth:
         return BackendHealth(
             backend_name=self.backend_name,
@@ -277,7 +315,12 @@ class OllamaEmbeddingBackend:
             available=self._started,
             mode="service",
             last_error=self._last_error,
-            metadata={"base_url": self.base_url},
+            metadata={
+                "base_url": self.base_url,
+                "supports_asymmetric_embeddings": bool(
+                    self.query_prefix or self.document_prefix
+                ),
+            },
         )
 
     async def unload(self) -> bool:
@@ -433,12 +476,24 @@ class SentenceTransformersEmbeddingBackend:
 
     backend_name = "sentence_transformers"
 
-    def __init__(self, model_name: str, timeout_s: float) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        timeout_s: float,
+        *,
+        prefer_asymmetric_embeddings: bool = True,
+        query_prefix: str = "",
+        document_prefix: str = "",
+    ) -> None:
         self.model_name = model_name
         self.timeout_s = timeout_s
+        self.prefer_asymmetric_embeddings = prefer_asymmetric_embeddings
+        self.query_prefix = query_prefix
+        self.document_prefix = document_prefix
         self._started = False
         self._model: Any | None = None
         self._last_error: str | None = None
+        self._supports_asymmetric_embeddings = False
 
     async def start(self) -> None:
         await asyncio.to_thread(self._load_model)
@@ -451,7 +506,24 @@ class SentenceTransformersEmbeddingBackend:
 
     async def embed(self, text: str) -> list[float]:
         self._require_started()
-        return await asyncio.wait_for(asyncio.to_thread(self._embed_blocking, text), timeout=self.timeout_s)
+        return await asyncio.wait_for(
+            asyncio.to_thread(self._embed_blocking, text),
+            timeout=self.timeout_s,
+        )
+
+    async def embed_query(self, text: str) -> list[float]:
+        self._require_started()
+        return await asyncio.wait_for(
+            asyncio.to_thread(self._embed_query_blocking, text),
+            timeout=self.timeout_s,
+        )
+
+    async def embed_document(self, text: str) -> list[float]:
+        self._require_started()
+        return await asyncio.wait_for(
+            asyncio.to_thread(self._embed_document_blocking, text),
+            timeout=self.timeout_s,
+        )
 
     async def health(self) -> BackendHealth:
         return BackendHealth(
@@ -462,12 +534,14 @@ class SentenceTransformersEmbeddingBackend:
             mode="cpu",
             estimated_vram_gb=0.0,
             last_error=self._last_error,
+            metadata={"supports_asymmetric_embeddings": self._supports_asymmetric_embeddings},
         )
 
     async def unload(self) -> bool:
         unloaded = self._model is not None
         self._model = None
         self._started = False
+        self._supports_asymmetric_embeddings = False
         return unloaded
 
     def _load_model(self) -> None:
@@ -484,8 +558,36 @@ class SentenceTransformersEmbeddingBackend:
             raise BackendStartupError(
                 f"Failed to load sentence-transformers model '{self.model_name}': {exc}"
             ) from exc
+        self._supports_asymmetric_embeddings = (
+            self.prefer_asymmetric_embeddings
+            and hasattr(self._model, "encode_query")
+            and hasattr(self._model, "encode_document")
+        )
 
     def _embed_blocking(self, text: str) -> list[float]:
+        return self._encode_blocking(text)
+
+    def _embed_query_blocking(self, text: str) -> list[float]:
+        if self._supports_asymmetric_embeddings and self._model is not None:
+            try:
+                vector = self._model.encode_query(text)
+            except Exception as exc:  # pragma: no cover - backend-specific
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                raise BackendUnavailableError(f"sentence-transformers query encode failed: {exc}") from exc
+            return [float(value) for value in vector]
+        return self._encode_blocking(f"{self.query_prefix}{text}")
+
+    def _embed_document_blocking(self, text: str) -> list[float]:
+        if self._supports_asymmetric_embeddings and self._model is not None:
+            try:
+                vector = self._model.encode_document(text)
+            except Exception as exc:  # pragma: no cover - backend-specific
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                raise BackendUnavailableError(f"sentence-transformers document encode failed: {exc}") from exc
+            return [float(value) for value in vector]
+        return self._encode_blocking(f"{self.document_prefix}{text}")
+
+    def _encode_blocking(self, text: str) -> list[float]:
         if self._model is None:
             raise BackendUnavailableError("sentence-transformers backend is not loaded.")
         try:

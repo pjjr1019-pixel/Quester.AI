@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quester-ai"
+version = "0.1.0"
+description = "Local-first async multi-agent AI runtime scaffold for Quester.AI."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Philip Giovia" }
+]
+keywords = ["ai", "agents", "local-first", "async", "ollama"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0,<9.0",
+]
+telemetry = [
+  "psutil>=5.9,<7.0",
+]
+embeddings = [
+  "sentence-transformers>=3.0,<4.0",
+]
+vector = [
+  "chromadb>=0.5,<1.0",
+]
+llama-cpp = [
+  "llama-cpp-python>=0.3,<1.0",
+]
+dev = [
+  "pytest>=8.0,<9.0",
+  "psutil>=5.9,<7.0",
+]
+
+[project.scripts]
+quester-ai = "orchestrator:main"
+
+[tool.setuptools]
+py-modules = [
+  "compressor",
+  "config",
+  "critic",
+  "dashboard",
+  "data_structures",
+  "macro_engine",
+  "model_backends",
+  "model_manager",
+  "orchestrator",
+  "phase6_benchmark",
+  "planner",
+  "prompts",
+  "reasoner",
+  "retrieval",
+  "researcher",
+  "runtime_errors",
+  "self_optimizer",
+  "storage",
+  "utils",
+  "web_adapter",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+python_files = ["test_*.py"]

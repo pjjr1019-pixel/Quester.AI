@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime
 from inspect import signature
 from pathlib import Path
 
@@ -38,6 +40,127 @@ from planner import PlannerAgent
 from reasoner import ReasonerAgent
 from researcher import ResearcherAgent
 from storage import StorageManager
+
+_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "compatibility"
+_FIXTURE_TIMESTAMP = datetime(2026, 3, 7, 12, 0, tzinfo=UTC)
+
+
+def _load_compatibility_fixture(name: str) -> dict[str, object]:
+    return json.loads((_FIXTURE_DIR / name).read_text(encoding="ascii"))
+
+
+def _assert_payload_subset(
+    testcase: unittest.TestCase,
+    actual: object,
+    expected: object,
+    *,
+    path: str = "root",
+) -> None:
+    if isinstance(expected, dict):
+        testcase.assertIsInstance(actual, dict, msg=f"{path} should be a dict.")
+        actual_dict = actual
+        for key, value in expected.items():
+            testcase.assertIn(key, actual_dict, msg=f"Missing key at {path}.{key}")
+            _assert_payload_subset(testcase, actual_dict[key], value, path=f"{path}.{key}")
+        return
+    if isinstance(expected, list):
+        testcase.assertIsInstance(actual, list, msg=f"{path} should be a list.")
+        actual_list = actual
+        testcase.assertEqual(
+            len(actual_list),
+            len(expected),
+            msg=f"List length mismatch at {path}",
+        )
+        for index, value in enumerate(expected):
+            _assert_payload_subset(testcase, actual_list[index], value, path=f"{path}[{index}]")
+        return
+    testcase.assertEqual(actual, expected, msg=f"Value mismatch at {path}")
+
+
+def _build_frozen_compressed_trace() -> CompressedTrace:
+    return CompressedTrace(
+        task_id="fixture-task",
+        tokens=("@lookup", "@emit"),
+        expanded_preview=("Lookup evidence", "Emit answer"),
+        macros_used=("@emit",),
+        confidence=0.72,
+        reasoner_notes="fixture trace",
+        created_at=_FIXTURE_TIMESTAMP,
+    )
+
+
+def _build_frozen_task_result() -> TaskResult:
+    plan = Plan(
+        task_id="fixture-task",
+        question="What remains stable?",
+        steps=(PlanStep(step_id="step_1", description="Inspect evidence"),),
+        required_evidence=("local docs",),
+        success_criteria=("return typed answer",),
+        budget=ResourceBudget(
+            retrieval_top_k=5,
+            max_web_queries=1,
+            reasoner_passes=2,
+            critic_passes=1,
+            macro_depth=3,
+        ),
+        planner_notes="fixture planner notes",
+        created_at=_FIXTURE_TIMESTAMP,
+    )
+    evidence = EvidenceBundle(
+        task_id=plan.task_id,
+        local_results=(
+            EvidenceItem(
+                id="ev-local-1",
+                content="Fixture local evidence",
+                source_type=SourceType.LOCAL,
+                source_ref="local://fixture",
+                score=0.81,
+                metadata={"topic": "compatibility"},
+                vector_preview=(0.1, 0.2),
+            ),
+        ),
+        web_results=(),
+        used_web_fallback=False,
+        created_at=_FIXTURE_TIMESTAMP,
+    )
+    trace = _build_frozen_compressed_trace()
+    critique = CritiqueReport(
+        task_id=plan.task_id,
+        is_valid=True,
+        issues=(),
+        fixed_trace=trace,
+        evidence_coverage=1.0,
+        critic_notes="fixture critique",
+        result=CritiqueResult.VALID,
+        created_at=_FIXTURE_TIMESTAMP,
+    )
+    proposal = MacroProposal(
+        proposal_id="proposal-1",
+        macro=Macro(macro_name="emit_answer", expansion=("@emit",), version=1),
+        reason="Repeated emit token",
+        examples=("@emit",),
+        simulation_score=0.5,
+        approved=False,
+        created_at=_FIXTURE_TIMESTAMP,
+    )
+    metric = PerformanceMetric(
+        task_id=plan.task_id,
+        time=0.25,
+        vram_usage=0.0,
+        iterations=2,
+    )
+    return TaskResult(
+        task_id=plan.task_id,
+        plan=plan,
+        evidence=evidence,
+        reasoning=trace,
+        critique=critique,
+        compression=(proposal,),
+        answer_text="Stable answer text",
+        warnings=("warning.compatibility",),
+        metrics=(metric,),
+        completed_at=_FIXTURE_TIMESTAMP,
+    )
 
 
 def _build_examples() -> dict[str, object]:
@@ -201,7 +324,7 @@ class CompatibilityFieldContractTests(unittest.TestCase):
             "CompressedTrace": {"tokens", "expanded_preview", "macros_used", "confidence", "reasoner_notes"},
             "CritiqueReport": {"is_valid", "issues", "fixed_trace", "evidence_coverage", "critic_notes", "result"},
             "MacroProposal": {"proposal_id", "macro", "reason", "examples", "simulation_score", "approved"},
-            "TaskResult": {"plan", "evidence", "reasoning", "critique", "compression"},
+            "TaskResult": {"plan", "evidence", "reasoning", "critique", "compression", "answer_text", "warnings", "metrics"},
             "RuntimeEvent": {"stage", "payload", "timestamp"},
             "AgentStatus": {"component", "state", "task_id", "severity", "message"},
         }
@@ -212,6 +335,41 @@ class CompatibilityFieldContractTests(unittest.TestCase):
 
 class CompatibilitySerializationTests(unittest.TestCase):
     """Verify old and new payload shapes remain readable."""
+
+    def test_frozen_compressed_trace_fixture_still_deserializes(self) -> None:
+        fixture = _load_compatibility_fixture("compressed_trace_compatibility.json")
+        trace = CompressedTrace.from_dict(fixture["legacy_input"])
+
+        self.assertEqual(trace.task_id, "legacy-trace-fixture")
+        self.assertEqual(trace.tokens, ("@lookup", "@emit"))
+        self.assertEqual(trace.expanded_preview, ())
+        self.assertEqual(trace.macros_used, ("@emit",))
+        self.assertEqual(trace.confidence, 0.72)
+        self.assertEqual(trace.reasoner_notes, "legacy trace fixture")
+
+    def test_frozen_task_result_fixture_still_deserializes(self) -> None:
+        fixture = _load_compatibility_fixture("task_result_compatibility.json")
+        result = TaskResult.from_dict(fixture["legacy_input"])
+
+        self.assertEqual(result.task_id, "legacy-task-fixture")
+        self.assertEqual(result.plan.task_id, "legacy-task-fixture")
+        self.assertEqual(result.reasoning.tokens, ("@lookup", "@emit"))
+        self.assertEqual(result.critique.result, CritiqueResult.VALID)
+        self.assertEqual(result.answer_text, "")
+        self.assertEqual(result.warnings, ())
+        self.assertEqual(result.metrics, ())
+
+    def test_current_compressed_trace_projection_matches_frozen_fixture(self) -> None:
+        fixture = _load_compatibility_fixture("compressed_trace_compatibility.json")
+        payload = _build_frozen_compressed_trace().to_dict()
+
+        _assert_payload_subset(self, payload, fixture["stable_projection"])
+
+    def test_current_task_result_projection_matches_frozen_fixture(self) -> None:
+        fixture = _load_compatibility_fixture("task_result_compatibility.json")
+        payload = _build_frozen_task_result().to_dict()
+
+        _assert_payload_subset(self, payload, fixture["stable_projection"])
 
     def test_old_serialized_payloads_still_deserialize(self) -> None:
         plan_step_payload = {
@@ -343,6 +501,10 @@ class CompatibilitySerializationTests(unittest.TestCase):
         payload = trace.to_dict()
         self.assertEqual(payload["tokens"], ["@lookup", "@emit"])
         self.assertEqual(payload["expanded_preview"], ["Lookup evidence", "Emit answer"])
+        self.assertEqual(payload["ir_version"], "1")
+        self.assertEqual(payload["operation_stream"][0]["opcode"], "lookup")
+        self.assertEqual(payload["context_frames"][0]["frame_id"], "ctx-1")
+        self.assertEqual(payload["proof_hash"], "abc123")
 
 
 class CompatibilityRuntimeTests(unittest.IsolatedAsyncioTestCase):

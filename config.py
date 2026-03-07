@@ -16,6 +16,7 @@ from data_structures import ResourceBudget
 GenerationBackend = Literal["ollama", "llama_cpp"]
 EmbeddingBackend = Literal["sentence_transformers", "ollama_embeddings"]
 VectorStoreBackend = Literal["chromadb", "simple_inmemory"]
+WebSearchProvider = Literal["wikipedia", "stub"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 
@@ -37,7 +38,7 @@ class BackendSelection:
     generation_fallback_model: str = "qwen2.5-3b-instruct-q4_k_m.gguf"
 
     embedding_backend: EmbeddingBackend = "sentence_transformers"
-    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_model: str = "intfloat/e5-small-v2"
     embedding_fallback_backend: EmbeddingBackend = "ollama_embeddings"
     embedding_fallback_model: str = "nomic-embed-text"
 
@@ -123,44 +124,119 @@ class BackendRuntimeSettings:
     llama_cpp_gpu_layers: int = 0
 
 
+@dataclass(frozen=True)
+class RetrievalSettings:
+    """Local-first retrieval and chunking settings."""
+
+    chunk_size_chars: int = 400
+    chunk_overlap_chars: int = 80
+    max_chunks_per_document: int = 64
+    lexical_weight: float = 0.7
+    vector_weight: float = 0.3
+    max_vector_candidates: int = 32
+    minimum_combined_score: float = 0.05
+    vector_only_score_threshold: float = 0.97
+    prefer_asymmetric_embeddings: bool = True
+    query_prefix: str = "query: "
+    document_prefix: str = "passage: "
+    enable_reranking: bool = True
+    max_rerank_candidates: int = 6
+    rerank_min_budget_top_k: int = 6
+    rerank_combined_weight: float = 0.5
+    rerank_lexical_weight: float = 0.2
+    rerank_order_weight: float = 0.15
+    rerank_exact_phrase_weight: float = 0.1
+    rerank_title_weight: float = 0.05
+    seed_default_corpus: bool = True
+    seed_corpus_mode: str = "stub_only"
+    seed_corpus_tier: str = "seed_demo"
+    exclude_seed_corpus_from_live_queries: bool = True
+
+
+@dataclass(frozen=True)
+class WebSearchSettings:
+    """Optional bounded web lookup settings for freshness and missing-evidence fallback."""
+
+    provider: WebSearchProvider = "wikipedia"
+    api_base_url: str = "https://en.wikipedia.org/w/api.php"
+    user_agent: str = "QuesterAI/0.1 (local-first-runtime)"
+    request_timeout_s: float = 5.0
+    max_retries: int = 1
+    retry_backoff_s: float = 0.25
+    max_results_per_query: int = 5
+    max_extract_chars: int = 1200
+    snippet_chars: int = 320
+    live_web_in_stub_mode: bool = False
+
+
+@dataclass(frozen=True)
+class BudgetCalibrationSettings:
+    """Budget caps calibrated for the baseline target and the current dev machine."""
+
+    development_vram_gb: float = 4.0
+    development_ram_gb: float = 8.0
+    max_thinking_minutes: int = 720
+    max_retrieval_top_k: int = 10
+    max_web_queries: int = 5
+    max_reasoner_passes: int = 4
+    max_critic_passes: int = 3
+    max_macro_depth: int = 4
+
+    def clamp_budget(self, budget: ResourceBudget) -> ResourceBudget:
+        """Return a bounded budget that is safe for both baseline and dev profiles."""
+        return ResourceBudget(
+            retrieval_top_k=max(1, min(budget.retrieval_top_k, self.max_retrieval_top_k)),
+            max_web_queries=max(0, min(budget.max_web_queries, self.max_web_queries)),
+            reasoner_passes=max(1, min(budget.reasoner_passes, self.max_reasoner_passes)),
+            critic_passes=max(1, min(budget.critic_passes, self.max_critic_passes)),
+            macro_depth=max(1, min(budget.macro_depth, self.max_macro_depth)),
+        )
+
+
 class BudgetPolicy:
     """Convert thinking-time input into a bounded task budget."""
 
     @staticmethod
-    def from_minutes(minutes: int) -> ResourceBudget:
+    def from_minutes(
+        minutes: int,
+        calibration: BudgetCalibrationSettings | None = None,
+    ) -> ResourceBudget:
         """Return a bounded budget profile for the requested think time."""
-        safe_minutes = max(1, int(minutes))
+        calibration = calibration or APP_CONFIG.budget_calibration
+        safe_minutes = max(1, min(int(minutes), calibration.max_thinking_minutes))
         if safe_minutes <= 5:
-            return ResourceBudget(
+            budget = ResourceBudget(
                 retrieval_top_k=4,
                 max_web_queries=1,
                 reasoner_passes=1,
                 critic_passes=1,
                 macro_depth=2,
             )
-        if safe_minutes <= 30:
-            return ResourceBudget(
+        elif safe_minutes <= 30:
+            budget = ResourceBudget(
                 retrieval_top_k=6,
                 max_web_queries=2,
                 reasoner_passes=2,
                 critic_passes=2,
                 macro_depth=3,
             )
-        if safe_minutes <= 120:
-            return ResourceBudget(
+        elif safe_minutes <= 120:
+            budget = ResourceBudget(
                 retrieval_top_k=8,
                 max_web_queries=3,
                 reasoner_passes=3,
                 critic_passes=2,
                 macro_depth=4,
             )
-        return ResourceBudget(
-            retrieval_top_k=10,
-            max_web_queries=5,
-            reasoner_passes=4,
-            critic_passes=3,
-            macro_depth=4,
-        )
+        else:
+            budget = ResourceBudget(
+                retrieval_top_k=10,
+                max_web_queries=5,
+                reasoner_passes=4,
+                critic_passes=3,
+                macro_depth=4,
+            )
+        return calibration.clamp_budget(budget)
 
 
 @dataclass(frozen=True)
@@ -170,6 +246,9 @@ class StorageSettings:
     sqlite_path: Path = Path("quester.sqlite3")
     logs_dir: Path = Path("logs")
     events_log_name: str = "events.jsonl"
+    trace_log_name: str = "traces.jsonl"
+    web_log_name: str = "web.jsonl"
+    status_log_name: str = "status.jsonl"
 
 
 @dataclass(frozen=True)
@@ -204,6 +283,9 @@ class AppConfig:
     concurrency: ConcurrencySettings = field(default_factory=ConcurrencySettings)
     model_tuning: ModelTuningSettings = field(default_factory=ModelTuningSettings)
     backend_runtime: BackendRuntimeSettings = field(default_factory=BackendRuntimeSettings)
+    retrieval: RetrievalSettings = field(default_factory=RetrievalSettings)
+    web: WebSearchSettings = field(default_factory=WebSearchSettings)
+    budget_calibration: BudgetCalibrationSettings = field(default_factory=BudgetCalibrationSettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
     dashboard: DashboardSettings = field(default_factory=DashboardSettings)
     self_optimizer: SelfOptimizerSettings = field(default_factory=SelfOptimizerSettings)
@@ -246,6 +328,91 @@ class AppConfig:
             raise ValueError("low_vram_headroom_gb must be >= 0.")
         if self.backend_runtime.llama_cpp_context_window < 256:
             raise ValueError("llama_cpp_context_window must be at least 256.")
+        if self.retrieval.chunk_size_chars < 64:
+            raise ValueError("chunk_size_chars must be at least 64.")
+        if self.retrieval.chunk_overlap_chars < 0:
+            raise ValueError("chunk_overlap_chars must be zero or positive.")
+        if self.retrieval.chunk_overlap_chars >= self.retrieval.chunk_size_chars:
+            raise ValueError("chunk_overlap_chars must be smaller than chunk_size_chars.")
+        if self.retrieval.max_chunks_per_document < 1:
+            raise ValueError("max_chunks_per_document must be positive.")
+        if self.retrieval.seed_corpus_mode not in {"stub_only", "always", "disabled"}:
+            raise ValueError("seed_corpus_mode must be one of: stub_only, always, disabled.")
+        if not self.retrieval.seed_corpus_tier.strip():
+            raise ValueError("seed_corpus_tier must not be empty.")
+        if self.retrieval.lexical_weight < 0 or self.retrieval.vector_weight < 0:
+            raise ValueError("retrieval weights must be zero or positive.")
+        if self.retrieval.lexical_weight + self.retrieval.vector_weight <= 0:
+            raise ValueError("at least one retrieval weight must be positive.")
+        if self.retrieval.max_vector_candidates < 1:
+            raise ValueError("max_vector_candidates must be positive.")
+        if self.retrieval.minimum_combined_score < 0:
+            raise ValueError("minimum_combined_score must be zero or positive.")
+        if not 0.0 <= self.retrieval.vector_only_score_threshold <= 1.0:
+            raise ValueError("vector_only_score_threshold must be between 0 and 1.")
+        if self.retrieval.max_rerank_candidates < 1:
+            raise ValueError("max_rerank_candidates must be positive.")
+        if self.retrieval.rerank_min_budget_top_k < 1:
+            raise ValueError("rerank_min_budget_top_k must be positive.")
+        if self.retrieval.rerank_combined_weight < 0:
+            raise ValueError("rerank_combined_weight must be zero or positive.")
+        if self.retrieval.rerank_lexical_weight < 0:
+            raise ValueError("rerank_lexical_weight must be zero or positive.")
+        if self.retrieval.rerank_order_weight < 0:
+            raise ValueError("rerank_order_weight must be zero or positive.")
+        if self.retrieval.rerank_exact_phrase_weight < 0:
+            raise ValueError("rerank_exact_phrase_weight must be zero or positive.")
+        if self.retrieval.rerank_title_weight < 0:
+            raise ValueError("rerank_title_weight must be zero or positive.")
+        if (
+            self.retrieval.rerank_combined_weight
+            + self.retrieval.rerank_lexical_weight
+            + self.retrieval.rerank_order_weight
+            + self.retrieval.rerank_exact_phrase_weight
+            + self.retrieval.rerank_title_weight
+            <= 0
+        ):
+            raise ValueError("at least one rerank weight must be positive.")
+        if self.web.request_timeout_s <= 0:
+            raise ValueError("web.request_timeout_s must be positive.")
+        if self.web.max_retries < 0:
+            raise ValueError("web.max_retries must be zero or positive.")
+        if self.web.retry_backoff_s < 0:
+            raise ValueError("web.retry_backoff_s must be zero or positive.")
+        if self.web.max_results_per_query < 1:
+            raise ValueError("web.max_results_per_query must be positive.")
+        if self.web.max_extract_chars < 128:
+            raise ValueError("web.max_extract_chars must be at least 128.")
+        if self.web.snippet_chars < 64:
+            raise ValueError("web.snippet_chars must be at least 64.")
+        if self.budget_calibration.development_vram_gb <= 0:
+            raise ValueError("development_vram_gb must be positive.")
+        if self.budget_calibration.development_ram_gb <= 0:
+            raise ValueError("development_ram_gb must be positive.")
+        if self.budget_calibration.development_vram_gb > self.preflight.hardware.max_vram_gb:
+            raise ValueError("development_vram_gb must not exceed the locked baseline VRAM target.")
+        if self.budget_calibration.development_ram_gb > self.preflight.hardware.max_ram_gb:
+            raise ValueError("development_ram_gb must not exceed the locked baseline RAM target.")
+        if self.budget_calibration.max_thinking_minutes < 720:
+            raise ValueError("max_thinking_minutes must support the 121-720 minute preset band.")
+        if self.budget_calibration.max_retrieval_top_k < 10:
+            raise ValueError("max_retrieval_top_k must support the maximum preset.")
+        if self.budget_calibration.max_web_queries < 5:
+            raise ValueError("max_web_queries must support the maximum preset.")
+        if self.budget_calibration.max_reasoner_passes < 4:
+            raise ValueError("max_reasoner_passes must support the maximum preset.")
+        if self.budget_calibration.max_critic_passes < 3:
+            raise ValueError("max_critic_passes must support the maximum preset.")
+        if self.budget_calibration.max_macro_depth < 4:
+            raise ValueError("max_macro_depth must support the maximum preset.")
+        if not self.storage.events_log_name.strip():
+            raise ValueError("events_log_name must not be empty.")
+        if not self.storage.trace_log_name.strip():
+            raise ValueError("trace_log_name must not be empty.")
+        if not self.storage.web_log_name.strip():
+            raise ValueError("web_log_name must not be empty.")
+        if not self.storage.status_log_name.strip():
+            raise ValueError("status_log_name must not be empty.")
 
 
 PREFLIGHT = PreflightConfig()

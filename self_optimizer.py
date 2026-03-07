@@ -7,6 +7,7 @@ import logging
 
 from config import APP_CONFIG, AppConfig
 from data_structures import Macro, MacroProposal
+from macro_engine import MacroEngine
 from storage import StorageManager
 from utils import cancel_task, utc_now_iso
 
@@ -44,13 +45,27 @@ class SelfOptimizer:
 
     async def run_cycle(self) -> list[MacroProposal]:
         """Execute one optimizer cycle."""
-        proposal = MacroProposal(
-            proposal_id=f"proposal-{utc_now_iso()}",
-            macro=Macro(macro_name="optimizer_stub_macro", expansion=("@compose_answer",), version=1),
-            reason="Phase 2 placeholder cycle completed.",
-            examples=("@compose_answer",),
-            simulation_score=0.25,
-            approved=False,
+        engine = MacroEngine()
+        proposal = engine.validate_macro_proposal(
+            MacroProposal(
+                proposal_id=f"proposal-{utc_now_iso()}",
+                macro=Macro(
+                    macro_name="optimizer_stub_macro",
+                    expansion=("@compose_answer",),
+                    version=1,
+                    opcode_pattern=("emit",),
+                    invariants=(
+                        "deterministic_round_trip",
+                        "provenance_preserving",
+                        "uncertainty_preserving",
+                    ),
+                    semantic_kind="token_macro",
+                ),
+                reason="Phase 2 placeholder cycle completed.",
+                examples=("@compose_answer",),
+                simulation_score=0.25,
+                approved=False,
+            )
         )
         await self.storage.log_event("self_optimizer.cycle", proposal.to_dict())
         return [proposal]

@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import logging
-from collections import Counter
 
+from compression_service import CompressionService
 from config import APP_CONFIG, AppConfig
-from data_structures import CompressedTrace, Macro, MacroProposal, ReasoningLog
+from data_structures import CompressedTrace, MacroProposal, ReasoningLog
 from model_manager import ModelManager
-from prompts import COMPRESSOR_PROMPT
 
 
 class CompressorAgent:
@@ -18,6 +17,7 @@ class CompressorAgent:
         self.model_manager = model_manager
         self.config = config
         self.logger = logging.getLogger("quester.compressor")
+        self.service = CompressionService(model_manager=model_manager, config=config)
         self._started = False
 
     async def start(self) -> None:
@@ -36,24 +36,4 @@ class CompressorAgent:
         """Return typed macro suggestions from repeated chain tokens."""
         if not self._started:
             raise RuntimeError("CompressorAgent must be started before use.")
-        chain = trace.tokens
-        _ = logs
-        prompt = f"{COMPRESSOR_PROMPT}\nChainLength: {len(chain)}"
-        await self.model_manager.generate(prompt)
-        token_counts = Counter(chain)
-        suggestions: list[MacroProposal] = []
-        for token, count in token_counts.items():
-            if count <= 1:
-                continue
-            sanitized = token.lstrip("@") or "macro_token"
-            suggestions.append(
-                MacroProposal(
-                    proposal_id=f"{trace.task_id}:{sanitized}",
-                    macro=Macro(macro_name=sanitized, expansion=(token,), version=1),
-                    reason=f"Token '{token}' repeated {count} times in compressed trace.",
-                    examples=(token,),
-                    simulation_score=min(1.0, count / 3.0),
-                    approved=False,
-                )
-            )
-        return suggestions
+        return await self.service.propose(trace, logs)
