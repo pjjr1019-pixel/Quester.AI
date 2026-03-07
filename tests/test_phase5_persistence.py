@@ -13,6 +13,7 @@ from critic import CriticAgent
 from data_structures import (
     AgentState,
     AgentStatus,
+    CandidateTrace,
     CanonicalReasoningGraph,
     CompressedTrace,
     ContextFrame,
@@ -26,7 +27,12 @@ from data_structures import (
     MacroProposal,
     OperationStep,
     OpcodeEntry,
+    OptimizerActivationDecision,
+    OptimizerActivationRecord,
+    OptimizerLifecycleStage,
+    OptimizerProposalRecord,
     OptimizerReplaySample,
+    OptimizerRollbackRecord,
     PerformanceMetric,
     Plan,
     PlanStep,
@@ -42,6 +48,7 @@ from data_structures import (
     SourceType,
     SymbolTableSnapshot,
     TaskResult,
+    VerifiedDeepTraceExport,
     WebEvidenceRecord,
 )
 from model_manager import ModelManager
@@ -278,6 +285,113 @@ class StorageManagerTypedPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((self.test_logs / self.test_config.storage.trace_log_name).exists())
         self.assertTrue((self.test_logs / self.test_config.storage.status_log_name).exists())
         self.assertEqual(await self.storage.count_tasks(), 1)
+
+    async def test_storage_persists_optimizer_lifecycle_records_and_verified_deep_exports(self) -> None:
+        result = _build_task_result("persist-deep-task")
+        deep_context = replace(result.reasoning.context_frames[0], metadata={"rm": "deep"})
+        candidate_trace = CandidateTrace(
+            candidate_id="cand-1",
+            answer_text=result.answer_text,
+            strategy="deterministic_stub",
+            verifier_type="evidence_grounding",
+            verified=True,
+            total_score=0.91,
+            agreement_score=0.9,
+            evidence_support_score=1.0,
+            proof_hash_stability=1.0,
+            supporting_evidence_ids=("ev-1",),
+            tokens=result.reasoning.tokens,
+            expanded_preview=result.reasoning.expanded_preview,
+            operation_stream=result.reasoning.operation_stream,
+            decode_hints=result.reasoning.decode_hints,
+            proof_hash=result.reasoning.proof_hash,
+        )
+        deep_trace = replace(
+            result.reasoning,
+            context_frames=(deep_context,),
+            candidate_traces=(candidate_trace,),
+        )
+        deep_critique = replace(
+            result.critique,
+            verifier_type="evidence_grounding",
+            candidate_score=0.91,
+            proof_hash_match=True,
+            result=CritiqueResult.VALID,
+            is_valid=True,
+        )
+        deep_result = replace(result, reasoning=deep_trace, critique=deep_critique)
+        proposal = deep_result.compression[0]
+        proposal_records = (
+            OptimizerProposalRecord(
+                cycle_id="cycle:test",
+                proposal_id=proposal.proposal_id,
+                proposal=proposal,
+                lifecycle_stage=OptimizerLifecycleStage.PROPOSED,
+                source_task_ids=(deep_result.task_id,),
+                replay_sample_count=1,
+                accepted_simulation_count=0,
+                mean_simulation_score=proposal.simulation_score,
+                pass_rate=0.0,
+                contradiction_risk=1.0,
+                activation_eligible=False,
+            ),
+            OptimizerProposalRecord(
+                cycle_id="cycle:test",
+                proposal_id=proposal.proposal_id,
+                proposal=proposal,
+                lifecycle_stage=OptimizerLifecycleStage.VALIDATED,
+                source_task_ids=(deep_result.task_id,),
+                replay_sample_count=1,
+                accepted_simulation_count=1,
+                mean_simulation_score=0.88,
+                pass_rate=1.0,
+                contradiction_risk=0.0,
+                activation_eligible=True,
+            ),
+        )
+        activation_record = OptimizerActivationRecord(
+            cycle_id="cycle:test",
+            proposal_id=proposal.proposal_id,
+            decision=OptimizerActivationDecision.BLOCKED,
+            lifecycle_stage=OptimizerLifecycleStage.ACTIVATION_BLOCKED,
+            reason="proposal_only_policy",
+            validation_passed=True,
+            mean_simulation_score=0.88,
+            pass_rate=1.0,
+            contradiction_risk=0.0,
+            activation_applied=False,
+            rollback_record_id="rollback:test",
+        )
+        rollback_record = OptimizerRollbackRecord(
+            rollback_record_id="rollback:test",
+            cycle_id="cycle:test",
+            proposal_id=proposal.proposal_id,
+            proposal_macro_name=proposal.macro.macro_name,
+            active_macro_versions={},
+            reason="Prepared snapshot before activation.",
+            applied=False,
+        )
+
+        await self.storage.record_task_result(deep_result)
+        await self.storage.record_optimizer_proposal_records(proposal_records)
+        await self.storage.record_optimizer_activation_records((activation_record,))
+        await self.storage.record_optimizer_rollback_records((rollback_record,))
+
+        stored_proposal_records = await self.storage.list_optimizer_proposal_records(cycle_id="cycle:test")
+        stored_activation_records = await self.storage.list_optimizer_activation_records(cycle_id="cycle:test")
+        stored_rollback_records = await self.storage.list_optimizer_rollback_records(cycle_id="cycle:test")
+        export_path = self.test_logs / "verified_deep_trace_exports.jsonl"
+        exports = await self.storage.export_verified_deep_traces(export_path=export_path)
+
+        self.assertEqual(stored_proposal_records, proposal_records)
+        self.assertEqual(stored_activation_records, (activation_record,))
+        self.assertEqual(stored_rollback_records, (rollback_record,))
+        self.assertEqual(len(exports), 1)
+        self.assertIsInstance(exports[0], VerifiedDeepTraceExport)
+        self.assertEqual(exports[0].task_id, deep_result.task_id)
+        self.assertEqual(exports[0].trace_proof_hash, deep_result.reasoning.proof_hash)
+        self.assertEqual(exports[0].evidence_source_refs, ("local://sample",))
+        self.assertTrue(export_path.exists())
 
     async def test_storage_persists_web_evidence_records(self) -> None:
         record = WebEvidenceRecord(

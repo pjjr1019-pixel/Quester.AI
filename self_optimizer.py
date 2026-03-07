@@ -6,21 +6,28 @@ import asyncio
 import logging
 from collections import Counter
 from dataclasses import replace
+from pathlib import Path
 
 from config import APP_CONFIG, AppConfig
 from data_structures import (
     CompressedTrace,
     Macro,
     MacroProposal,
+    OptimizerActivationDecision,
+    OptimizerActivationRecord,
+    OptimizerLifecycleStage,
+    OptimizerProposalRecord,
     OptimizerReplayEvaluation,
     OptimizerReplaySample,
+    OptimizerRollbackRecord,
     PerformanceMetric,
     ReasoningLog,
+    VerifiedDeepTraceExport,
 )
 from macro_engine import MacroEngine
 from retrieval import stable_hash
 from storage import StorageManager
-from utils import cancel_task
+from utils import cancel_task, utc_now_iso
 
 
 class SelfOptimizer:
@@ -61,11 +68,28 @@ class SelfOptimizer:
 
     async def run_cycle(self) -> list[MacroProposal]:
         """Execute one optimizer cycle."""
+        foreground_task_count = await self.storage.get_foreground_task_count()
+        if foreground_task_count > 0:
+            await self.storage.log_event(
+                "self_optimizer.cycle_deferred",
+                {
+                    "reason": "foreground_task_active",
+                    "foreground_task_count": foreground_task_count,
+                },
+            )
+            return []
+
         engine = MacroEngine()
         reasoning_logs = await self._load_reasoning_logs()
         traces = await self.storage.list_reasoning_traces()
         metrics = await self.storage.list_performance_metrics()
         replay_samples = await self._load_replay_samples()
+        cycle_id = self._build_cycle_id(
+            reasoning_logs=reasoning_logs,
+            traces=traces,
+            metrics=metrics,
+            replay_samples=replay_samples,
+        )
         proposals = self._build_trace_driven_proposals(
             engine=engine,
             reasoning_logs=reasoning_logs,
@@ -82,9 +106,31 @@ class SelfOptimizer:
         if evaluations:
             await self.storage.record_optimizer_replay_evaluations(evaluations)
             proposals = self._apply_replay_scores(proposals, evaluations)
+        proposal_summaries = self._summarize_proposal_states(
+            proposals=tuple(proposals),
+            evaluations=evaluations,
+        )
+        proposal_records = self._build_proposal_records(
+            cycle_id=cycle_id,
+            proposals=tuple(proposals),
+            replay_samples=replay_samples,
+            proposal_summaries=proposal_summaries,
+        )
+        activation_records, rollback_records = await self._build_activation_and_rollback_records(
+            cycle_id=cycle_id,
+            proposals=tuple(proposals),
+            proposal_summaries=proposal_summaries,
+        )
+        if proposal_records:
+            await self.storage.record_optimizer_proposal_records(proposal_records)
+        if activation_records:
+            await self.storage.record_optimizer_activation_records(activation_records)
+        if rollback_records:
+            await self.storage.record_optimizer_rollback_records(rollback_records)
         await self.storage.log_event(
             "self_optimizer.cycle",
             {
+                "cycle_id": cycle_id,
                 "proposal_count": len(proposals),
                 "proposal_ids": [proposal.proposal_id for proposal in proposals],
                 "reasoning_log_count": len(reasoning_logs),
@@ -94,9 +140,29 @@ class SelfOptimizer:
                 "evaluation_count": len(evaluations),
                 "accepted_evaluation_count": sum(1 for evaluation in evaluations if evaluation.accepted),
                 "proposal_scores": self._summarize_evaluations(evaluations),
+                "activation_decisions": [
+                    {
+                        "proposal_id": record.proposal_id,
+                        "decision": record.decision.value,
+                        "reason": record.reason,
+                    }
+                    for record in activation_records
+                ],
+                "rollback_record_count": len(rollback_records),
             },
         )
         return proposals
+
+    async def export_verified_deep_traces(
+        self,
+        *,
+        export_path: Path | None = None,
+    ) -> tuple[VerifiedDeepTraceExport, ...]:
+        """Export the bounded verified deep-trace dataset for future replay or distillation."""
+        return await self.storage.export_verified_deep_traces(
+            export_path=export_path,
+            limit=self.config.self_optimizer.replay_history_limit,
+        )
 
     async def _load_reasoning_logs(self) -> tuple[ReasoningLog, ...]:
         payloads = await self.storage.list_reasoning_history()
@@ -116,6 +182,262 @@ class SelfOptimizer:
         if len(samples) <= limit:
             return samples
         return samples[-limit:]
+
+    def _build_cycle_id(
+        self,
+        *,
+        reasoning_logs: tuple[ReasoningLog, ...],
+        traces: tuple[CompressedTrace, ...],
+        metrics: tuple[PerformanceMetric, ...],
+        replay_samples: tuple[OptimizerReplaySample, ...],
+    ) -> str:
+        seed = "|".join(
+            [
+                utc_now_iso(),
+                str(len(reasoning_logs)),
+                str(len(traces)),
+                str(len(metrics)),
+                str(len(replay_samples)),
+                ",".join(sample.task_id for sample in replay_samples[-4:]),
+            ]
+        )
+        return f"cycle:{stable_hash(seed)[:16]}"
+
+    def _summarize_proposal_states(
+        self,
+        *,
+        proposals: tuple[MacroProposal, ...],
+        evaluations: tuple[OptimizerReplayEvaluation, ...],
+    ) -> dict[str, dict[str, float | int | tuple[str, ...] | bool]]:
+        grouped: dict[str, list[OptimizerReplayEvaluation]] = {}
+        for evaluation in evaluations:
+            grouped.setdefault(evaluation.proposal_id, []).append(evaluation)
+        summaries: dict[str, dict[str, float | int | tuple[str, ...] | bool]] = {}
+        for proposal in proposals:
+            items = grouped.get(proposal.proposal_id, [])
+            sample_count = len(items)
+            accepted_count = sum(1 for item in items if item.accepted)
+            mean_score = (
+                round(sum(item.aggregate_score for item in items) / sample_count, 3)
+                if sample_count
+                else proposal.simulation_score
+            )
+            pass_rate = round((accepted_count / sample_count), 3) if sample_count else 0.0
+            rejection_reasons = tuple(
+                sorted(
+                    {
+                        reason.strip()
+                        for item in items
+                        for reason in item.rejection_reason.split(",")
+                        if reason.strip()
+                    }
+                )
+            )
+            contradiction_risk = self._estimate_contradiction_risk(
+                proposal=proposal,
+                pass_rate=pass_rate,
+                rejection_reasons=rejection_reasons,
+            )
+            validation_ready = (
+                proposal.validation_passed
+                and sample_count > 0
+                and mean_score >= self.config.self_optimizer.minimum_simulation_score
+            )
+            activation_eligible = (
+                validation_ready
+                and pass_rate >= 0.5
+                and contradiction_risk <= 0.35
+            )
+            summaries[proposal.proposal_id] = {
+                "sample_count": sample_count,
+                "accepted_count": accepted_count,
+                "mean_score": mean_score,
+                "pass_rate": pass_rate,
+                "rejection_reasons": rejection_reasons,
+                "contradiction_risk": contradiction_risk,
+                "validation_ready": validation_ready,
+                "activation_eligible": activation_eligible,
+            }
+        return summaries
+
+    def _build_proposal_records(
+        self,
+        *,
+        cycle_id: str,
+        proposals: tuple[MacroProposal, ...],
+        replay_samples: tuple[OptimizerReplaySample, ...],
+        proposal_summaries: dict[str, dict[str, float | int | tuple[str, ...] | bool]],
+    ) -> tuple[OptimizerProposalRecord, ...]:
+        source_task_ids = tuple(sample.task_id for sample in replay_samples)
+        records: list[OptimizerProposalRecord] = []
+        for proposal in proposals:
+            summary = proposal_summaries.get(proposal.proposal_id, {})
+            replay_sample_count = int(summary.get("sample_count", 0))
+            accepted_count = int(summary.get("accepted_count", 0))
+            mean_score = float(summary.get("mean_score", proposal.simulation_score))
+            pass_rate = float(summary.get("pass_rate", 0.0))
+            contradiction_risk = float(summary.get("contradiction_risk", 1.0))
+            activation_eligible = bool(summary.get("activation_eligible", False))
+            validation_ready = bool(summary.get("validation_ready", False))
+            records.append(
+                OptimizerProposalRecord(
+                    cycle_id=cycle_id,
+                    proposal_id=proposal.proposal_id,
+                    proposal=proposal,
+                    lifecycle_stage=OptimizerLifecycleStage.PROPOSED,
+                    source_task_ids=source_task_ids,
+                    replay_sample_count=replay_sample_count,
+                    accepted_simulation_count=0,
+                    mean_simulation_score=proposal.simulation_score,
+                    pass_rate=0.0,
+                    contradiction_risk=1.0,
+                    activation_eligible=False,
+                )
+            )
+            records.append(
+                OptimizerProposalRecord(
+                    cycle_id=cycle_id,
+                    proposal_id=proposal.proposal_id,
+                    proposal=proposal,
+                    lifecycle_stage=OptimizerLifecycleStage.SIMULATED,
+                    source_task_ids=source_task_ids,
+                    replay_sample_count=replay_sample_count,
+                    accepted_simulation_count=accepted_count,
+                    mean_simulation_score=mean_score,
+                    pass_rate=pass_rate,
+                    contradiction_risk=contradiction_risk,
+                    activation_eligible=False,
+                )
+            )
+            records.append(
+                OptimizerProposalRecord(
+                    cycle_id=cycle_id,
+                    proposal_id=proposal.proposal_id,
+                    proposal=proposal,
+                    lifecycle_stage=(
+                        OptimizerLifecycleStage.VALIDATED
+                        if validation_ready
+                        else OptimizerLifecycleStage.REJECTED
+                    ),
+                    source_task_ids=source_task_ids,
+                    replay_sample_count=replay_sample_count,
+                    accepted_simulation_count=accepted_count,
+                    mean_simulation_score=mean_score,
+                    pass_rate=pass_rate,
+                    contradiction_risk=contradiction_risk,
+                    activation_eligible=activation_eligible,
+                )
+            )
+        return tuple(records)
+
+    async def _build_activation_and_rollback_records(
+        self,
+        *,
+        cycle_id: str,
+        proposals: tuple[MacroProposal, ...],
+        proposal_summaries: dict[str, dict[str, float | int | tuple[str, ...] | bool]],
+    ) -> tuple[tuple[OptimizerActivationRecord, ...], tuple[OptimizerRollbackRecord, ...]]:
+        active_macros = await self.storage.list_macros(active_only=True)
+        active_macro_versions = {
+            macro.macro_name: macro.version
+            for macro in active_macros
+        }
+        activation_records: list[OptimizerActivationRecord] = []
+        rollback_records: list[OptimizerRollbackRecord] = []
+        for proposal in proposals:
+            summary = proposal_summaries.get(proposal.proposal_id, {})
+            decision, lifecycle_stage, reason = self._evaluate_activation_outcome(
+                proposal=proposal,
+                summary=summary,
+            )
+            rollback_record_id = ""
+            activation_eligible = bool(summary.get("activation_eligible", False))
+            if activation_eligible:
+                rollback_record_id = f"rollback:{stable_hash(f'{cycle_id}:{proposal.proposal_id}')[:16]}"
+                rollback_records.append(
+                    OptimizerRollbackRecord(
+                        rollback_record_id=rollback_record_id,
+                        cycle_id=cycle_id,
+                        proposal_id=proposal.proposal_id,
+                        proposal_macro_name=proposal.macro.macro_name,
+                        active_macro_versions=active_macro_versions,
+                        reason=(
+                            "Prepared snapshot before future activation attempt."
+                            if decision != OptimizerActivationDecision.REJECTED
+                            else "Prepared snapshot for auditable rejection path."
+                        ),
+                        applied=False,
+                    )
+                )
+            activation_records.append(
+                OptimizerActivationRecord(
+                    cycle_id=cycle_id,
+                    proposal_id=proposal.proposal_id,
+                    decision=decision,
+                    lifecycle_stage=lifecycle_stage,
+                    reason=reason,
+                    validation_passed=bool(summary.get("validation_ready", False)),
+                    mean_simulation_score=float(summary.get("mean_score", proposal.simulation_score)),
+                    pass_rate=float(summary.get("pass_rate", 0.0)),
+                    contradiction_risk=float(summary.get("contradiction_risk", 1.0)),
+                    activation_applied=False,
+                    rollback_record_id=rollback_record_id,
+                )
+            )
+        return tuple(activation_records), tuple(rollback_records)
+
+    def _evaluate_activation_outcome(
+        self,
+        *,
+        proposal: MacroProposal,
+        summary: dict[str, float | int | tuple[str, ...] | bool],
+    ) -> tuple[OptimizerActivationDecision, OptimizerLifecycleStage, str]:
+        sample_count = int(summary.get("sample_count", 0))
+        validation_ready = bool(summary.get("validation_ready", False))
+        activation_eligible = bool(summary.get("activation_eligible", False))
+        rejection_reasons = tuple(str(item) for item in summary.get("rejection_reasons", ()))
+        if sample_count == 0:
+            return (
+                OptimizerActivationDecision.DEFERRED,
+                OptimizerLifecycleStage.SIMULATED,
+                "replay_samples_unavailable",
+            )
+        if not validation_ready:
+            reason = "proposal_validation_failed" if not proposal.validation_passed else "simulation_gate_failed"
+            return (
+                OptimizerActivationDecision.REJECTED,
+                OptimizerLifecycleStage.REJECTED,
+                reason,
+            )
+        if not activation_eligible:
+            return (
+                OptimizerActivationDecision.REJECTED,
+                OptimizerLifecycleStage.REJECTED,
+                ",".join(rejection_reasons) or "contradiction_risk_too_high",
+            )
+        return (
+            OptimizerActivationDecision.BLOCKED,
+            OptimizerLifecycleStage.ACTIVATION_BLOCKED,
+            "proposal_only_policy",
+        )
+
+    def _estimate_contradiction_risk(
+        self,
+        *,
+        proposal: MacroProposal,
+        pass_rate: float,
+        rejection_reasons: tuple[str, ...],
+    ) -> float:
+        risk = 1.0 - max(0.0, min(1.0, pass_rate))
+        if not proposal.validation_passed:
+            risk += 0.2
+        if any("proof_hash" in reason for reason in rejection_reasons):
+            risk += 0.2
+        if any("invalid" in reason for reason in rejection_reasons):
+            risk += 0.15
+        if any("memory" in reason or "latency" in reason for reason in rejection_reasons):
+            risk += 0.05
+        return self._clamp_score(risk)
 
     def _build_trace_driven_proposals(
         self,

@@ -260,22 +260,22 @@ Roadmap Adjustment Note (Current Priority Order)
 8. Phase 8 - Implement the Background Self-Optimizer
 - [x] 8.0.1 Before coding Phase 8, keep the optimizer read-only with respect to live runtime state until replay/simulation infrastructure is in place.
 - [x] 8.0.2 Before coding Phase 8, lock the evaluation metrics for “better” proposals: compression gain, proof-hash stability, critic validity, latency, and memory cost.
-- [ ] 8.0.3 Before coding Phase 8, define proposal persistence and rollback records first so every activation decision is auditable.
+- [x] 8.0.3 Before coding Phase 8, define proposal persistence and rollback records first so every activation decision is auditable.
 - [x] 8.0.4 Before coding Phase 8, cap history windows and replay scope so the optimizer does not become the largest memory consumer in the system.
 - [x] 8.0.5 Until `8.5` to `8.9` exist, keep the optimizer disabled by default or clearly proposal-only in stub/dev mode; do not treat placeholder cycles as live optimization.
-- [ ] 8.0.6 Before coding Phase 8, treat any future model improvement as distillation from verified system traces first; do not plan training-from-scratch as the default path.
-- [ ] 8.1 Implement `SelfOptimizer` as a background async service that never blocks the foreground task pipeline.
+- [x] 8.0.6 Before coding Phase 8, treat any future model improvement as distillation from verified system traces first; do not plan training-from-scratch as the default path.
+- [x] 8.1 Implement `SelfOptimizer` as a background async service that never blocks the foreground task pipeline.
 - [x] 8.2 Read reasoning logs, macro usage, critique results, and performance metrics on a schedule.
 - [x] 8.2.1 Persist candidate-trace sets, verifier scores, agreement scores, tool outputs, and final adjudication so replay and analysis can learn from `deep` mode runs.
-- [ ] 8.3 Generate only proposals, never direct live changes.
-- [ ] 8.4 Enforce the lifecycle `propose -> simulate -> validate -> activate`.
+- [x] 8.3 Generate only proposals, never direct live changes.
+- [x] 8.4 Enforce the lifecycle `propose -> simulate -> validate -> activate`.
 - [x] 8.5 Build a small simulation harness that reruns sample tasks using candidate macro changes and compares success and efficiency metrics.
-- [ ] 8.5.1 Export only verified `deep`-mode traces as datasets for future SFT or process-supervision training; never distill unverified free-form chain-of-thought.
-- [ ] 8.6 Activate a proposal only if it passes validation and improves results without increasing contradiction risk.
-- [ ] 8.7 Keep the currently active macro set immutable during a foreground task run.
+- [x] 8.5.1 Export only verified `deep`-mode traces as datasets for future SFT or process-supervision training; never distill unverified free-form chain-of-thought.
+- [x] 8.6 Activate a proposal only if it passes validation and improves results without increasing contradiction risk.
+- [x] 8.7 Keep the currently active macro set immutable during a foreground task run.
 - [x] 8.8 Replace the current placeholder optimizer cycle with real proposal generation based on persisted reasoning, critique, and performance data.
-- [ ] 8.8.1 If small-model training is pursued later, begin with distilling verified `deep`-mode behavior into the existing lightweight policy model before considering architecture research or larger local models.
-- [ ] 8.9 Track activation decisions and failed simulations so regressions are visible and rollback is explicit.
+- [x] 8.8.1 If small-model training is pursued later, begin with distilling verified `deep`-mode behavior into the existing lightweight policy model before considering architecture research or larger local models.
+- [x] 8.9 Track activation decisions and failed simulations so regressions are visible and rollback is explicit.
 
 9. Phase 9 - Orchestrator and Event Flow
 - [ ] 9.0.0 Phase 9 sequencing note: the typed event/status contract and additive `TaskResult` fields should already exist from Phase 5; Phase 9 finishes orchestration behavior on top of those contracts.
@@ -408,7 +408,7 @@ Assumptions and Defaults
 - [x] Default web behavior: optional, adapter-based, timeout-protected
 - [x] Default event/status policy: typed `RuntimeEvent` plus typed `AgentStatus` persisted as machine-readable records
 - [x] Default seed-corpus policy: stub/demo fixtures remain clearly separable from user and runtime data
-- [ ] Default optimizer activation policy: proposal-only until replay, validation, activation logging, and rollback exist
+- [x] Default optimizer activation policy: proposal-only until replay, validation, activation logging, and rollback exist
 - [x] Default translation-registry policy: machine-readable runtime registry plus optional human-readable export; never use a giant plain-text file as the primary runtime source of truth
 - [ ] Default implementation rule: optimize memory and concurrency without removing logic or features
 

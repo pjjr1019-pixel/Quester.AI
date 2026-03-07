@@ -128,6 +128,7 @@ class Orchestrator:
     async def run_task(self, question: str, thinking_minutes: int) -> TaskResult:
         """Execute the foreground workflow from Planner to Compressor."""
         self._require_started()
+        await self.storage.enter_foreground_task()
         started_at = time.perf_counter()
         budget = BudgetPolicy.from_minutes(
             thinking_minutes,
@@ -150,233 +151,236 @@ class Orchestrator:
         plan = None
         task_id: str | None = None
         try:
-            plan = await self._run_component(
-                "planner",
-                task_id=None,
-                start_stage="pipeline.planner_started",
-                done_stage="pipeline.planner_done",
-                start_payload={"question": question},
-                run=lambda: self.planner.plan(question, budget),
-            )
-            task_id = plan.task_id
-            await self._emit_event("pipeline.planner_done", {"task_id": task_id})
-            await self._record_status(
-                "planner",
-                AgentState.IDLE,
-                task_id=task_id,
-                message="planning completed",
-            )
-
-            evidence = await self._run_component(
-                "researcher",
-                task_id=task_id,
-                start_stage="pipeline.researcher_started",
-                done_stage="pipeline.researcher_done",
-                start_payload={"task_id": task_id},
-                run=lambda: self.researcher.research(plan, budget),
-            )
-            await self._emit_event("pipeline.researcher_done", {"task_id": task_id})
-            await self._record_status(
-                "researcher",
-                AgentState.IDLE,
-                task_id=task_id,
-                message=self._research_status_message(evidence),
-                severity=self._research_status_severity(evidence),
-            )
-            reasoner_handoff = ResearchReasonerHandoff.from_inputs(
-                plan=plan,
-                evidence=evidence,
-                budget=budget,
-                reasoning_mode=self._select_reasoning_mode(budget),
-                final_text_policy=self.reasoner.service.final_text_policy,
-                implementation_mode=self.reasoner.service.implementation_mode,
-            )
-
-            reasoning = await self._run_component(
-                "reasoner",
-                task_id=task_id,
-                start_stage="pipeline.reasoner_started",
-                done_stage="pipeline.reasoner_done",
-                start_payload={
-                    "task_id": task_id,
-                    "output_contract": reasoner_handoff.output_contract,
-                    "reasoning_mode": reasoner_handoff.reasoning_mode,
-                    "final_text_policy": reasoner_handoff.final_text_policy,
-                },
-                run=lambda: self.reasoner.reason_from_handoff(reasoner_handoff),
-            )
-            await self._emit_event(
-                "pipeline.reasoner_done",
-                self._reasoning_event_payload(task_id=task_id, reasoning=reasoning),
-            )
-            await self._record_status(
-                "reasoner",
-                AgentState.IDLE,
-                task_id=task_id,
-                message="reasoning completed",
-            )
-            reasoning_log = ReasoningLog(
-                task_id=task_id,
-                compressed_chain=reasoning.tokens,
-                macros_used=reasoning.macros_used,
-            )
-            await self.storage.record_reasoning_trace(reasoning)
-            await self.storage.record_reasoning_log(reasoning_log)
-            critic_handoff = ReasonerCriticHandoff.from_inputs(
-                plan=plan,
-                evidence=evidence,
-                trace=reasoning,
-                budget=budget,
-                final_text_policy=self.critic.service.final_text_policy,
-                implementation_mode=self.critic.service.implementation_mode,
-            )
-
-            critique = await self._run_component(
-                "critic",
-                task_id=task_id,
-                start_stage="pipeline.critic_started",
-                done_stage="pipeline.critic_done",
-                start_payload={
-                    "task_id": task_id,
-                    "output_contract": critic_handoff.output_contract,
-                    "final_text_policy": critic_handoff.final_text_policy,
-                    "proof_hash": critic_handoff.proof_hash,
-                },
-                run=lambda: self.critic.review_from_handoff(critic_handoff),
-            )
-            await self._emit_event(
-                "pipeline.critic_done",
-                self._critique_event_payload(task_id=task_id, critique=critique),
-            )
-            await self._record_status(
-                "critic",
-                AgentState.IDLE if critique.is_valid else AgentState.ERROR,
-                task_id=task_id,
-                message="critique completed" if critique.is_valid else "critique reported issues",
-                severity=SeverityLevel.LOW if critique.is_valid else SeverityLevel.HIGH,
-            )
-            reasoning, critique, repair_history = await self._run_repair_loop(
-                task_id=task_id,
-                plan=plan,
-                evidence=evidence,
-                budget=budget,
-                reasoner_handoff=reasoner_handoff,
-                reasoning=reasoning,
-                critique=critique,
-            )
-            await self._record_status(
-                "critic",
-                self._critique_status_state(critique),
-                task_id=task_id,
-                message=self._critique_status_message(critique, repair_history=repair_history),
-                severity=self._critique_status_severity(critique),
-            )
-            recent_reasoning_logs = await self._load_recent_reasoning_logs(limit=6)
-
-            compression = await self._run_component(
-                "compressor",
-                task_id=task_id,
-                start_stage="pipeline.compressor_started",
-                done_stage="pipeline.compressor_done",
-                start_payload={"task_id": task_id},
-                run=lambda: self.compressor.propose(reasoning, logs=recent_reasoning_logs),
-            )
-            await self._emit_event("pipeline.compressor_done", {"task_id": task_id})
-            await self._record_status(
-                "compressor",
-                AgentState.IDLE,
-                task_id=task_id,
-                message="compression proposal generation completed",
-            )
-
-            warnings = self._build_warnings(evidence=evidence, critique=critique)
-            if repair_history:
-                warnings.extend(self._build_repair_warnings(repair_history))
-            metric = self._build_performance_metric(
-                task_id=task_id,
-                started_at=started_at,
-                budget=budget,
-            )
-            await self.storage.record_performance_metric(metric)
-
-            model_snapshot = self.model_manager.health_snapshot()
-            if model_snapshot.fallback_active:
+            try:
+                plan = await self._run_component(
+                    "planner",
+                    task_id=None,
+                    start_stage="pipeline.planner_started",
+                    done_stage="pipeline.planner_done",
+                    start_payload={"question": question},
+                    run=lambda: self.planner.plan(question, budget),
+                )
+                task_id = plan.task_id
+                await self._emit_event("pipeline.planner_done", {"task_id": task_id})
                 await self._record_status(
-                    "model_manager",
-                    AgentState.RUNNING,
+                    "planner",
+                    AgentState.IDLE,
                     task_id=task_id,
-                    message=model_snapshot.fallback_reason or "model fallback active",
-                    severity=SeverityLevel.MEDIUM,
+                    message="planning completed",
                 )
 
-            answer_text = self._build_answer_text(
-                evidence=evidence,
-                reasoning=reasoning,
-                critique=critique,
-            )
-            result = TaskResult(
-                task_id=task_id,
-                plan=plan,
-                evidence=evidence,
-                reasoning=reasoning,
-                critique=critique,
-                compression=tuple(compression),
-                answer_text=answer_text,
-                warnings=tuple(warnings),
-                metrics=(metric,),
-            )
-            await self.storage.record_task_result(result)
-            await self._emit_event(
-                "pipeline.completed",
-                self._completion_event_payload(
+                evidence = await self._run_component(
+                    "researcher",
                     task_id=task_id,
+                    start_stage="pipeline.researcher_started",
+                    done_stage="pipeline.researcher_done",
+                    start_payload={"task_id": task_id},
+                    run=lambda: self.researcher.research(plan, budget),
+                )
+                await self._emit_event("pipeline.researcher_done", {"task_id": task_id})
+                await self._record_status(
+                    "researcher",
+                    AgentState.IDLE,
+                    task_id=task_id,
+                    message=self._research_status_message(evidence),
+                    severity=self._research_status_severity(evidence),
+                )
+                reasoner_handoff = ResearchReasonerHandoff.from_inputs(
+                    plan=plan,
+                    evidence=evidence,
+                    budget=budget,
+                    reasoning_mode=self._select_reasoning_mode(budget),
+                    final_text_policy=self.reasoner.service.final_text_policy,
+                    implementation_mode=self.reasoner.service.implementation_mode,
+                )
+
+                reasoning = await self._run_component(
+                    "reasoner",
+                    task_id=task_id,
+                    start_stage="pipeline.reasoner_started",
+                    done_stage="pipeline.reasoner_done",
+                    start_payload={
+                        "task_id": task_id,
+                        "output_contract": reasoner_handoff.output_contract,
+                        "reasoning_mode": reasoner_handoff.reasoning_mode,
+                        "final_text_policy": reasoner_handoff.final_text_policy,
+                    },
+                    run=lambda: self.reasoner.reason_from_handoff(reasoner_handoff),
+                )
+                await self._emit_event(
+                    "pipeline.reasoner_done",
+                    self._reasoning_event_payload(task_id=task_id, reasoning=reasoning),
+                )
+                await self._record_status(
+                    "reasoner",
+                    AgentState.IDLE,
+                    task_id=task_id,
+                    message="reasoning completed",
+                )
+                reasoning_log = ReasoningLog(
+                    task_id=task_id,
+                    compressed_chain=reasoning.tokens,
+                    macros_used=reasoning.macros_used,
+                )
+                await self.storage.record_reasoning_trace(reasoning)
+                await self.storage.record_reasoning_log(reasoning_log)
+                critic_handoff = ReasonerCriticHandoff.from_inputs(
+                    plan=plan,
+                    evidence=evidence,
+                    trace=reasoning,
+                    budget=budget,
+                    final_text_policy=self.critic.service.final_text_policy,
+                    implementation_mode=self.critic.service.implementation_mode,
+                )
+
+                critique = await self._run_component(
+                    "critic",
+                    task_id=task_id,
+                    start_stage="pipeline.critic_started",
+                    done_stage="pipeline.critic_done",
+                    start_payload={
+                        "task_id": task_id,
+                        "output_contract": critic_handoff.output_contract,
+                        "final_text_policy": critic_handoff.final_text_policy,
+                        "proof_hash": critic_handoff.proof_hash,
+                    },
+                    run=lambda: self.critic.review_from_handoff(critic_handoff),
+                )
+                await self._emit_event(
+                    "pipeline.critic_done",
+                    self._critique_event_payload(task_id=task_id, critique=critique),
+                )
+                await self._record_status(
+                    "critic",
+                    AgentState.IDLE if critique.is_valid else AgentState.ERROR,
+                    task_id=task_id,
+                    message="critique completed" if critique.is_valid else "critique reported issues",
+                    severity=SeverityLevel.LOW if critique.is_valid else SeverityLevel.HIGH,
+                )
+                reasoning, critique, repair_history = await self._run_repair_loop(
+                    task_id=task_id,
+                    plan=plan,
+                    evidence=evidence,
+                    budget=budget,
+                    reasoner_handoff=reasoner_handoff,
+                    reasoning=reasoning,
+                    critique=critique,
+                )
+                await self._record_status(
+                    "critic",
+                    self._critique_status_state(critique),
+                    task_id=task_id,
+                    message=self._critique_status_message(critique, repair_history=repair_history),
+                    severity=self._critique_status_severity(critique),
+                )
+                recent_reasoning_logs = await self._load_recent_reasoning_logs(limit=6)
+
+                compression = await self._run_component(
+                    "compressor",
+                    task_id=task_id,
+                    start_stage="pipeline.compressor_started",
+                    done_stage="pipeline.compressor_done",
+                    start_payload={"task_id": task_id},
+                    run=lambda: self.compressor.propose(reasoning, logs=recent_reasoning_logs),
+                )
+                await self._emit_event("pipeline.compressor_done", {"task_id": task_id})
+                await self._record_status(
+                    "compressor",
+                    AgentState.IDLE,
+                    task_id=task_id,
+                    message="compression proposal generation completed",
+                )
+
+                warnings = self._build_warnings(evidence=evidence, critique=critique)
+                if repair_history:
+                    warnings.extend(self._build_repair_warnings(repair_history))
+                metric = self._build_performance_metric(
+                    task_id=task_id,
+                    started_at=started_at,
+                    budget=budget,
+                )
+                await self.storage.record_performance_metric(metric)
+
+                model_snapshot = self.model_manager.health_snapshot()
+                if model_snapshot.fallback_active:
+                    await self._record_status(
+                        "model_manager",
+                        AgentState.RUNNING,
+                        task_id=task_id,
+                        message=model_snapshot.fallback_reason or "model fallback active",
+                        severity=SeverityLevel.MEDIUM,
+                    )
+
+                answer_text = self._build_answer_text(
                     evidence=evidence,
                     reasoning=reasoning,
                     critique=critique,
+                )
+                result = TaskResult(
+                    task_id=task_id,
+                    plan=plan,
+                    evidence=evidence,
+                    reasoning=reasoning,
+                    critique=critique,
+                    compression=tuple(compression),
                     answer_text=answer_text,
-                    warning_count=len(result.warnings),
-                ),
-            )
-            await self._record_status(
-                "orchestrator",
-                AgentState.IDLE,
-                task_id=task_id,
-                message="pipeline completed",
-            )
-            return result
-        except asyncio.CancelledError:
-            await self._emit_event(
-                "pipeline.cancelled",
-                {
-                    "task_id": task_id,
-                    "question": question,
-                },
-            )
-            await self._record_status(
-                "orchestrator",
-                AgentState.ERROR,
-                task_id=task_id,
-                message="pipeline cancelled",
-                severity=SeverityLevel.MEDIUM,
-            )
-            raise
-        except Exception as exc:
-            await self._emit_event(
-                "pipeline.failed",
-                {
-                    "task_id": task_id,
-                    "question": question,
-                    "error": str(exc),
-                },
-            )
-            await self._record_status(
-                "orchestrator",
-                AgentState.ERROR,
-                task_id=task_id,
-                message=str(exc),
-                severity=SeverityLevel.CRITICAL,
-            )
-            raise
+                    warnings=tuple(warnings),
+                    metrics=(metric,),
+                )
+                await self.storage.record_task_result(result)
+                await self._emit_event(
+                    "pipeline.completed",
+                    self._completion_event_payload(
+                        task_id=task_id,
+                        evidence=evidence,
+                        reasoning=reasoning,
+                        critique=critique,
+                        answer_text=answer_text,
+                        warning_count=len(result.warnings),
+                    ),
+                )
+                await self._record_status(
+                    "orchestrator",
+                    AgentState.IDLE,
+                    task_id=task_id,
+                    message="pipeline completed",
+                )
+                return result
+            except asyncio.CancelledError:
+                await self._emit_event(
+                    "pipeline.cancelled",
+                    {
+                        "task_id": task_id,
+                        "question": question,
+                    },
+                )
+                await self._record_status(
+                    "orchestrator",
+                    AgentState.ERROR,
+                    task_id=task_id,
+                    message="pipeline cancelled",
+                    severity=SeverityLevel.MEDIUM,
+                )
+                raise
+            except Exception as exc:
+                await self._emit_event(
+                    "pipeline.failed",
+                    {
+                        "task_id": task_id,
+                        "question": question,
+                        "error": str(exc),
+                    },
+                )
+                await self._record_status(
+                    "orchestrator",
+                    AgentState.ERROR,
+                    task_id=task_id,
+                    message=str(exc),
+                    severity=SeverityLevel.CRITICAL,
+                )
+                raise
+        finally:
+            await self.storage.exit_foreground_task()
 
     async def run_pipeline(self, question: str) -> TaskResult:
         """Compatibility wrapper that uses the smallest valid budget."""

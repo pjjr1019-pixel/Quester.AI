@@ -6,8 +6,8 @@ Last updated: March 7, 2026
 
 - Phases 0.5, 1, 2, 3, and 4 are complete.
 - The compatibility contract is mostly enforced and covered by tests.
-- Phase 5 is functionally complete except for deferred `sqlite-vec` follow-up, Phase 6 is complete, and Phase 7 is functionally complete in stub mode.
-- Phase 8 preparation is now in place: replay-grade optimizer persistence, a locked offline metric contract, and a bounded replay evaluation harness exist, while live activation and rollback remain deferred.
+- Phase 5 is functionally complete except for deferred `sqlite-vec` follow-up, Phase 6 is complete, Phase 7 is functionally complete in stub mode, and Phase 8 is functionally complete in proposal-only mode.
+- The optimizer now records proposal lifecycle, activation decisions, rollback snapshots, and verified `deep`-trace exports while keeping live runtime activation blocked by policy.
 
 ## Completed in the current checkpoint
 
@@ -117,6 +117,12 @@ Last updated: March 7, 2026
   - `config.py` now locks the replay history cap, proposal limit, weighted metric contract, and latency/memory gates for offline optimizer scoring.
   - `self_optimizer.py` now evaluates validated macro proposals against bounded persisted replay samples and traces, records those evaluations, and keeps every proposal proposal-only.
   - `tests/test_phase5_persistence.py`, `tests/test_phase7_boundaries.py`, and `tests/test_phase2_contracts.py` now cover replay-sample persistence, replay-evaluation persistence, and metric-contract validation.
+- Closed the remaining Phase 8 lifecycle and export tranche:
+  - `data_structures.py` now defines typed optimizer proposal, activation, rollback, and verified-`deep`-trace export records.
+  - `storage.py` now persists append-only proposal lifecycle records, activation decisions, rollback snapshots, and can export only verified `deep`-mode traces as machine-readable dataset rows.
+  - `orchestrator.py` now marks foreground task entry/exit explicitly so future optimizer activation work cannot mutate the active macro set during a live user run.
+  - `self_optimizer.py` now emits a recorded `propose -> simulate -> validate -> activate` lifecycle, logs blocked or rejected activation decisions, prepares rollback snapshots for eligible proposals, defers cycles while foreground work is active, and keeps live activation policy-blocked by default.
+  - `tests/test_phase5_persistence.py` and `tests/test_phase7_boundaries.py` now cover lifecycle persistence, verified-trace export, and foreground-safe optimizer deferral.
 
 ## Phase 5 items completed
 
@@ -158,8 +164,8 @@ Last updated: March 7, 2026
 
 ## Verified state
 
-- Full test suite passes: `python -m pytest -q -ra`
-- Current passing count: `103 passed`
+- Full test suite passes: `python -m pytest -q --cache-clear`
+- Current passing count: `105 passed`
 
 ## Main gaps remaining
 
@@ -167,7 +173,7 @@ Last updated: March 7, 2026
 
 ## Recommended next steps
 
-1. Continue Phase `8` with activation audit trails and explicit rollback records before any live macro activation logic is considered.
-2. Expand the dashboard from the current event console into a richer operator view over verifier type, candidate score, repair actions, degraded reasons, replay scores, and citations.
+1. Expand the dashboard from the current event console into a richer operator view over verifier type, candidate score, repair actions, degraded reasons, replay scores, activation decisions, rollback snapshots, and citations.
+2. Keep live optimizer activation policy-gated and off by default until there is a concrete operator workflow for approval, rollback, and post-activation monitoring.
 3. Keep `5.0.6` deferred infrastructure, not the next coding target.
 4. Keep the real web provider policy unchanged: do not broaden beyond MediaWiki until the persisted evidence/provenance path has seen more use.

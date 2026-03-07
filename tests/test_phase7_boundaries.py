@@ -28,6 +28,8 @@ from data_structures import (
     EvidenceBundle,
     EvidenceItem,
     OpcodeEntry,
+    OptimizerActivationDecision,
+    OptimizerLifecycleStage,
     PerformanceMetric,
     Plan,
     PlanStep,
@@ -1314,10 +1316,15 @@ class SelfOptimizerCycleTests(unittest.IsolatedAsyncioTestCase):
         proposals = await optimizer.run_cycle()
         replay_samples = await self.orchestrator.storage.list_optimizer_replay_samples()
         replay_evaluations = await self.orchestrator.storage.list_optimizer_replay_evaluations()
+        proposal_records = await self.orchestrator.storage.list_optimizer_proposal_records()
+        activation_records = await self.orchestrator.storage.list_optimizer_activation_records()
+        rollback_records = await self.orchestrator.storage.list_optimizer_rollback_records()
 
         self.assertTrue(proposals)
         self.assertTrue(replay_samples)
         self.assertTrue(replay_evaluations)
+        self.assertTrue(proposal_records)
+        self.assertTrue(activation_records)
         self.assertTrue(all(not proposal.approved for proposal in proposals))
         self.assertTrue(all(proposal.reason for proposal in proposals))
         self.assertTrue(all(0.0 <= proposal.simulation_score <= 1.0 for proposal in proposals))
@@ -1329,3 +1336,51 @@ class SelfOptimizerCycleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertTrue(all(0.0 <= evaluation.aggregate_score <= 1.0 for evaluation in replay_evaluations))
+        self.assertTrue(
+            {record.lifecycle_stage for record in proposal_records}.issuperset(
+                {OptimizerLifecycleStage.PROPOSED, OptimizerLifecycleStage.SIMULATED}
+            )
+        )
+        self.assertTrue(
+            all(
+                record.decision
+                in {
+                    OptimizerActivationDecision.BLOCKED,
+                    OptimizerActivationDecision.REJECTED,
+                    OptimizerActivationDecision.DEFERRED,
+                }
+                for record in activation_records
+            )
+        )
+        blocked_records = tuple(
+            record for record in activation_records if record.decision == OptimizerActivationDecision.BLOCKED
+        )
+        self.assertEqual(
+            {record.proposal_id for record in activation_records},
+            {proposal.proposal_id for proposal in proposals},
+        )
+        if blocked_records:
+            self.assertEqual(
+                {record.rollback_record_id for record in blocked_records},
+                {record.rollback_record_id for record in rollback_records},
+            )
+
+    async def test_optimizer_defers_cycles_during_foreground_work_and_exports_only_verified_deep_traces(self) -> None:
+        await self.orchestrator.run_task("What is 2 + 2?", thinking_minutes=30)
+        await self.orchestrator.run_task("What is 2 + 2?", thinking_minutes=1)
+        optimizer = SelfOptimizer(storage=self.orchestrator.storage, config=self.config)
+
+        await self.orchestrator.storage.enter_foreground_task()
+        try:
+            proposals = await optimizer.run_cycle()
+        finally:
+            await self.orchestrator.storage.exit_foreground_task()
+        export_path = self.test_logs / "optimizer_verified_deep_exports.jsonl"
+        exports = await optimizer.export_verified_deep_traces(export_path=export_path)
+        deferred_events = await self.orchestrator.storage.list_runtime_events(stage="self_optimizer.cycle_deferred")
+
+        self.assertEqual(proposals, [])
+        self.assertTrue(deferred_events)
+        self.assertTrue(exports)
+        self.assertTrue(all(export.reasoning.context_frames[0].metadata.get("rm") == "deep" for export in exports))
+        self.assertTrue(export_path.exists())

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Mapping, TypeVar
+from typing import Any, Mapping, Sequence, TypeVar
 
 
 def utc_now() -> datetime:
@@ -119,6 +119,29 @@ class CritiqueResult(str, Enum):
     VALID = "valid"
     INVALID = "invalid"
     DEGRADED = "degraded"
+
+
+class OptimizerLifecycleStage(str, Enum):
+    """Lifecycle stage for one optimizer proposal."""
+
+    PROPOSED = "proposed"
+    SIMULATED = "simulated"
+    VALIDATED = "validated"
+    ACTIVATION_BLOCKED = "activation_blocked"
+    ACTIVATED = "activated"
+    REJECTED = "rejected"
+    ROLLBACK_PREPARED = "rollback_prepared"
+    ROLLED_BACK = "rolled_back"
+
+
+class OptimizerActivationDecision(str, Enum):
+    """Activation decision emitted after replay and validation."""
+
+    BLOCKED = "blocked"
+    REJECTED = "rejected"
+    DEFERRED = "deferred"
+    ACTIVATED = "activated"
+    ROLLED_BACK = "rolled_back"
 
 
 @dataclass(slots=True, frozen=True)
@@ -568,6 +591,190 @@ class OptimizerReplayEvaluation(DictSerializable):
             aggregate_score=float(data.get("aggregate_score", 0.0)),
             accepted=bool(data.get("accepted", False)),
             rejection_reason=str(data.get("rejection_reason", "")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class OptimizerProposalRecord(DictSerializable):
+    """Persisted lifecycle summary for one optimizer proposal inside a cycle."""
+
+    cycle_id: str
+    proposal_id: str
+    proposal: MacroProposal
+    lifecycle_stage: OptimizerLifecycleStage = OptimizerLifecycleStage.PROPOSED
+    source_task_ids: tuple[str, ...] = ()
+    replay_sample_count: int = 0
+    accepted_simulation_count: int = 0
+    mean_simulation_score: float = 0.0
+    pass_rate: float = 0.0
+    contradiction_risk: float = 1.0
+    activation_eligible: bool = False
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.cycle_id.strip()), "OptimizerProposalRecord.cycle_id must not be empty.")
+        _require(bool(self.proposal_id.strip()), "OptimizerProposalRecord.proposal_id must not be empty.")
+        _require(self.replay_sample_count >= 0, "OptimizerProposalRecord.replay_sample_count must be >= 0.")
+        _require(
+            self.accepted_simulation_count >= 0,
+            "OptimizerProposalRecord.accepted_simulation_count must be >= 0.",
+        )
+        _require(
+            0.0 <= self.mean_simulation_score <= 1.0,
+            "OptimizerProposalRecord.mean_simulation_score must be between 0 and 1.",
+        )
+        _require(0.0 <= self.pass_rate <= 1.0, "OptimizerProposalRecord.pass_rate must be between 0 and 1.")
+        _require(
+            0.0 <= self.contradiction_risk <= 1.0,
+            "OptimizerProposalRecord.contradiction_risk must be between 0 and 1.",
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OptimizerProposalRecord:
+        return cls(
+            cycle_id=str(data["cycle_id"]),
+            proposal_id=str(data["proposal_id"]),
+            proposal=MacroProposal.from_dict(data["proposal"]),
+            lifecycle_stage=_parse_enum(
+                OptimizerLifecycleStage,
+                data.get("lifecycle_stage", OptimizerLifecycleStage.PROPOSED),
+            ),
+            source_task_ids=tuple(str(item) for item in data.get("source_task_ids", [])),
+            replay_sample_count=int(data.get("replay_sample_count", 0)),
+            accepted_simulation_count=int(data.get("accepted_simulation_count", 0)),
+            mean_simulation_score=float(data.get("mean_simulation_score", 0.0)),
+            pass_rate=float(data.get("pass_rate", 0.0)),
+            contradiction_risk=float(data.get("contradiction_risk", 1.0)),
+            activation_eligible=bool(data.get("activation_eligible", False)),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class OptimizerActivationRecord(DictSerializable):
+    """Activation decision record for one proposal after replay and validation."""
+
+    cycle_id: str
+    proposal_id: str
+    decision: OptimizerActivationDecision
+    lifecycle_stage: OptimizerLifecycleStage
+    reason: str = ""
+    validation_passed: bool = False
+    mean_simulation_score: float = 0.0
+    pass_rate: float = 0.0
+    contradiction_risk: float = 1.0
+    activation_applied: bool = False
+    rollback_record_id: str = ""
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.cycle_id.strip()), "OptimizerActivationRecord.cycle_id must not be empty.")
+        _require(bool(self.proposal_id.strip()), "OptimizerActivationRecord.proposal_id must not be empty.")
+        _require(
+            0.0 <= self.mean_simulation_score <= 1.0,
+            "OptimizerActivationRecord.mean_simulation_score must be between 0 and 1.",
+        )
+        _require(0.0 <= self.pass_rate <= 1.0, "OptimizerActivationRecord.pass_rate must be between 0 and 1.")
+        _require(
+            0.0 <= self.contradiction_risk <= 1.0,
+            "OptimizerActivationRecord.contradiction_risk must be between 0 and 1.",
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OptimizerActivationRecord:
+        return cls(
+            cycle_id=str(data["cycle_id"]),
+            proposal_id=str(data["proposal_id"]),
+            decision=_parse_enum(
+                OptimizerActivationDecision,
+                data.get("decision", OptimizerActivationDecision.BLOCKED),
+            ),
+            lifecycle_stage=_parse_enum(
+                OptimizerLifecycleStage,
+                data.get("lifecycle_stage", OptimizerLifecycleStage.ACTIVATION_BLOCKED),
+            ),
+            reason=str(data.get("reason", "")),
+            validation_passed=bool(data.get("validation_passed", False)),
+            mean_simulation_score=float(data.get("mean_simulation_score", 0.0)),
+            pass_rate=float(data.get("pass_rate", 0.0)),
+            contradiction_risk=float(data.get("contradiction_risk", 1.0)),
+            activation_applied=bool(data.get("activation_applied", False)),
+            rollback_record_id=str(data.get("rollback_record_id", "")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class OptimizerRollbackRecord(DictSerializable):
+    """Prepared or applied rollback snapshot for an optimizer proposal."""
+
+    rollback_record_id: str
+    cycle_id: str
+    proposal_id: str
+    proposal_macro_name: str
+    active_macro_versions: dict[str, int] = field(default_factory=dict)
+    reason: str = ""
+    applied: bool = False
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.rollback_record_id.strip()), "OptimizerRollbackRecord.rollback_record_id must not be empty.")
+        _require(bool(self.cycle_id.strip()), "OptimizerRollbackRecord.cycle_id must not be empty.")
+        _require(bool(self.proposal_id.strip()), "OptimizerRollbackRecord.proposal_id must not be empty.")
+        _require(
+            bool(self.proposal_macro_name.strip()),
+            "OptimizerRollbackRecord.proposal_macro_name must not be empty.",
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OptimizerRollbackRecord:
+        return cls(
+            rollback_record_id=str(data["rollback_record_id"]),
+            cycle_id=str(data["cycle_id"]),
+            proposal_id=str(data["proposal_id"]),
+            proposal_macro_name=str(data["proposal_macro_name"]),
+            active_macro_versions={
+                str(key): int(value)
+                for key, value in dict(data.get("active_macro_versions", {})).items()
+            },
+            reason=str(data.get("reason", "")),
+            applied=bool(data.get("applied", False)),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class VerifiedDeepTraceExport(DictSerializable):
+    """Machine-readable dataset row for one verified deep-mode task result."""
+
+    export_id: str
+    task_id: str
+    question: str
+    answer_text: str
+    trace_proof_hash: str
+    reasoning: CompressedTrace
+    critique: CritiqueReport
+    evidence_source_refs: tuple[str, ...] = ()
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.export_id.strip()), "VerifiedDeepTraceExport.export_id must not be empty.")
+        _require(bool(self.task_id.strip()), "VerifiedDeepTraceExport.task_id must not be empty.")
+        _require(bool(self.question.strip()), "VerifiedDeepTraceExport.question must not be empty.")
+        _require(bool(self.answer_text.strip()), "VerifiedDeepTraceExport.answer_text must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> VerifiedDeepTraceExport:
+        return cls(
+            export_id=str(data["export_id"]),
+            task_id=str(data["task_id"]),
+            question=str(data["question"]),
+            answer_text=str(data["answer_text"]),
+            trace_proof_hash=str(data.get("trace_proof_hash", "")),
+            reasoning=CompressedTrace.from_dict(data["reasoning"]),
+            critique=CritiqueReport.from_dict(data["critique"]),
+            evidence_source_refs=tuple(str(item) for item in data.get("evidence_source_refs", [])),
             created_at=_parse_datetime(data.get("created_at", utc_now())),
         )
 
@@ -2297,6 +2504,42 @@ def coerce_optimizer_replay_evaluation(
     if isinstance(value, OptimizerReplayEvaluation):
         return value
     return OptimizerReplayEvaluation.from_dict(value)
+
+
+def coerce_optimizer_proposal_record(
+    value: OptimizerProposalRecord | Mapping[str, Any],
+) -> OptimizerProposalRecord:
+    """Convert mapping payloads to OptimizerProposalRecord while preserving existing values."""
+    if isinstance(value, OptimizerProposalRecord):
+        return value
+    return OptimizerProposalRecord.from_dict(value)
+
+
+def coerce_optimizer_activation_record(
+    value: OptimizerActivationRecord | Mapping[str, Any],
+) -> OptimizerActivationRecord:
+    """Convert mapping payloads to OptimizerActivationRecord while preserving existing values."""
+    if isinstance(value, OptimizerActivationRecord):
+        return value
+    return OptimizerActivationRecord.from_dict(value)
+
+
+def coerce_optimizer_rollback_record(
+    value: OptimizerRollbackRecord | Mapping[str, Any],
+) -> OptimizerRollbackRecord:
+    """Convert mapping payloads to OptimizerRollbackRecord while preserving existing values."""
+    if isinstance(value, OptimizerRollbackRecord):
+        return value
+    return OptimizerRollbackRecord.from_dict(value)
+
+
+def coerce_verified_deep_trace_export(
+    value: VerifiedDeepTraceExport | Mapping[str, Any],
+) -> VerifiedDeepTraceExport:
+    """Convert mapping payloads to VerifiedDeepTraceExport while preserving existing values."""
+    if isinstance(value, VerifiedDeepTraceExport):
+        return value
+    return VerifiedDeepTraceExport.from_dict(value)
 
 
 def coerce_runtime_event(value: RuntimeEvent | Mapping[str, Any]) -> RuntimeEvent:

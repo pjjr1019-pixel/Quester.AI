@@ -15,28 +15,37 @@ from data_structures import (
     AgentStatus,
     CompressedTrace,
     CompressionRuntimeSubset,
+    CritiqueResult,
     DecoderEntry,
     Macro,
     OpcodeEntry,
+    OptimizerActivationRecord,
+    OptimizerProposalRecord,
     OptimizerReplayEvaluation,
     OptimizerReplaySample,
+    OptimizerRollbackRecord,
     PerformanceMetric,
     ProofHashRecord,
     ReasoningLog,
     RuntimeEvent,
     SymbolTableSnapshot,
     TaskResult,
+    VerifiedDeepTraceExport,
     WebEvidenceRecord,
     coerce_agent_status,
     coerce_compressed_trace,
     coerce_decoder_entry,
+    coerce_optimizer_activation_record,
+    coerce_optimizer_proposal_record,
     coerce_optimizer_replay_evaluation,
     coerce_optimizer_replay_sample,
+    coerce_optimizer_rollback_record,
     coerce_opcode_entry,
     coerce_proof_hash_record,
     coerce_runtime_event,
     coerce_symbol_table_snapshot,
     coerce_task_result,
+    coerce_verified_deep_trace_export,
     coerce_web_evidence_record,
 )
 from retrieval import (
@@ -231,6 +240,18 @@ class TaskRepository(_SQLiteRepository):
             cursor = conn.execute("SELECT COUNT(*) AS count FROM task_runs")
             row = cursor.fetchone()
         return int(row["count"])
+
+    def list(self, *, limit: int | None = None) -> tuple[TaskResult, ...]:
+        conn = self._conn()
+        query = "SELECT payload_json FROM task_runs ORDER BY updated_at, task_id"
+        values: tuple[Any, ...] = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            values = (limit,)
+        with self._lock:
+            cursor = conn.execute(query, values)
+            rows = cursor.fetchall()
+        return tuple(TaskResult.from_dict(_json_loads(row["payload_json"])) for row in rows)
 
 
 class AgentStatusRepository(_SQLiteRepository):
@@ -1645,6 +1666,272 @@ class OptimizerReplayEvaluationRepository(_SQLiteRepository):
         return tuple(OptimizerReplayEvaluation.from_dict(_json_loads(row["payload_json"])) for row in rows)
 
 
+class OptimizerProposalRecordRepository(_SQLiteRepository):
+    """Append-only lifecycle records for optimizer proposals."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optimizer_proposal_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id TEXT NOT NULL,
+                proposal_id TEXT NOT NULL,
+                lifecycle_stage TEXT NOT NULL,
+                activation_eligible INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_proposal_records_cycle "
+            "ON optimizer_proposal_records (cycle_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_proposal_records_proposal "
+            "ON optimizer_proposal_records (proposal_id);"
+        )
+        conn.commit()
+
+    def append_many(self, records: Sequence[OptimizerProposalRecord]) -> None:
+        if not records:
+            return
+        conn = self._conn()
+        with self._lock:
+            conn.executemany(
+                """
+                INSERT INTO optimizer_proposal_records (
+                    cycle_id,
+                    proposal_id,
+                    lifecycle_stage,
+                    activation_eligible,
+                    payload_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        record.cycle_id,
+                        record.proposal_id,
+                        record.lifecycle_stage.value,
+                        1 if record.activation_eligible else 0,
+                        _json_dumps(record.to_dict()),
+                        record.created_at.isoformat(),
+                    )
+                    for record in records
+                ],
+            )
+            conn.commit()
+
+    def list(
+        self,
+        *,
+        cycle_id: str | None = None,
+        proposal_id: str | None = None,
+    ) -> tuple[OptimizerProposalRecord, ...]:
+        conn = self._conn()
+        clauses: list[str] = []
+        values: list[str] = []
+        if cycle_id is not None:
+            clauses.append("cycle_id = ?")
+            values.append(cycle_id)
+        if proposal_id is not None:
+            clauses.append("proposal_id = ?")
+            values.append(proposal_id)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cursor = conn.execute(
+                f"""
+                SELECT payload_json
+                FROM optimizer_proposal_records
+                {where_clause}
+                ORDER BY id
+                """,
+                tuple(values),
+            )
+            rows = cursor.fetchall()
+        return tuple(OptimizerProposalRecord.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
+class OptimizerActivationRecordRepository(_SQLiteRepository):
+    """Append-only activation decisions for optimizer proposals."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optimizer_activation_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id TEXT NOT NULL,
+                proposal_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                lifecycle_stage TEXT NOT NULL,
+                activation_applied INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_activation_records_cycle "
+            "ON optimizer_activation_records (cycle_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_activation_records_proposal "
+            "ON optimizer_activation_records (proposal_id);"
+        )
+        conn.commit()
+
+    def append_many(self, records: Sequence[OptimizerActivationRecord]) -> None:
+        if not records:
+            return
+        conn = self._conn()
+        with self._lock:
+            conn.executemany(
+                """
+                INSERT INTO optimizer_activation_records (
+                    cycle_id,
+                    proposal_id,
+                    decision,
+                    lifecycle_stage,
+                    activation_applied,
+                    payload_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        record.cycle_id,
+                        record.proposal_id,
+                        record.decision.value,
+                        record.lifecycle_stage.value,
+                        1 if record.activation_applied else 0,
+                        _json_dumps(record.to_dict()),
+                        record.created_at.isoformat(),
+                    )
+                    for record in records
+                ],
+            )
+            conn.commit()
+
+    def list(
+        self,
+        *,
+        cycle_id: str | None = None,
+        proposal_id: str | None = None,
+    ) -> tuple[OptimizerActivationRecord, ...]:
+        conn = self._conn()
+        clauses: list[str] = []
+        values: list[str] = []
+        if cycle_id is not None:
+            clauses.append("cycle_id = ?")
+            values.append(cycle_id)
+        if proposal_id is not None:
+            clauses.append("proposal_id = ?")
+            values.append(proposal_id)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cursor = conn.execute(
+                f"""
+                SELECT payload_json
+                FROM optimizer_activation_records
+                {where_clause}
+                ORDER BY id
+                """,
+                tuple(values),
+            )
+            rows = cursor.fetchall()
+        return tuple(OptimizerActivationRecord.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
+class OptimizerRollbackRecordRepository(_SQLiteRepository):
+    """Rollback snapshots prepared before any future optimizer activation."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optimizer_rollback_records (
+                rollback_record_id TEXT PRIMARY KEY,
+                cycle_id TEXT NOT NULL,
+                proposal_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_rollback_records_cycle "
+            "ON optimizer_rollback_records (cycle_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_rollback_records_proposal "
+            "ON optimizer_rollback_records (proposal_id);"
+        )
+        conn.commit()
+
+    def append_many(self, records: Sequence[OptimizerRollbackRecord]) -> None:
+        if not records:
+            return
+        conn = self._conn()
+        with self._lock:
+            conn.executemany(
+                """
+                INSERT INTO optimizer_rollback_records (
+                    rollback_record_id,
+                    cycle_id,
+                    proposal_id,
+                    payload_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(rollback_record_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    created_at = excluded.created_at
+                """,
+                [
+                    (
+                        record.rollback_record_id,
+                        record.cycle_id,
+                        record.proposal_id,
+                        _json_dumps(record.to_dict()),
+                        record.created_at.isoformat(),
+                    )
+                    for record in records
+                ],
+            )
+            conn.commit()
+
+    def list(
+        self,
+        *,
+        cycle_id: str | None = None,
+        proposal_id: str | None = None,
+    ) -> tuple[OptimizerRollbackRecord, ...]:
+        conn = self._conn()
+        clauses: list[str] = []
+        values: list[str] = []
+        if cycle_id is not None:
+            clauses.append("cycle_id = ?")
+            values.append(cycle_id)
+        if proposal_id is not None:
+            clauses.append("proposal_id = ?")
+            values.append(proposal_id)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cursor = conn.execute(
+                f"""
+                SELECT payload_json
+                FROM optimizer_rollback_records
+                {where_clause}
+                ORDER BY created_at, rollback_record_id
+                """,
+                tuple(values),
+            )
+            rows = cursor.fetchall()
+        return tuple(OptimizerRollbackRecord.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
 class StorageManager:
     """Owns local persistence lifecycle and additively exposes specialized repositories."""
 
@@ -1661,6 +1948,7 @@ class StorageManager:
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.Lock()
         self._vector_index: VectorIndexAdapter | None = None
+        self._foreground_task_count = 0
 
         self.events = EventLogRepository(self)
         self.kv = KeyValueRepository(self)
@@ -1679,6 +1967,9 @@ class StorageManager:
         self.performance_history = PerformanceHistoryRepository(self)
         self.optimizer_replay_samples = OptimizerReplaySampleRepository(self)
         self.optimizer_replay_evaluations = OptimizerReplayEvaluationRepository(self)
+        self.optimizer_proposal_records = OptimizerProposalRecordRepository(self)
+        self.optimizer_activation_records = OptimizerActivationRecordRepository(self)
+        self.optimizer_rollback_records = OptimizerRollbackRecordRepository(self)
         self.retrieval = LocalRetrievalService(
             settings=self.config.retrieval,
             lexical_store=self.chunks,
@@ -1720,6 +2011,9 @@ class StorageManager:
             self.performance_history,
             self.optimizer_replay_samples,
             self.optimizer_replay_evaluations,
+            self.optimizer_proposal_records,
+            self.optimizer_activation_records,
+            self.optimizer_rollback_records,
         ):
             repository.create_tables()
 
@@ -1978,6 +2272,31 @@ class StorageManager:
         self._require_conn()
         return self.tasks.count()
 
+    async def list_task_results(self, *, limit: int | None = None) -> tuple[TaskResult, ...]:
+        """Return persisted task results ordered by update time."""
+        self._require_conn()
+        return self.tasks.list(limit=limit)
+
+    async def enter_foreground_task(self) -> int:
+        """Increment the foreground task counter used to freeze activation state."""
+        self._require_conn()
+        with self._lock:
+            self._foreground_task_count += 1
+            return self._foreground_task_count
+
+    async def exit_foreground_task(self) -> int:
+        """Decrement the foreground task counter without dropping below zero."""
+        self._require_conn()
+        with self._lock:
+            self._foreground_task_count = max(0, self._foreground_task_count - 1)
+            return self._foreground_task_count
+
+    async def get_foreground_task_count(self) -> int:
+        """Return the number of foreground tasks currently running."""
+        self._require_conn()
+        with self._lock:
+            return self._foreground_task_count
+
     def _build_optimizer_replay_sample(self, task_result: TaskResult) -> OptimizerReplaySample:
         """Derive one replay-grade optimizer sample from a completed task result."""
         reasoning = task_result.reasoning
@@ -2172,6 +2491,60 @@ class StorageManager:
         self._require_conn()
         return self.optimizer_replay_evaluations.list(proposal_id=proposal_id, task_id=task_id)
 
+    async def record_optimizer_proposal_records(
+        self,
+        records: Sequence[OptimizerProposalRecord | dict[str, Any]],
+    ) -> None:
+        """Persist append-only proposal lifecycle records."""
+        normalized = tuple(coerce_optimizer_proposal_record(item) for item in records)
+        self.optimizer_proposal_records.append_many(normalized)
+
+    async def list_optimizer_proposal_records(
+        self,
+        *,
+        cycle_id: str | None = None,
+        proposal_id: str | None = None,
+    ) -> tuple[OptimizerProposalRecord, ...]:
+        """Return persisted proposal lifecycle records in append order."""
+        self._require_conn()
+        return self.optimizer_proposal_records.list(cycle_id=cycle_id, proposal_id=proposal_id)
+
+    async def record_optimizer_activation_records(
+        self,
+        records: Sequence[OptimizerActivationRecord | dict[str, Any]],
+    ) -> None:
+        """Persist append-only activation decisions."""
+        normalized = tuple(coerce_optimizer_activation_record(item) for item in records)
+        self.optimizer_activation_records.append_many(normalized)
+
+    async def list_optimizer_activation_records(
+        self,
+        *,
+        cycle_id: str | None = None,
+        proposal_id: str | None = None,
+    ) -> tuple[OptimizerActivationRecord, ...]:
+        """Return persisted activation decisions in append order."""
+        self._require_conn()
+        return self.optimizer_activation_records.list(cycle_id=cycle_id, proposal_id=proposal_id)
+
+    async def record_optimizer_rollback_records(
+        self,
+        records: Sequence[OptimizerRollbackRecord | dict[str, Any]],
+    ) -> None:
+        """Persist rollback snapshots prepared for future live activation."""
+        normalized = tuple(coerce_optimizer_rollback_record(item) for item in records)
+        self.optimizer_rollback_records.append_many(normalized)
+
+    async def list_optimizer_rollback_records(
+        self,
+        *,
+        cycle_id: str | None = None,
+        proposal_id: str | None = None,
+    ) -> tuple[OptimizerRollbackRecord, ...]:
+        """Return persisted rollback records."""
+        self._require_conn()
+        return self.optimizer_rollback_records.list(cycle_id=cycle_id, proposal_id=proposal_id)
+
     async def register_macro(self, macro: Macro) -> None:
         """Persist a versioned macro definition."""
         self.macros.upsert(macro)
@@ -2291,6 +2664,65 @@ class StorageManager:
             decoders=self.decoders.list(decoder_names=decoder_names, active_only=True) if decoder_names else (),
             symbol_table=self.symbol_tables.get_latest(task_id, active_only=True),
             proof_hashes=self.proof_hashes.list(task_id=task_id),
+        )
+
+    async def export_verified_deep_traces(
+        self,
+        *,
+        export_path: Path | None = None,
+        limit: int | None = None,
+    ) -> tuple[VerifiedDeepTraceExport, ...]:
+        """Return and optionally persist only verified deep-mode traces."""
+        self._require_conn()
+        exports = tuple(
+            self._build_verified_deep_trace_export(result)
+            for result in self.tasks.list(limit=limit)
+            if self._is_verified_deep_task_result(result)
+        )
+        if export_path is not None:
+            ensure_directory(export_path.parent)
+            with export_path.open("w", encoding="utf-8") as handle:
+                for export_row in exports:
+                    handle.write(_json_dumps(coerce_verified_deep_trace_export(export_row).to_dict()) + "\n")
+        return exports
+
+    def _is_verified_deep_task_result(self, result: TaskResult) -> bool:
+        reasoning_mode = ""
+        if result.reasoning.context_frames:
+            reasoning_mode = str(result.reasoning.context_frames[0].metadata.get("rm", "")).strip()
+        return (
+            reasoning_mode == "deep"
+            and bool(result.reasoning.candidate_traces)
+            and result.critique.is_valid
+            and result.critique.result == CritiqueResult.VALID
+            and result.critique.proof_hash_match
+        )
+
+    def _build_verified_deep_trace_export(self, result: TaskResult) -> VerifiedDeepTraceExport:
+        evidence_items = {
+            item.id: item
+            for item in (result.evidence.local_results + result.evidence.web_results)
+        }
+        source_refs = tuple(
+            dict.fromkeys(
+                evidence_items[item_id].source_ref
+                for item_id in result.reasoning.evidence_handles
+                if item_id in evidence_items and evidence_items[item_id].source_ref
+            )
+        )
+        answer_text = result.answer_text.strip()
+        if not answer_text and result.reasoning.decode_hints:
+            answer_text = str(result.reasoning.decode_hints[0].metadata.get("answer_text", "")).strip()
+        return VerifiedDeepTraceExport(
+            export_id=f"deep_export:{stable_hash(f'{result.task_id}:{result.reasoning.proof_hash}')[:16]}",
+            task_id=result.task_id,
+            question=result.plan.question,
+            answer_text=answer_text or result.plan.question,
+            trace_proof_hash=result.reasoning.proof_hash,
+            reasoning=result.reasoning,
+            critique=result.critique,
+            evidence_source_refs=source_refs,
+            created_at=result.completed_at,
         )
 
     async def export_compression_lexicon(self, export_path: Path) -> Path:

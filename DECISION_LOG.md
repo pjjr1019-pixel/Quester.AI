@@ -111,15 +111,22 @@ These choices are locked before Phase 1 to prevent architecture churn.
 
 ## Phase 8 Replay Gate Rule (2026-03-07)
 
-- `SelfOptimizer` remains proposal-only by default; replay evaluation may score proposals, but it must not activate live macro/runtime changes until explicit activation logging and rollback records exist.
+- `SelfOptimizer` remains proposal-only by default; replay evaluation may score proposals, but it must not activate live macro/runtime changes unless the policy is explicitly changed later.
 - Replay input should come from persisted task results, reasoning traces, critique outcomes, and performance metrics rather than ad hoc in-memory snapshots.
 - Replay scope stays bounded by a configurable history window so optimizer work cannot become the dominant memory consumer.
+- Every optimizer cycle must emit append-only proposal lifecycle records, activation decisions, and rollback snapshots so blocked or rejected activation paths remain auditable.
 
 ## Phase 8 Optimizer Metric Rule (2026-03-07)
 
 - The offline optimizer contract is locked to five metrics: compression gain, proof-hash stability, critique validity, latency ratio, and memory ratio.
 - Default replay weights are `0.30 / 0.25 / 0.25 / 0.10 / 0.10` in that order, with a default minimum simulation score of `0.55`.
 - Default replay gates cap both latency and memory ratios at `1.15`; proposals may pass replay evaluation, but proposal approval remains false until the later activation path exists.
+
+## Phase 8 Verified Distillation Rule (2026-03-07)
+
+- Any future model-improvement work should begin with export or distillation from verified `deep`-mode traces only.
+- Unverified free-form chain-of-thought, rejected traces, and degraded critique outcomes must not be exported as training targets.
+- Verified-trace export stays machine-readable so replay, distillation, and process-supervision code can reuse the same artifact boundary.
 
 ### 0.5.5 Development Mode Default
 - `stub_mode=true` by default for first-pass implementation and tests

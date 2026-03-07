@@ -14,9 +14,9 @@ Current repo state:
 - `critique_service.py` now performs hybrid strict verification with bounded arithmetic, Python-expression, Python-code, unit-test, evidence-count, and retrieval-grounding helpers, emits machine-readable failure categories and repair actions, and degrades or abstains instead of polishing weak answers.
 - `translation_service.py` now renders final answers strictly from verified state with templates and source citations, and `orchestrator.py` now applies a bounded repair loop plus richer dashboard/runtime-event metadata.
 - `compression_service.py` now proposes graph-path, candidate-subproof, and symbol-bundle macros in addition to token/opcode motifs, so compression is no longer limited to exact-token aliasing.
-- Phase 8 prep is in place: `storage.py` persists optimizer replay samples, `config.py` locks the offline optimizer metric contract, and `self_optimizer.py` evaluates proposals against a bounded replay window while remaining proposal-only.
+- Phase 8 is functionally complete in proposal-only mode: `storage.py` persists replay samples, replay evaluations, proposal lifecycle records, activation decisions, rollback snapshots, and verified `deep`-trace exports, while `self_optimizer.py` enforces a bounded `propose -> simulate -> validate -> activate` lifecycle without applying live macro changes.
 - Stub mode is the default and is the supported path for local tests.
-- Remaining near-term work is Phase 8 activation audit trails and rollback records, plus expanding the dashboard from its current minimal event console.
+- Remaining near-term work is dashboard/operator visibility over the richer reasoning, critique, and optimizer metadata, plus future policy-gated live activation work if it is ever pursued.
 
 ## Requirements
 
