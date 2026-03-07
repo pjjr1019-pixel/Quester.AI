@@ -1,0 +1,391 @@
+Phase-Based Implementation Prompt for a Lightweight Multi-Agent AI System
+
+Summary
+Build a complete Python-based, local-first, async multi-agent AI system that preserves the full requested workflow and feature set while staying within a hard target of 6GB VRAM and 8GB system RAM. Implement agents as logical services that share one generation backend and one embedding backend, use local-first retrieval, enforce strict resource limits, and keep all heavy work bounded, testable, and modular.
+
+Required Interfaces and Types
+- [x] Implement `PlannerAgent.plan(question: str, budget: ResourceBudget) -> Plan`
+- [x] Implement `ResearcherAgent.research(plan: Plan, budget: ResourceBudget) -> EvidenceBundle`
+- [x] Implement `ReasonerAgent.reason(plan: Plan, evidence: EvidenceBundle, budget: ResourceBudget) -> CompressedTrace`
+- [x] Implement `CriticAgent.review(plan: Plan, evidence: EvidenceBundle, trace: CompressedTrace, budget: ResourceBudget) -> CritiqueReport`
+- [x] Implement `CompressorAgent.propose(trace: CompressedTrace, logs: list[ReasoningLog]) -> list[MacroProposal]`
+- [x] Implement `SelfOptimizer.run_cycle() -> list[MacroProposal]`
+- [x] Implement `Orchestrator.run_task(question: str, thinking_minutes: int) -> TaskResult`
+- [x] Implement `MacroEngine.compress(steps: list[str]) -> CompressedTrace`
+- [x] Implement `MacroEngine.expand(tokens: list[str]) -> list[str]`
+- [x] Implement `MacroEngine.verify_round_trip(trace: CompressedTrace) -> bool`
+- [x] During Phases 3-4, align the implementation to this public API checklist; `run_pipeline()` is temporary and must become `run_task(question, thinking_minutes)`.
+- [x] During Phases 3-4, thread `ResourceBudget` through Researcher, Reasoner, and Critic so the public interface checklist is fully true.
+
+Required internal types
+- [x] Add `Macro`, `KnowledgeVector`, `ReasoningLog`, `PerformanceMetric`
+- [x] Add `Plan`, `PlanStep`, `EvidenceItem`, `EvidenceBundle`
+- [x] Add `CompressedTrace`, `CritiqueReport`, `MacroProposal`
+- [x] Add `AgentStatus`, `ResourceBudget`, `TaskResult`
+
+0.5 Phase 0.5 - Preflight Decision Lock (Do This Before Phase 1)
+- [x] 0.5.1 Confirm hard runtime targets: 6GB VRAM and 8GB RAM.
+- [x] 0.5.2 Select generation runtime backend and pin one default option.
+- [x] 0.5.3 Select embedding backend and pin one default option.
+- [x] 0.5.4 Select local vector store adapter and pin one default option.
+- [x] 0.5.5 Set `stub_mode=true` as the default for first-pass development and tests.
+- [x] 0.5.6 Define a minimal "first successful run" goal: one question completes full pipeline in stub mode.
+- [x] 0.5.7 Define a minimal "first real-backend run" goal: one question completes with real model calls and bounded resources.
+- [x] 0.5.8 Write these locked decisions in a short decision log section so later phases do not re-open core choices.
+- [x] 0.5.9 Do not begin Phase 1 until items 0.5.1 to 0.5.8 are checked.
+
+1. Phase 1 - Project Scaffold and Runtime Rules
+- [x] 1.1 Create the required modules: `planner.py`, `researcher.py`, `reasoner.py`, `compressor.py`, `critic.py`, `self_optimizer.py`, `dashboard.py`, `macro_engine.py`, `data_structures.py`.
+- [x] 1.2 Add support modules: `orchestrator.py`, `model_manager.py`, `storage.py`, `config.py`, `prompts.py`, `utils.py`, `tests/`.
+- [x] 1.3 Use Python 3.11+ and prefer standard library tools first: `asyncio`, `sqlite3`, `dataclasses`, `logging`, `queue`, `threading`, `tkinter`.
+- [x] 1.4 Put all tunable settings in `config.py`; do not hard-code magic numbers inside agents.
+- [x] 1.5 Add a clear startup path and a clean shutdown path for models, background tasks, database connections, and the GUI.
+- [x] 1.6 Treat 6GB VRAM / 8GB RAM as a hard resource budget and mention it in config comments and runtime checks.
+
+2. Phase 2 - Core Data Structures, Typed Contracts, and Boundary Validation
+- [x] 2.1 Treat Phase 2 as a contract migration phase, not a behavior-expansion phase.
+- [x] 2.2 Keep current Phase 1 behavior working while replacing raw dict handoffs with typed dataclass objects.
+- [x] 2.3 Implement all required dataclasses in `data_structures.py` using type hints, `slots=True`, and small helper methods like `to_dict()` / `from_dict()`.
+- [x] 2.4 Use `frozen=True` for immutable value objects where mutation is not needed.
+- [x] 2.5 Implement the original required structures: `Macro`, `KnowledgeVector`, `ReasoningLog`, and `PerformanceMetric`.
+- [x] 2.6 Implement the internal pipeline contracts: `PlanStep`, `Plan`, `EvidenceItem`, `EvidenceBundle`, `CompressedTrace`, `CritiqueReport`, `MacroProposal`, `ResourceBudget`, and `TaskResult`.
+- [x] 2.7 Keep timestamps as `datetime` inside typed objects and convert to ISO strings only at storage, logging, and dashboard boundaries.
+- [x] 2.8 Add simple enums or string constants for agent states, source types, task states, severity levels, and critique result categories.
+- [x] 2.9 Define `Plan` with at minimum: `task_id`, `question`, `steps`, `required_evidence`, `success_criteria`, and `budget`.
+- [x] 2.10 Define `PlanStep` with at minimum: `step_id`, `description`, `depends_on`, `status`, and `notes`.
+- [x] 2.11 Define `EvidenceItem` with at minimum: `id`, `content`, `source_type`, `source_ref`, `score`, `metadata`, and optional `vector_preview`.
+- [x] 2.12 Define `EvidenceBundle` with at minimum: `task_id`, `local_results`, `web_results`, `used_web_fallback`, and `created_at`.
+- [x] 2.13 Define `CompressedTrace` with at minimum: `task_id`, `tokens`, `expanded_preview`, `macros_used`, `confidence`, and `created_at`.
+- [x] 2.14 Define `CritiqueReport` with at minimum: `task_id`, `is_valid`, `issues`, `fixed_trace`, `evidence_coverage`, and `created_at`.
+- [x] 2.15 Define `MacroProposal` with at minimum: `proposal_id`, `macro`, `reason`, `examples`, `simulation_score`, and `approved`.
+- [x] 2.16 Define `TaskResult` as the final typed return object from the orchestrator, containing plan, evidence, reasoning, critique, compression output, and completion timestamp.
+- [x] 2.17 Add lightweight validation methods so invalid data fails early and predictably at object construction or explicit `validate()` calls.
+- [x] 2.18 Add temporary adapter helpers so Phase 1 dict-based code can be migrated incrementally instead of all at once.
+- [x] 2.19 Migrate `MacroEngine` to typed inputs and outputs before expanding its real compression logic in later phases.
+- [x] 2.20 Migrate agent boundaries in this order: Planner -> Researcher -> Reasoner -> Critic -> Compressor.
+- [x] 2.21 Migrate `AppOrchestrator.run_pipeline()` last so it returns a typed `TaskResult` instead of nested dicts.
+- [x] 2.22 Do not mix Phase 2 work with storage redesign, web adapter changes, dashboard redesign, or new optimization behavior.
+- [x] 2.23 Add serialization round-trip tests, invalid-constructor tests, and one typed end-to-end pipeline test before marking Phase 2 complete.
+Phase 2 exit note
+Typed contracts are complete, but stub/placeholder behavior still exists in runtime, macro, retrieval, optimizer, and dashboard layers. Do not treat Phase 2 completion as feature completion.
+
+Compatibility Contract for Future Phases
+- [x] Keep public method signatures stable in `planner.py`, `researcher.py`, `reasoner.py`, `critic.py`, `compressor.py`, and `orchestrator.py`; future phases may change internals but must not break the current public API.
+- [ ] Evolve dataclasses additively first: add new fields with safe defaults before considering removal or rename of existing fields.
+- [x] Keep every `from_dict()` backward-compatible with old serialized payloads; `to_dict()` may emit the newer canonical shape.
+- [x] Keep current enum values valid; add new values only when needed and never repurpose an existing value to mean something different.
+- [x] Keep `ResourceBudget` backward-compatible; any new budget knobs must default safely so `BudgetPolicy.from_minutes()` still returns a valid object for old callers.
+- [x] Keep `PlanStep.description` as the human/debug representation even if a future planner control IR or opcode layer is added.
+- [x] Keep `Plan.task_id`, `question`, `steps`, `required_evidence`, `success_criteria`, `budget`, and `planner_notes`; future plan-IR fields must be additive.
+- [x] Keep `Macro.macro_name`, `expansion`, and `version`; future fields such as signature, invariants, or proof hash must be additive.
+- [x] Keep `ReasoningLog.compressed_chain` and `macros_used` as legacy/debug projections even after proof hashes, motif IDs, or IR metadata are added.
+- [x] Keep `EvidenceItem.content`, `source_type`, `source_ref`, `score`, `metadata`, and `vector_preview`; compressed evidence atoms may be added, but raw content must remain for audit and decode.
+- [x] Keep `EvidenceBundle.local_results`, `web_results`, and `used_web_fallback`; future evidence-graph or citation-index fields must be additive.
+- [x] Keep `CompressedTrace.tokens`, `expanded_preview`, `macros_used`, `confidence`, and `reasoner_notes`; graph-backed IR fields such as op stream, symbol-table references, context frames, and proof hash must be additive.
+- [x] Keep `CompressedTrace.tokens` populated as a legacy/debug projection even after graph-backed IR becomes the primary reasoning representation.
+- [x] Keep `CritiqueReport.is_valid`, `issues`, `fixed_trace`, `evidence_coverage`, `critic_notes`, and `result`; future drift/provenance/proof-hash fields must be additive.
+- [x] Keep `MacroProposal.proposal_id`, `macro`, `reason`, `examples`, `simulation_score`, and `approved`; future motif/fingerprint metadata must be additive.
+- [x] Keep `TaskResult.plan`, `evidence`, `reasoning`, `critique`, and `compression`; future answer text, metrics, or proof summaries must be additive.
+- [x] Keep `RuntimeEvent.stage`, `payload`, and `timestamp`; future event codes may be embedded inside payloads, but old event consumers must still work.
+- [x] Keep `AgentStatus.component`, `state`, `task_id`, `severity`, and `message`; machine-readable status codes may be added, but message remains the readable fallback.
+- [x] Keep `Orchestrator.run_task(question, thinking_minutes)` as the primary public entrypoint; keep `run_pipeline(question)` as a compatibility shim until a later explicit cleanup phase.
+- [x] Keep `StorageManager` usable while adding specialized repositories/tables; do not break existing logging and key-value behaviors during storage migrations.
+- [x] Keep `DashboardService.publish_event(...)` compatible with the current event-dict shape even after richer typed events are introduced.
+- [ ] Treat `MacroEngine`, Reasoner, Critic, storage schema, optimizer logic, and dashboard internals as replaceable implementation details so long as the compatibility rules above remain true.
+- [x] Add and keep compatibility tests that prove old serialized payloads still deserialize, `run_task(...)` still returns a valid `TaskResult`, `run_pipeline(...)` still works during migration, old `CompressedTrace` payloads without IR fields remain valid, and new IR-backed traces still emit legacy `tokens` and `expanded_preview`.
+
+3. Phase 3 - Resource Budgeting and Shared Model Management (Complete)
+- [x] 3.0.1 Before coding Phase 3, freeze the generation and embedding adapter interfaces (`start`, `stop`, `generate` / `embed`, `health`) so backend-specific code does not leak into agents.
+- [x] 3.0.2 Before coding Phase 3, extend config first with backend runtime settings such as endpoint/path, timeout, idle-unload threshold, fallback policy, and telemetry flags; do not hard-code them in `ModelManager`.
+- [x] 3.0.3 Before coding Phase 3, define explicit runtime error types for startup failure, backend unavailable, timeout, and fallback/OOM conditions so failures stay structured.
+- [x] 3.0.4 Before coding Phase 3, preserve stub-mode parity with real mode and add tests for semaphores, fallback, and health snapshots before wiring actual backends.
+- [x] 3.1 Keep `ModelManager` as the only component allowed to load, unload, or schedule model work.
+- [x] 3.2 Treat Phase 3 as a real backend-abstraction phase, not just a semaphore cleanup phase.
+- [x] 3.3 Implement a shared generation backend interface for Planner, Reasoner, Critic, and Compressor.
+- [x] 3.4 Implement a separate lightweight embedding backend interface for Researcher.
+- [x] 3.5 Add `asyncio.Semaphore` limits so only 1 generation task and 1 embedding task can actively use model resources at the same time.
+- [x] 3.6 Add runtime memory checks using optional `psutil` and backend-reported VRAM usage when available.
+- [x] 3.7 Add CPU fallback or reduced-budget fallback when VRAM is too low to keep the system usable.
+- [x] 3.8 Ensure inactive model sessions are unloaded or released after idle timeout.
+- [x] 3.9 Keep queue sizes bounded so the dashboard and optimizer cannot create unbounded memory growth.
+- [x] 3.10 Add provider protocols or adapter classes so `ollama`, `llama.cpp`, and embedding backends can be swapped without agent changes.
+- [x] 3.11 Add a runtime capability/health snapshot that reports backend name, active jobs, fallback mode, and recent usage.
+- [x] 3.12 Replace placeholder real-mode behavior with actual backend calls or explicit adapter stubs that fail clearly when not configured.
+- [x] 3.13 Add explicit idle-unload and backend-fallback rules so the system can degrade gracefully under 6GB VRAM / 8GB RAM constraints.
+Phase 3 exit note
+- [x] Phase 3 is complete for the current codebase: backend abstraction, semaphores, fallback rules, health snapshots, and idle maintenance are implemented. Real-backend smoke remains a later acceptance-gate item because local services, dependencies, and model files are environment prerequisites rather than remaining Phase 3 code.
+
+4. Phase 4 - Budget Policy and Thinking-Time Mapping
+- [x] 4.0.1 Before coding Phase 4, treat existing `BudgetPolicy.from_minutes()` and `Orchestrator.run_task(...)` as the baseline; calibrate and extend them instead of creating duplicate entrypoints or duplicate budget logic.
+- [x] 4.0.2 Before coding Phase 4, decide one source of truth for budget derivation in `config.py` and make all agents consume the same `ResourceBudget` object.
+- [ ] 4.0.3 Before coding Phase 4, add tests that prove different `thinking_minutes` values actually change downstream behavior instead of only changing metadata.
+- [ ] 4.0.4 Before coding Phase 4, keep all new budget controls memory-safe and bounded so no slider position can force unbounded retrieval, web use, or reasoning passes.
+- [ ] 4.0.5 Before closing Phase 4, calibrate the bounded presets against both the locked 6GB VRAM / 8GB RAM baseline and the current 4GB VRAM / 8GB RAM development profile so the budget table is honest for real runs.
+- [x] 4.1 Implement `ResourceBudget` and a `BudgetPolicy.from_minutes(minutes)` helper in `config.py`.
+- [x] 4.2 Use these default bounded presets:
+- [x] 4.3 `1-5 min -> retrieval_top_k=4, max_web_queries=1, reasoner_passes=1, critic_passes=1, macro_depth=2`
+- [x] 4.4 `6-30 min -> retrieval_top_k=6, max_web_queries=2, reasoner_passes=2, critic_passes=2, macro_depth=3`
+- [x] 4.5 `31-120 min -> retrieval_top_k=8, max_web_queries=3, reasoner_passes=3, critic_passes=2, macro_depth=4`
+- [x] 4.6 `121-720 min -> retrieval_top_k=10, max_web_queries=5, reasoner_passes=4, critic_passes=3, macro_depth=4`
+- [x] 4.7 Keep all presets memory-safe; never scale budgets linearly without bounds.
+- [ ] 4.8 Make the slider affect actual work depth, not artificial waiting.
+- [x] 4.9 Add public `Orchestrator.run_task(question, thinking_minutes)` and compute `ResourceBudget` from `thinking_minutes` there.
+- [ ] 4.10 Pass the computed `ResourceBudget` through Planner, Researcher, Reasoner, and Critic so retrieval depth, web gating, reasoning passes, and critic depth all change actual runtime work instead of only metadata.
+- [x] 4.11 Keep the current `run_pipeline(question)` path only as a compatibility helper until `run_task(...)` is the main entrypoint.
+
+5. Phase 5 - Storage, Chunking, Retrieval, and Web Adapters
+- [ ] 5.0.1 Before coding Phase 5, design repository boundaries first: event log, settings/KV, vector index, source document store, macro registry, and reasoning/performance history must be separate responsibilities.
+- [ ] 5.0.2 Before coding Phase 5, keep the current `StorageManager.log_event(...)` and key-value behavior working while specialized storage layers are added behind it.
+- [ ] 5.0.3 Before coding Phase 5, lock document chunking, deduplication, and source-identity rules so Researcher, Critic, and decoder all refer to evidence consistently; evidence handles must remain stable across re-embedding and storage migrations.
+- [ ] 5.0.4 Before coding Phase 5, define web-adapter timeout, retry, and degraded-mode behavior up front; web failure must never break local-only runs.
+- [ ] 5.0.5 Before coding Phase 5, keep `chromadb` as the pinned primary vector store for v1 using a local persistent client; do not re-open the primary choice unless the decision log changes.
+- [ ] 5.0.6 Before coding Phase 5, keep `sqlite-vec` as an optional secondary adapter only; it fits the SQLite-heavy architecture well but must not become the default while it remains a newer dependency.
+- [ ] 5.0.7 Before coding Phase 5, lock the default retrieval embedding strategy: prefer a retrieval-tuned sentence-transformers model and separate query/document encoding paths instead of one generic embedding call.
+- [ ] 5.1 Build a lightweight persistence layer in `storage.py` using SQLite for tasks, metrics, macros, and source metadata.
+- [ ] 5.2 Store append-only trace and web logs as JSONL when that is simpler than relational tables.
+- [ ] 5.3 Implement a vector store adapter that supports insert, search, update, and delete operations.
+- [ ] 5.4 Use Chroma PersistentClient as the primary local vector index; keep the adapter generic so it can swap to `sqlite-vec` or a simple fallback index without agent changes.
+- [ ] 5.5 Add a chunker that splits documents before embedding; default to small bounded chunks with overlap.
+- [ ] 5.6 Add local-first retrieval logic: search local store first, support metadata filters, score results, optionally rerank a small bounded candidate set, and only trigger web fetch if evidence quality is insufficient.
+- [ ] 5.6.1 When the selected embedding model supports it, use asymmetric query/document encoding APIs instead of one generic embed path.
+- [ ] 5.6.2 Keep reranking optional and bounded; if used, apply it only to a small top-N set so CPU-heavy runs remain practical on low-resource machines.
+- [ ] 5.7 Add a web adapter with timeout, retry, source logging, deduplication, and safe parsing.
+- [ ] 5.8 Never let web fetch block the app indefinitely; all network work must be optional and time-bounded.
+- [ ] 5.9 Split storage responsibilities into explicit repositories or tables for vectors, source documents, macro history, reasoning logs, and performance metrics instead of keeping everything behind a generic key-value layer.
+- [ ] 5.10 Do not bury retrieval behavior in one generic storage class; keep retrieval/indexing adapters separate from event logging and settings persistence.
+- [ ] 5.11 Add explicit storage for the compression runtime: opcode lexicon, macro registry, decoder lexicon, local symbol-table snapshots, and proof-hash history.
+- [ ] 5.12 Keep the runtime source of truth machine-readable (`SQLite` tables or `JSONL`), not a giant plain-text dictionary loaded into every prompt.
+- [ ] 5.13 If a human-readable reference file is desired, generate `compression_lexicon.md` or `compression_lexicon.txt` from the registry as a debug/export artifact only; do not make it the primary runtime store.
+- [ ] 5.14 Load only the active subset of macro/opcode/decoder entries for a task; never inject the full translation registry into every model call.
+- [ ] 5.15 Persist chunk text, source metadata, embedding model/version, and vector IDs together so re-indexing and compatibility migrations are auditable.
+- [ ] 5.16 Keep source-document storage and vector storage independently rebuildable; re-embedding or index rebuilds must never lose the original text or provenance metadata.
+
+6. Phase 6 - Canonical Semantic IR, Macro Registry, and Compressed Reasoning DSL
+- [ ] 6.0.1 Before coding Phase 6, lock the canonical IR shapes in `data_structures.py` first; do not begin `MacroEngine` work until the graph, opcode, symbol-table, context-frame, and proof-hash structures are defined.
+- [ ] 6.0.2 Before coding Phase 6, treat `CompressedTrace.tokens` and `expanded_preview` as legacy/debug projections that must remain available throughout the migration.
+- [ ] 6.0.3 Before coding Phase 6, implement deterministic expansion and validation before optimizer-learned compression; read/verify paths must exist before write/learn paths.
+- [ ] 6.0.4 Before coding Phase 6, benchmark memory and payload size on stub traces so the new IR is actually denser than the current token-list placeholder.
+- [ ] 6.0.5 Before coding Phase 6, lock provenance primitives first: entity, activity, agent, and bundle shapes must be explicit in the IR instead of implicit metadata blobs.
+- [ ] 6.1 Treat Phase 6 as an architecture redesign of `MacroEngine`, not a light enhancement.
+- [ ] 6.2 Define a canonical semantic intermediate representation (IR) before designing shorthand tokens; the compression language must preserve proof semantics, provenance, and uncertainty as first-class semantics rather than best-effort annotations.
+- [ ] 6.3 Represent reasoning internally as a graph/DAG of typed semantic nodes and dependencies, not just a flat list of string tokens.
+- [ ] 6.3.1 Model evidence items, derived claims, answer fragments, macro definitions, and intermediate bindings as typed entities with stable IDs.
+- [ ] 6.3.2 Model retrieval, reasoning, critique, and compression passes as typed activities linked to the entities they use and produce.
+- [ ] 6.3.3 Model component/model ownership as typed agents so traces can record which service and backend produced each artifact.
+- [ ] 6.4 Define a compact typed opcode lexicon with fixed semantics for core operations such as lookup, bind, compare, infer, aggregate, check, emit, cite, and confidence update.
+- [ ] 6.5 Keep the core opcode lexicon small and stable; store it once and treat it as part of the runtime, not as repeated prompt text.
+- [ ] 6.6 Add a machine-readable macro registry with versioned, parameterized macros; each macro must declare its signature, canonical expansion, invariants, and proof fingerprint.
+- [ ] 6.7 Add a per-task local symbol table that maps entities, predicates, attributes, evidence handles, and temporary registers to short IDs for dense encoding.
+- [ ] 6.8 Add context frames so provenance sets, confidence, scope, and active assumptions can be inherited instead of repeated on every operation.
+- [ ] 6.9 Compile the canonical graph into a compact operation stream / bytecode representation inside `CompressedTrace` instead of relying on plain string-token sequences as the primary meaning store.
+- [ ] 6.10 Extend `CompressedTrace` as needed to carry IR version, operation stream, symbol-table references, evidence handles, context frames, proof hash, and decode hints while preserving current public compatibility.
+- [ ] 6.11 Implement `compress()` around repeated graph motifs and parameterized macros, not exact-token aliases.
+- [ ] 6.12 Implement `expand()` by resolving macro IDs, replaying the operation stream, and reconstructing the canonical graph deterministically.
+- [ ] 6.13 Add structural hashing / proof fingerprints for expanded graphs so equivalent reasoning chains can be deduplicated and verified cheaply.
+- [ ] 6.14 Add recursion detection with a visited-set and a strict max depth such as `8`.
+- [ ] 6.15 Add canonical normalization rules for graphs, bindings, and opcode order where order is semantically irrelevant; reject noncanonical encodings.
+- [ ] 6.16 Implement `verify_round_trip()` as `compressed -> expanded canonical graph -> normalized graph -> recompressed` and require proof-hash stability, not just text equality.
+- [ ] 6.17 Reject macro proposals that fail loop checks, fingerprint checks, provenance preservation, uncertainty preservation, or semantic consistency checks.
+- [ ] 6.18 Replace the current identity-style placeholder compression with real graph compilation, macro expansion, and validation logic.
+- [ ] 6.19 Add a decoder lexicon that maps internal symbols and verified proof structures back to natural-language templates, but keep decoding separate from reasoning.
+- [ ] 6.19.1 Add a compact human-readable debug/export view for the IR and provenance graph so operators can inspect a task without reading raw JSON blobs.
+- [ ] 6.20 Use selective context injection only: Reasoner and Critic may load active opcodes, active macro definitions, and the current local symbol table, but must never carry the whole registry in context.
+- [ ] 6.21 Ensure macro proposals are validated before they can influence Reasoner, Critic, or Self-Optimizer flows.
+
+7. Phase 7 - Implement the Foreground Agents and Verification Layer
+- [ ] 7.0.1 Before coding Phase 7, keep agents thin and move shared logic into services; Planner, Researcher, Reasoner, Critic, and Compressor should orchestrate behavior, not own storage/runtime internals.
+- [ ] 7.0.2 Before coding Phase 7, define the exact handoff shape from Researcher -> Reasoner and Reasoner -> Critic so evidence handles, proof structures, and repair data do not drift.
+- [ ] 7.0.3 Before coding Phase 7, implement deterministic or stubbed versions of the new agent logic first, then layer real model-backed inference behind the same contracts.
+- [ ] 7.0.4 Before coding Phase 7, keep translation to natural language as a final step after verification; do not let free-form text become the primary reasoning state again.
+- [ ] 7.0.5 Before coding Phase 7, lock one structured-output path for model-backed agents; Planner, Reasoner, Critic, and Compressor must emit schema-constrained JSON rather than free-form text.
+- [ ] 7.0.6 Before coding Phase 7, keep dataclasses as the domain model and use boundary-only schema helpers to generate and validate model I/O contracts.
+- [ ] 7.1 Replace remaining stub or placeholder agent behavior with real task-aware logic while preserving typed contracts.
+- [ ] 7.2 Implement `PlannerAgent` to return structured `Plan` objects only via schema-constrained output; do not let it return free-form text as its primary output.
+- [ ] 7.3 Implement `ResearcherAgent` to accept a `Plan`, retrieve local evidence first using stable evidence handles and retrieval-tuned embeddings, optionally fetch web evidence, embed/store new content, and return `EvidenceBundle`.
+- [ ] 7.4 Implement `ReasonerAgent` to consume the `Plan` and `EvidenceBundle`, build the canonical reasoning/provenance graph, compile it into the compressed IR, and stay within the `ResourceBudget`.
+- [ ] 7.5 Make the Reasoner reuse the per-task symbol table, active opcode lexicon, and active macro registry subset instead of emitting ad hoc symbolic strings.
+- [ ] 7.6 Implement `CriticAgent` as a hybrid strict verifier: schema validation -> deterministic provenance/IR constraint checks -> deterministic macro/IR expansion -> optional model-assisted semantic fallback only if structural checks pass.
+- [ ] 7.7 Make the Critic validate plan coverage, evidence support, opcode legality, ordering/type/impossibility constraints, macro signature matching, contradiction surfacing, uncertainty preservation, provenance coverage, and proof-hash stability.
+- [ ] 7.7.1 Make the Critic surface whether failures are schema, provenance, proof-hash, or evidence-coverage violations so repair paths stay targeted instead of generic.
+- [ ] 7.8 Extend `CritiqueReport` as needed to expose drift score, proof-hash match, provenance coverage, macro violations, and repair actions while preserving current compatibility where possible.
+- [ ] 7.9 Implement `CompressorAgent` to learn parameterized graph motifs, frequent subproofs, and symbol-table optimization opportunities; exact-token aliases must not be the main compression strategy.
+- [ ] 7.10 Add a translation layer that expands only the verified output-relevant proof subgraph and renders it to natural language using templates first and LLM surface realization second.
+- [ ] 7.11 Keep each agent small and single-purpose; shared concerns like logging, model access, storage, symbol-table management, and proof hashing must stay in shared services.
+- [ ] 7.12 Make budget a real input to foreground agents so work depth changes with the thinking-time policy.
+- [ ] 7.13 Do not claim foreground-agent completion while local retrieval, critic verification depth, graph-backed compression, and macro-aware reasoning are still stubbed.
+- [ ] 7.14 If a model output fails schema validation, allow at most one bounded repair attempt before returning a structured failure.
+
+8. Phase 8 - Implement the Background Self-Optimizer
+- [ ] 8.0.1 Before coding Phase 8, keep the optimizer read-only with respect to live runtime state until replay/simulation infrastructure is in place.
+- [ ] 8.0.2 Before coding Phase 8, lock the evaluation metrics for “better” proposals: compression gain, proof-hash stability, critic validity, latency, and memory cost.
+- [ ] 8.0.3 Before coding Phase 8, define proposal persistence and rollback records first so every activation decision is auditable.
+- [ ] 8.0.4 Before coding Phase 8, cap history windows and replay scope so the optimizer does not become the largest memory consumer in the system.
+- [ ] 8.1 Implement `SelfOptimizer` as a background async service that never blocks the foreground task pipeline.
+- [ ] 8.2 Read reasoning logs, macro usage, critique results, and performance metrics on a schedule.
+- [ ] 8.3 Generate only proposals, never direct live changes.
+- [ ] 8.4 Enforce the lifecycle `propose -> simulate -> validate -> activate`.
+- [ ] 8.5 Build a small simulation harness that reruns sample tasks using candidate macro changes and compares success and efficiency metrics.
+- [ ] 8.6 Activate a proposal only if it passes validation and improves results without increasing contradiction risk.
+- [ ] 8.7 Keep the currently active macro set immutable during a foreground task run.
+- [ ] 8.8 Replace the current placeholder optimizer cycle with real proposal generation based on persisted reasoning, critique, and performance data.
+- [ ] 8.9 Track activation decisions and failed simulations so regressions are visible and rollback is explicit.
+
+9. Phase 9 - Orchestrator and Event Flow
+- [ ] 9.0.1 Before coding Phase 9, lock the event schema first so storage, dashboard, and tests all observe the same stage/status payload shape.
+- [ ] 9.0.2 Before coding Phase 9, define cancellation, retry, and surfaced-warning semantics before adding more runtime branches to the orchestrator.
+- [ ] 9.0.3 Before coding Phase 9, keep orchestration logic separate from agent logic; `Orchestrator` should compose services, not absorb reasoning or storage rules.
+- [ ] 9.0.4 Before coding Phase 9, preserve `run_task(...)` as the primary path and keep `run_pipeline(...)` as a thin compatibility wrapper only.
+- [ ] 9.0.5 Before coding Phase 9, make degraded-mode/resource-pressure/fallback events first-class so UI, logs, and tests can surface why the runtime changed behavior.
+- [ ] 9.1 Build `Orchestrator` as the only component that wires the main workflow together.
+- [ ] 9.2 Implement the foreground sequence exactly as `Planner -> Researcher -> Reasoner -> Critic -> Compressor -> Dashboard`.
+- [ ] 9.3 Add an internal event stream or bounded status queue so the dashboard can display live progress without tight coupling.
+- [ ] 9.4 Record `AgentStatus` updates at each stage start, completion, retry, failure, fallback, and degraded-mode branch.
+- [ ] 9.5 Add cancellation handling so a user can stop a long task safely.
+- [ ] 9.6 Add retry logic only for safe transient failures such as timeouts; do not retry invalid outputs forever.
+- [ ] 9.7 Return a final `TaskResult` containing the plan, evidence summary, verified trace, answer, metrics, and surfaced warnings.
+- [ ] 9.8 Expose `run_task(question, thinking_minutes)` as the primary public entrypoint and treat `run_pipeline(question)` as legacy until it can be removed.
+- [ ] 9.9 Carry resource budget, status events, and surfaced warnings through the full orchestration path so later acceptance gates can be tested directly.
+
+10. Phase 10 - Dashboard Implementation
+- [ ] 10.0.1 Before coding Phase 10, keep headless mode and UI mode behaviorally aligned so tests and non-GUI runs remain valid.
+- [ ] 10.0.2 Before coding Phase 10, treat the dashboard as a read-only event consumer; it must not become a source of pipeline state truth.
+- [ ] 10.0.3 Before coding Phase 10, define queue backpressure and event-drop behavior so the UI cannot cause memory growth under heavy activity.
+- [ ] 10.0.4 Before coding Phase 10, keep UI updates off the main pipeline thread and expose degraded resource/error states explicitly rather than hiding them.
+- [ ] 10.1 Use `Tkinter` by default to keep memory overhead low.
+- [ ] 10.2 Create panels for question input, thinking-time slider, agent status, runtime health, evidence inspector, macro/provenance inspector, web query log, final answer, and critique summary.
+- [ ] 10.3 Show live status updates by polling a bounded queue or using a thread-safe event bridge.
+- [ ] 10.4 Display current resource usage when available, including RAM and VRAM estimates.
+- [ ] 10.5 Keep the UI responsive by running model and I/O work outside the main UI thread.
+- [ ] 10.6 Add clear error states and recovery actions so a failed web fetch or low-memory event does not crash the dashboard.
+- [ ] 10.7 Replace the current text-only event console with the real structured dashboard panels above; the raw event log view may remain only as a debug pane.
+- [ ] 10.8 Show when events were dropped due to queue backpressure so UI silence cannot hide runtime activity.
+
+11. Phase 11 - Seed Data, Example Tasks, and Sample Macros
+- [ ] 11.0.1 Before coding Phase 11, keep all fixtures small, deterministic, and versioned so they remain stable across optimizer and compression changes.
+- [ ] 11.0.2 Before coding Phase 11, separate local-only demo tasks from web-fallback demo tasks so each behavior can be tested independently.
+- [ ] 11.0.3 Before coding Phase 11, ensure starter macros and opcode entries are conservative and fully validated; sample data must not depend on optimizer-learned definitions.
+- [ ] 11.0.4 Before coding Phase 11, include at least one contradiction/conflict example so Critic and decoder behavior can be verified under non-happy paths.
+- [ ] 11.0.5 Before coding Phase 11, include at least one clearly asymmetric retrieval corpus (question -> passage) so query/document encoding paths are tested honestly instead of only symmetric similarity cases.
+- [ ] 11.1 Add a small local knowledge sample so the system can demonstrate local-first retrieval without requiring web access; chunk IDs, source hashes, and metadata filters should be part of the fixture.
+- [ ] 11.2 Add a few starter macros that are simple, safe, and useful for repeated reasoning patterns.
+- [ ] 11.3 Add 3-5 sample user questions that exercise planning, retrieval, reasoning, critique, and compression.
+- [ ] 11.4 Add a fake or stub web adapter for tests so CI does not depend on live internet.
+- [ ] 11.5 Add one example task that intentionally triggers web fallback and one that stays fully local.
+- [ ] 11.6 Ensure at least one sample task exercises the `thinking_minutes -> ResourceBudget -> agent behavior` flow end to end.
+- [ ] 11.7 Add a small starter opcode lexicon, macro registry, and decoder lexicon so the compressed IR can be demonstrated without requiring the optimizer to invent everything first.
+- [ ] 11.8 Add one starter provenance bundle example that shows evidence -> reasoning activity -> verified claim links end to end.
+
+12. Phase 12 - Tests, Validation, and Best Practices
+- [ ] 12.0.1 Before coding Phase 12, prioritize tests by risk: compatibility, resource limits, proof-hash stability, provenance preservation, and fallback behavior come before cosmetic coverage gains.
+- [ ] 12.0.2 Before coding Phase 12, keep stub-mode tests as the default CI path and make real-backend tests opt-in or smoke-only so the suite stays portable.
+- [ ] 12.0.3 Before coding Phase 12, add regression fixtures for old serialized payloads and legacy `CompressedTrace` shapes before the IR migration lands.
+- [ ] 12.0.4 Before coding Phase 12, define minimum acceptance thresholds for validity, compression improvement, and bounded resource usage so “passing” is concrete.
+- [ ] 12.0.5 Before coding Phase 12, add a reproducible environment manifest (`pyproject.toml` with optional extras) before claiming any real-backend path is supported.
+- [ ] 12.1 Write unit tests for every agent with mocked model and storage backends.
+- [ ] 12.2 Write unit tests for `MacroEngine` compression, expansion, nested macros, recursion blocking, and round-trip verification.
+- [ ] 12.3 Write retrieval tests for local-first behavior, metadata filtering, query/document encoding split, bounded reranking, web fallback behavior, deduplication, and empty-result handling.
+- [ ] 12.4 Write resource tests for semaphore limits, queue limits, low-memory fallback, Ollama keep-alive/unload behavior, and model unload behavior.
+- [ ] 12.5 Write optimizer tests proving proposals are simulated before activation.
+- [ ] 12.6 Write end-to-end pipeline tests for at least two example questions.
+- [ ] 12.7 Write failure-path tests for malformed macro definitions, invalid plan output, web timeout, empty evidence, and critic rejection.
+- [ ] 12.8 Keep prompts, parsing, storage, and UI code separate to avoid circular dependencies and fragile edits.
+- [ ] 12.9 Use dependency injection for models, storage, and web adapters so components are easy to mock and swap.
+- [ ] 12.10 Keep comments concise and useful; explain non-obvious logic, resource guards, and validation rules.
+- [ ] 12.11 Add a short README with setup steps, optional dependency extras, local service/model prerequisites, architecture notes, runtime limits, and how both the locked 6GB baseline and the 4GB dev profile are enforced.
+- [ ] 12.12 Do a final pass to remove dead code, duplicate logic, hidden globals, and unbounded caches.
+- [ ] 12.13 Add explicit tests for the top-level public API checklist so phase completion and interface compliance cannot drift apart.
+- [ ] 12.14 Do not mark the project feature complete while placeholder runtime paths or text-only dashboard behavior remain.
+- [ ] 12.15 Add proof-hash stability tests so semantically equivalent encodings normalize to the same canonical fingerprint.
+- [ ] 12.16 Add failure-path tests for provenance loss, uncertainty erasure, macro signature mismatch, and noncanonical encodings.
+- [ ] 12.17 Add selective-context tests proving only active opcode/macro/symbol-table entries are loaded for a task instead of the whole registry.
+- [ ] 12.18 Add translation-layer tests that verify final natural-language output preserves the verified claim, evidence basis, and uncertainty markers.
+- [ ] 12.19 Add setup/smoke checks that fail clearly when required real-mode dependencies, local services, or model files are missing.
+
+Acceptance Checklist
+- [ ] The system runs locally as an async, modular, multi-agent pipeline.
+- [ ] The system preserves every requested feature and workflow stage.
+- [ ] The system remains designed for 6GB VRAM and 8GB RAM through shared runtimes, bounded workloads, and fallback behavior.
+- [ ] The macro engine supports nested macros and round-trip verification safely.
+- [ ] The compression system uses a canonical graph-backed IR with parameterized macros, proof hashing, and per-task symbol tables instead of plain string-token shorthands.
+- [ ] The Researcher uses local retrieval before web access.
+- [ ] The Self-Optimizer never applies live changes without simulation and validation.
+- [ ] The dashboard works and shows live progress, logs, macro usage, and results.
+- [ ] Tests cover unit, integration, resource, failure, and optimization scenarios.
+- [ ] The public interface checklist at the top of this file is fully matched by the codebase.
+- [ ] Placeholder runtime paths have been replaced by real or clearly configured backend behavior.
+- [ ] The runtime uses selective context injection and does not depend on loading a giant translation dictionary into every model prompt.
+- [ ] Real-mode prerequisites are reproducible from a manifest plus README, and missing dependencies/services/models fail clearly.
+
+Assumptions and Defaults
+- [ ] Default GUI: `Tkinter`
+- [ ] Default persistence: `SQLite + JSONL`
+- [ ] Default architecture: shared generation backend + shared embedding backend
+- [ ] Default local vector store: `Chroma PersistentClient`
+- [ ] Optional secondary vector store: `sqlite-vec`
+- [ ] Default retrieval embedding model: `sentence-transformers/multi-qa-MiniLM-L6-cos-v1`
+- [ ] Default compression architecture: canonical graph-backed IR compiled into a compact operation stream with parameterized macros and proof hashing
+- [ ] Default model-output policy: schema-constrained JSON at agent boundaries
+- [ ] Default dev calibration profile: `4GB VRAM / 8GB RAM` current laptop while keeping `6GB VRAM / 8GB RAM` as the locked baseline acceptance target
+- [ ] Default macro recursion limit: `8`
+- [ ] Default queue policy: bounded queues only
+- [ ] Default web behavior: optional, adapter-based, timeout-protected
+- [ ] Default translation-registry policy: machine-readable runtime registry plus optional human-readable export; never use a giant plain-text file as the primary runtime source of truth
+- [ ] Default implementation rule: optimize memory and concurrency without removing logic or features
+
+13. Phase 13 - Lower-Level AI Implementation Guardrails
+- [ ] 13.0.1 Before using Phase 13 as guidance, treat it as a standing checklist that must be reviewed at the start of every implementation phase, not as a one-time phase.
+- [ ] 13.0.2 Before relying on lower-level AI execution, keep tasks small enough that each coding pass changes one subsystem and one test surface at a time.
+- [ ] 13.0.3 Before delegating work, ensure every task names the target files, required contracts, and success tests explicitly so the implementer does not guess.
+- [ ] 13.1 Do not skip phase order; complete Phase N acceptance checks before starting Phase N+1.
+- [ ] 13.2 Build in two modes from day one: `stub_mode=true` (no heavy model calls) and `stub_mode=false` (real backends).
+- [ ] 13.3 Keep one public class per module where possible; avoid advanced abstractions unless they remove duplication.
+- [ ] 13.4 For every agent output, enforce typed parsing and validation before passing to the next stage.
+- [ ] 13.5 If generation output is invalid JSON/schema, run one repair attempt, then return a structured failure.
+- [ ] 13.6 Every async loop must support cancellation and timeout; never allow infinite `while True` without sleep and stop signal.
+- [ ] 13.7 Keep queues bounded and define explicit drop/retry behavior to prevent memory growth.
+- [ ] 13.8 Add docstrings that state input, output, and failure behavior for each public method.
+- [ ] 13.9 Keep feature parity: simplify implementation details, never remove required logic or workflow steps.
+
+14. Phase 14 - Micro-Step Build Order (Easiest Safe Path)
+- [ ] 14.0.1 Before following Phase 14 literally, reconcile it with any future phase-order changes; this section is the execution sequence and must stay synchronized with the rest of the plan.
+- [ ] 14.0.2 Before each subsystem handoff, confirm the prior subsystem’s tests and done gate are already green; do not treat build order as a substitute for validation.
+- [ ] 14.0.3 Before using lower-level AI for a micro-step, reduce the task to one contract addition, one behavior change, and one test target where possible.
+- [ ] 14.1 Create dataclasses and enums first, then write tests for type validation and serialization.
+- [ ] 14.2 Implement `storage.py` with SQLite tables and JSONL logging utilities, then test create/read/write paths.
+- [ ] 14.3 Implement `model_manager.py` with stub backends and semaphores, then test concurrency limits.
+- [ ] 14.4 Implement `macro_engine.py` before Reasoner/Compressor, then test compress/expand/round-trip rules.
+- [ ] 14.5 Implement Planner with deterministic stub output first, then switch to model-backed mode.
+- [ ] 14.6 Implement Researcher with local-only retrieval first, then add optional web fallback.
+- [ ] 14.7 Implement Reasoner using macro engine + evidence bundle, then add budget-aware iteration logic.
+- [ ] 14.8 Implement Critic checks (schema, contradiction flags, evidence coverage), then add fix suggestions.
+- [ ] 14.9 Implement Compressor proposals and semantic checks, then connect proposal persistence.
+- [ ] 14.10 Implement Self-Optimizer simulation loop and proposal activation rules.
+- [ ] 14.11 Implement Orchestrator pipeline and cancellation handling.
+- [ ] 14.12 Implement Dashboard last, using event queue subscriptions from orchestrator.
+
+15. Phase 15 - Common Failure Patterns and Mandatory Fixes
+- [ ] 15.0.1 Before Phase 15 issues happen in production, convert each known failure pattern into a test, log signal, or explicit degraded-mode branch during the earlier phases.
+- [ ] 15.0.2 Before closing any phase, review this failure list and verify the phase did not introduce a new unchecked failure mode around memory, schema drift, retries, or optimizer safety.
+- [ ] 15.0.3 Before accepting a “works on my machine” result, confirm the failure handling also behaves correctly in stub mode, headless mode, and low-resource mode.
+- [ ] 15.1 If RAM usage grows over time, inspect queues, cached traces, and web content buffers; cap or prune immediately.
+- [ ] 15.2 If VRAM spikes, reduce active context length, lower batch size, unload idle model sessions, and reduce concurrent model tasks.
+- [ ] 15.3 If agent outputs drift in format, enforce strict schema adapters at agent boundaries.
+- [ ] 15.4 If round-trip macro checks fail, reject the macro proposal and keep previous stable macro set.
+- [ ] 15.5 If web fetch fails, continue with local evidence and return degraded-mode warnings, not hard crashes.
+- [ ] 15.6 If critic rejects trace repeatedly, cap retries and return a structured failure report with root causes.
+- [ ] 15.7 If optimizer causes regressions in simulation, do not activate proposals; log failure and rollback candidate.
+
+16. Phase 16 - Definition of Done Gates by Subsystem
+- [ ] 16.0.1 Before marking any subsystem done, require both its local tests and its compatibility tests to pass; no subsystem is done if it breaks an earlier phase contract.
+- [ ] 16.0.2 Before calling the whole project complete, require the acceptance checklist, subsystem gates, and compatibility contract to all be green at the same time.
+- [ ] 16.0.3 Before release, run at least one end-to-end stub-mode path and one real-backend smoke path against the 6GB VRAM / 8GB RAM target assumptions.
+- [ ] 16.1 Data layer done gate: all dataclass validation and serialization tests pass.
+- [ ] 16.2 Storage layer done gate: SQLite and JSONL smoke tests pass with no schema migration errors.
+- [ ] 16.3 Model layer done gate: semaphore/concurrency tests prove only allowed model jobs run at once.
+- [ ] 16.4 Macro layer done gate: nested expansion, recursion guard, and round-trip verification tests pass.
+- [ ] 16.5 Agent layer done gate: each agent unit test passes in stub mode and real mode (where dependencies exist).
+- [ ] 16.6 Orchestrator done gate: full pipeline executes sample tasks with correct stage order and status events.
+- [ ] 16.7 Optimizer done gate: proposals are never activated without simulation + validation pass.
+- [ ] 16.8 Dashboard done gate: UI remains responsive during long-running tasks and displays live logs/status.
+- [ ] 16.9 Resource done gate: target runtime stays within practical limits for 6GB VRAM / 8GB RAM baseline.
+- [ ] 16.10 Release done gate: end-to-end tests pass and acceptance checklist is fully checked.

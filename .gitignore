@@ -1,0 +1,35 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and benchmark artifacts
+.pytest_cache/
+.benchmarks/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local runtime data
+logs/
+*.sqlite3
+test_*_logs/
+
+# Local model artifacts
+models/
+*.gguf
+
+# Environment files
+.env
+.env.*
+
+# Editor and OS noise
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

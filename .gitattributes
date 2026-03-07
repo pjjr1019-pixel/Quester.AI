@@ -1,0 +1,7 @@
+* text=auto
+*.py text
+*.md text
+*.txt text
+*.sqlite3 binary
+*.gguf binary
+*.pyc binary
