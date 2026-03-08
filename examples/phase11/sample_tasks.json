@@ -1,0 +1,81 @@
+{
+  "pack_version": "v1",
+  "tasks": [
+    {
+      "sample_id": "storage_layers_comparison",
+      "title": "Default Persistence Layers",
+      "question": "According to the Phase 11 demo pack, what are Quester.AI's two default persistence layers?",
+      "category": "multi_hop_retrieval",
+      "execution_profile": "local_only",
+      "recommended_thinking_minutes": 30,
+      "expected_behavior": "Fast mode usually surfaces only the top storage layer, while deep mode should combine both SQLite and JSONL.",
+      "success_markers": [
+        "sqlite",
+        "jsonl"
+      ],
+      "required_source_refs": [
+        "local://phase11/storage/sqlite",
+        "local://phase11/storage/jsonl"
+      ],
+      "requires_demo_pack": true,
+      "comparison_group": "storage_layers",
+      "comparison_fast_minutes": 1,
+      "comparison_deep_minutes": 30
+    },
+    {
+      "sample_id": "arithmetic_exact",
+      "title": "Arithmetic Exact Check",
+      "question": "What is 19 * (7 - 3)?",
+      "category": "math",
+      "execution_profile": "local_only",
+      "recommended_thinking_minutes": 1,
+      "expected_behavior": "The arithmetic verifier should return the exact answer.",
+      "expected_result": "76",
+      "success_markers": [
+        "76"
+      ]
+    },
+    {
+      "sample_id": "web_runtime_status",
+      "title": "Freshness Web Fallback",
+      "question": "What is the latest runtime status today?",
+      "category": "freshness_web",
+      "execution_profile": "web_fallback",
+      "recommended_thinking_minutes": 30,
+      "expected_behavior": "This sample should trigger bounded web fallback through the stub or configured web adapter.",
+      "uses_web_fallback": true
+    },
+    {
+      "sample_id": "python_code_result",
+      "title": "Python Code Verification",
+      "question": "Given this Python code:\n```python\nbase = 3\nresult = (base * 2) + 2\n```\nPython expression: `result`",
+      "category": "code",
+      "execution_profile": "local_only",
+      "recommended_thinking_minutes": 30,
+      "expected_behavior": "The bounded Python code executor should verify the final answer exactly.",
+      "expected_result": "8",
+      "success_markers": [
+        "8"
+      ]
+    },
+    {
+      "sample_id": "project_aurora_conflict",
+      "title": "Conflicting Evidence Demo",
+      "question": "What single launch month is definitively confirmed across the Project Aurora documents?",
+      "category": "contradiction",
+      "execution_profile": "local_only",
+      "recommended_thinking_minutes": 30,
+      "expected_behavior": "Conflicting demo evidence should produce a degraded or abstained answer instead of a confident unsupported claim.",
+      "required_source_refs": [
+        "local://phase11/aurora/march",
+        "local://phase11/aurora/april"
+      ],
+      "requires_demo_pack": true,
+      "expected_degraded_reason": "conflicting_evidence",
+      "success_markers": [
+        "conflicting_evidence",
+        "insufficient evidence"
+      ]
+    }
+  ]
+}

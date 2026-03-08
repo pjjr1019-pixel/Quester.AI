@@ -7,8 +7,7 @@ import logging
 from config import APP_CONFIG, AppConfig
 from data_structures import EvidenceBundle, Plan, ResourceBudget
 from model_manager import ModelManager
-from research_service import ResearchService
-from storage import StorageManager
+from research_service import ResearchService, ResearchStorage
 from web_adapter import WebSearchAdapter
 
 
@@ -18,15 +17,16 @@ class ResearcherAgent:
     def __init__(
         self,
         model_manager: ModelManager,
-        storage: StorageManager,
+        storage: ResearchStorage,
         config: AppConfig = APP_CONFIG,
         web_adapter: WebSearchAdapter | None = None,
+        service: ResearchService | None = None,
     ):
         self.model_manager = model_manager
         self.storage = storage
         self.config = config
         self.logger = logging.getLogger("quester.researcher")
-        self.service = ResearchService(
+        self.service = service or ResearchService(
             model_manager=model_manager,
             storage=storage,
             config=config,
@@ -44,11 +44,13 @@ class ResearcherAgent:
         self.service.web_adapter = value
 
     async def start(self) -> None:
+        """Mark the agent ready to serve local retrieval requests."""
         if self._started:
             return
         self._started = True
 
     async def stop(self) -> None:
+        """Reset lightweight retrieval state and reject future calls until restarted."""
         await self.service.reset()
         self._started = False
 

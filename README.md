@@ -93,6 +93,27 @@ Pinned defaults from the current decision log:
 - Web fallback provider: bounded MediaWiki API lookup in real mode, deterministic stub adapter in stub mode
 - Vector store target for future retrieval work: local Chroma persistent collection
 
+Current optional specialist-role support:
+- `reranker`: implemented as an opt-in routed local role; the dashboard Settings and Readiness views can enable it without changing the base `generation + embedding` runtime
+- `speech_to_text` and `vad`: implemented as opt-in local voice-input roles with bounded `.wav` processing, deterministic local VAD, a dashboard voice-input tab, stub-mode validation paths, and optional Windows `System.Speech` transcription when available
+- `text_to_speech`: implemented as an opt-in routed local role with bounded `.wav` synthesis output, deterministic stub speech generation for validation, optional Windows `System.Speech` synthesis when available, and audio-tab actions for speaking custom text or the current answer
+- `translation`: implemented as an opt-in routed local role with bounded free-text, answer, and document-style translation in the dashboard Translation tab, deterministic stub translation for validation, and optional Argos Translate routing when installed
+- `code_specialist`: implemented as an opt-in routed local role for bounded file or snippet review in the dashboard Code tab, with deterministic stub maintenance analysis for validation and on-demand unload support
+- The Local AI control-plane panel now surfaces all typed local roles, recent routed decisions, recent fallback reasons, bounded cache status, and recent optimizer suggestions in one place
+- The same panel now exposes per-role quick actions for install guidance, enable/disable, warm, unload, test ping, and fallback inspection without splitting specialist features into separate agent UIs
+- The control plane now also surfaces typed compressor insights with estimated gain, validation state, blocked reasons, and whether a reusable pattern came from deterministic analysis or replay evidence
+
+Pinned lightweight specialist-role defaults:
+- `reranker`: `jinaai/jina-reranker-v1-tiny-en`
+- `speech_to_text`: `whisper.cpp` or `openai/whisper-tiny`
+- `vad`: `Silero VAD`
+- `text_to_speech`: `Piper`
+- `translation`: `Argos Translate`
+- `code_specialist`: `Qwen/Qwen2.5-Coder-1.5B-Instruct`
+
+Phase 20 foundation:
+- `capability_guardrails.py` now codifies the first desktop/control guardrail: future desktop or cloud helpers must extend the current local-first runtime, keep `Orchestrator.run_task(question, thinking_minutes)` as the public task entrypoint, preserve the base `generation + embedding` pair plus local storage and audit path, remain opt-in, and never make cloud helpers the primary execution path.
+
 The code already fails clearly when real-mode prerequisites are missing:
 - missing Ollama service -> backend unavailable/startup error
 - missing `llama-cpp-python` -> startup error
@@ -116,6 +137,19 @@ Key runtime pieces:
 - `retrieval_service.py`: bounded local lexical/vector retrieval policy
 - `dashboard.py`: headless/Tkinter event consumer
 
+## Implementation Workflow
+
+Phase 13 is now codified as a standing workflow, not just roadmap text.
+
+- Review the relevant phase checklist before each implementation pass.
+- Keep each change focused on one subsystem and one primary test surface where practical.
+- Name the target files, required typed contracts, and success tests before coding.
+- Do not start later-phase work until the earlier phase acceptance path is green.
+- Preserve both `stub_mode=true` and `stub_mode=false` behavior on runtime or readiness changes.
+- Keep structured agent outputs typed and validated, with one bounded repair attempt before deterministic fallback.
+
+Use [`IMPLEMENTATION_TASK_TEMPLATE.md`](./IMPLEMENTATION_TASK_TEMPLATE.md) for the repo's standard task brief.
+
 ## Runtime Limits
 
 The repo is designed around bounded resource behavior:
@@ -126,6 +160,14 @@ The repo is designed around bounded resource behavior:
 - bounded dashboard and optimizer queues
 
 Config lives in [`config.py`](./config.py). Runtime choices are locked in [`DECISION_LOG.md`](./DECISION_LOG.md).
+
+Current Phase 12 acceptance thresholds are explicit:
+- validity: at least one verifiable `deep` example must improve with extra bounded test-time compute, final selection must stay verifier-backed, structured degraded outcomes are allowed, and real-mode failures must stay actionable
+- compression: foreground compression is capped at `5` validated proposals per task, scans at most `6` recent reasoning logs in the foreground path, preserves proof-hash stability, and must not regress critic validity
+- resources: the supported bounded baseline remains `1` generation slot, `1` embedding slot, bounded queues, `4 GB VRAM / 8 GB RAM` dev calibration, and `6 GB VRAM / 8 GB RAM` acceptance target
+
+Those thresholds live in [`acceptance_thresholds.py`](./acceptance_thresholds.py) and are locked by
+[`tests/test_phase12_acceptance_thresholds.py`](./tests/test_phase12_acceptance_thresholds.py).
 
 ## Testing
 
@@ -138,6 +180,62 @@ python -m unittest discover -v
 
 Prefer `python -m pytest` over bare `pytest` so the invoked interpreter matches the repo's Python `3.11+` requirement.
 
+Required Phase 16 subsystem gates currently defined:
+
+- Data:
+  `python -m pytest -q tests/test_phase2_contracts.py`
+  `python -m pytest -q tests/test_compatibility_contract.py`
+- Storage:
+  `python -m pytest -q tests/test_phase5_persistence.py`
+  `python -m pytest -q tests/test_compatibility_contract.py`
+- Model:
+  `python -m pytest -q tests/test_phase3_runtime.py`
+  `python -m pytest -q tests/test_phase12_preflight.py`
+  `python -m pytest -q tests/test_compatibility_contract.py`
+- Macro:
+  `python -m pytest -q tests/test_phase6_macro_engine.py`
+  `python -m pytest -q tests/test_compatibility_contract.py`
+- Agent:
+  `python -m pytest -q tests/test_phase12_agent_units.py`
+  `python -m pytest -q tests/test_phase12_end_to_end.py tests/test_phase12_preflight.py`
+  `python -m pytest -q tests/test_compatibility_contract.py`
+- Orchestrator:
+  `python -m pytest -q tests/test_phase16_subsystem_gates.py`
+  `python -m pytest -q tests/test_phase12_end_to_end.py tests/test_phase13_async_safety.py`
+  `python -m pytest -q tests/test_compatibility_contract.py`
+- Optimizer:
+  `python -m pytest -q tests/test_phase12_resource_optimizer.py tests/test_phase5_persistence.py`
+  `python -m pytest -q tests/test_compatibility_contract.py`
+- Dashboard:
+  `python -m pytest -q tests/test_phase16_subsystem_gates.py tests/test_phase12_gui_acceptance.py`
+  `python -m pytest -q tests/test_phase13_async_safety.py tests/test_phase7_boundaries.py`
+  `python -m pytest -q tests/test_compatibility_contract.py`
+
+Each defined subsystem gate requires both its local commands and its
+compatibility command to pass together before the subsystem is marked done.
+The typed gate registry lives in [`validation_gates.py`](./validation_gates.py)
+and is locked by
+[`tests/test_phase16_validation_gates.py`](./tests/test_phase16_validation_gates.py).
+
+Required Phase 16 project-wide gates currently defined:
+
+- Resource:
+  `python -m pytest -q tests/test_phase12_acceptance_thresholds.py`
+  `python -m pytest -q tests/test_phase3_runtime.py tests/test_phase12_resource_optimizer.py tests/test_phase17_long_horizon.py`
+- Pre-release smoke:
+  `python -m pytest -q tests/test_phase12_end_to_end.py`
+  `python -m pytest -q tests/test_phase12_packaged_smoke.py tests/test_phase12_preflight.py`
+- Release:
+  `python -m pytest -q tests/test_phase12_acceptance_thresholds.py tests/test_phase12_end_to_end.py tests/test_phase12_translation_exports.py`
+  `python -m pytest -q tests/test_phase12_packaged_smoke.py tests/test_phase12_gui_acceptance.py tests/test_phase12_preflight.py`
+- Project completion:
+  `python -m pytest -q tests/test_compatibility_contract.py`
+  `python -m pytest -q tests/test_phase12_acceptance_thresholds.py tests/test_phase12_end_to_end.py tests/test_phase12_gui_acceptance.py tests/test_phase12_packaged_smoke.py tests/test_phase12_preflight.py tests/test_phase12_translation_exports.py`
+
+The project-wide gate registry also lives in [`validation_gates.py`](./validation_gates.py)
+and is locked by
+[`tests/test_phase16_project_gates.py`](./tests/test_phase16_project_gates.py).
+
 Test coverage currently includes:
 - typed contract serialization and validation
 - compatibility-contract checks
@@ -146,6 +244,8 @@ Test coverage currently includes:
 - retrieval-service, `FTS5` lexical candidate generation, persistent-vector startup reconciliation, bounded reranking, selective vector-loading behavior, compression-runtime registry persistence, task-scoped selective runtime loading, and seed/demo corpus separation behavior
 - repeatable Phase 6 trace-density benchmarking and fresh-start runtime-lexicon bootstrap regression coverage
 - model manager runtime/fallback/semaphore behavior
+- explicit Phase 16 data, storage, model, macro, agent, orchestrator, optimizer, and dashboard validation-gate definitions
+- explicit Phase 16 resource, pre-release smoke, release, and project-completion gate definitions
 
 ## Limitations
 
@@ -153,7 +253,7 @@ This repo is not feature-complete yet.
 
 Known planned areas:
 - the current real web fallback is intentionally narrow and uses MediaWiki as the default provider
-- the dashboard is still a minimal event console
-- optional structured-output and solver dependencies (`jsonschema`, `outlines`, `msgspec`, `z3-solver`) remain deliberately off the default path
+- packaged Windows onboarding and broader release hardening are still future work
+- `jsonschema` is the first optional structured-output helper; heavier structured-output libraries (`outlines`, `msgspec`) and solver helpers (`z3-solver`) remain deliberately off the default path
 
 The authoritative roadmap is in [`Masterplan.txt`](./Masterplan.txt).

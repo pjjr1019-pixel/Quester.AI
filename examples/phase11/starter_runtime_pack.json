@@ -1,0 +1,49 @@
+{
+  "pack_version": "v1",
+  "opcodes": [
+    {
+      "opcode_name": "contrast",
+      "description": "Compare conflicting demo evidence claims without asserting unsupported certainty.",
+      "category": "reasoning",
+      "version": 1,
+      "is_active": true,
+      "metadata": {
+        "builtin": false,
+        "demo_only": true
+      }
+    },
+    {
+      "opcode_name": "qualify",
+      "description": "Attach a bounded qualifier to a demo answer projection.",
+      "category": "output",
+      "version": 1,
+      "is_active": true,
+      "metadata": {
+        "builtin": false,
+        "demo_only": true
+      }
+    }
+  ],
+  "decoders": [
+    {
+      "decoder_name": "demo_storage_summary",
+      "template": "Storage summary: {value}",
+      "version": 1,
+      "is_active": true,
+      "metadata": {
+        "demo_only": true,
+        "kind": "summary"
+      }
+    },
+    {
+      "decoder_name": "demo_conflict_notice",
+      "template": "Conflict detected: {value}",
+      "version": 1,
+      "is_active": true,
+      "metadata": {
+        "demo_only": true,
+        "kind": "warning"
+      }
+    }
+  ]
+}

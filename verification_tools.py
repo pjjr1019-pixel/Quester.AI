@@ -12,6 +12,15 @@ _ARITHMETIC_PROMPT_RE = re.compile(
     re.IGNORECASE,
 )
 _EVIDENCE_COUNT_RE = re.compile(r"(?:how many|count).*(?:evidence|source)", re.IGNORECASE)
+_CONFLICT_CONSENSUS_RE = re.compile(
+    r"(?:single|definitive(?:ly)?|consensus|agreed?|confirmed across|across .*documents)",
+    re.IGNORECASE,
+)
+_MONTH_RE = re.compile(
+    r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+    re.IGNORECASE,
+)
+_NUMBER_RE = re.compile(r"\b\d+\b")
 _PYTHON_EXPR_PATTERNS = (
     re.compile(r"python(?: expression)?\s*[:\-]\s*`([^`]+)`", re.IGNORECASE),
     re.compile(r"python(?: expression)?\s*[:\-]\s*(.+)$", re.IGNORECASE),
@@ -68,6 +77,16 @@ class EvidenceSupportResult:
 
     score: float
     supporting_evidence_ids: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class EvidenceConflictResult:
+    """Deterministic conflict estimate across retrieved evidence for consensus-style questions."""
+
+    conflict_detected: bool
+    conflicting_values: tuple[str, ...]
+    supporting_evidence_ids: tuple[str, ...]
+    detail: str
 
 
 def evaluate_arithmetic_question(question: str) -> str | None:
@@ -243,6 +262,50 @@ def measure_candidate_agreement(answer_text: str, peer_answers: Iterable[str]) -
     return round(sum(peer_scores) / len(peer_scores), 3)
 
 
+def detect_conflicting_evidence(
+    question: str,
+    evidence_items: Sequence[tuple[str, str]],
+) -> EvidenceConflictResult | None:
+    """Detect simple conflicting months or numeric values for consensus-style questions."""
+    if _CONFLICT_CONSENSUS_RE.search(question.strip()) is None:
+        return None
+    value_to_ids: dict[str, list[str]] = {}
+    for evidence_id, content in evidence_items:
+        for value in _extract_conflict_values(content):
+            ids = value_to_ids.setdefault(value, [])
+            if evidence_id not in ids:
+                ids.append(evidence_id)
+    if len(value_to_ids) >= 2:
+        conflicting_values = tuple(sorted(value_to_ids))
+        supporting_ids = tuple(
+            dict.fromkeys(
+                evidence_id
+                for value in conflicting_values
+                for evidence_id in value_to_ids.get(value, ())
+            )
+        )
+        return EvidenceConflictResult(
+            conflict_detected=True,
+            conflicting_values=conflicting_values,
+            supporting_evidence_ids=supporting_ids,
+            detail="Conflicting evidence values detected: " + ", ".join(conflicting_values),
+        )
+    if len(value_to_ids) == 1:
+        only_value = next(iter(value_to_ids))
+        return EvidenceConflictResult(
+            conflict_detected=False,
+            conflicting_values=(only_value,),
+            supporting_evidence_ids=tuple(value_to_ids[only_value]),
+            detail=f"Consensus evidence value detected: {only_value}",
+        )
+    return EvidenceConflictResult(
+        conflict_detected=False,
+        conflicting_values=(),
+        supporting_evidence_ids=(),
+        detail="No comparable consensus values found in retrieved evidence.",
+    )
+
+
 def normalize_answer_text(value: str) -> str:
     """Normalize lightweight answer text for deterministic comparisons."""
     normalized = " ".join(value.strip().lower().split())
@@ -304,6 +367,15 @@ def _extract_python_code_block(question: str) -> str | None:
     if not code:
         return None
     return "\n".join(line.rstrip() for line in code.splitlines()).strip()
+
+
+def _extract_conflict_values(content: str) -> tuple[str, ...]:
+    lowered = content.lower()
+    months = tuple(dict.fromkeys(match.group(1).lower() for match in _MONTH_RE.finditer(lowered)))
+    if months:
+        return months
+    numbers = tuple(dict.fromkeys(match.group(0) for match in _NUMBER_RE.finditer(content)))
+    return numbers
 
 
 def _execute_bounded_python(code: str) -> dict[str, Any]:

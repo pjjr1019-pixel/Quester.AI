@@ -13,38 +13,53 @@ from typing import Any
 from config import APP_CONFIG, AppConfig
 from data_structures import (
     AgentStatus,
+    BoundedCacheSnapshot,
     CompressedTrace,
     CompressionRuntimeSubset,
     CritiqueResult,
     DecoderEntry,
+    LongHorizonExportBundle,
+    LongHorizonCheckpoint,
+    LongHorizonSession,
     Macro,
+    ModelRegistryView,
     OpcodeEntry,
     OptimizerActivationRecord,
     OptimizerProposalRecord,
     OptimizerReplayEvaluation,
     OptimizerReplaySample,
     OptimizerRollbackRecord,
+    OptimizerSuggestionRecord,
+    OptimizerSuggestionUsageRecord,
     PerformanceMetric,
     ProofHashRecord,
     ReasoningLog,
     RuntimeEvent,
     SymbolTableSnapshot,
     TaskResult,
+    UserSettingsProfile,
     VerifiedDeepTraceExport,
     WebEvidenceRecord,
     coerce_agent_status,
     coerce_compressed_trace,
     coerce_decoder_entry,
+    coerce_long_horizon_checkpoint,
+    coerce_long_horizon_export_bundle,
+    coerce_long_horizon_session,
+    coerce_model_registry_view,
     coerce_optimizer_activation_record,
     coerce_optimizer_proposal_record,
     coerce_optimizer_replay_evaluation,
     coerce_optimizer_replay_sample,
     coerce_optimizer_rollback_record,
+    coerce_optimizer_suggestion_record,
+    coerce_optimizer_suggestion_usage_record,
     coerce_opcode_entry,
     coerce_proof_hash_record,
     coerce_runtime_event,
     coerce_symbol_table_snapshot,
     coerce_task_result,
+    coerce_user_settings_profile,
     coerce_verified_deep_trace_export,
     coerce_web_evidence_record,
 )
@@ -542,6 +557,47 @@ class SourceDocumentRepository(_SQLiteRepository):
                 (source_ref,),
             )
             row = cursor.fetchone()
+        return self._row_to_document(row)
+
+    def list(self) -> tuple[SourceDocumentRecord, ...]:
+        conn = self._conn()
+        with self._lock:
+            cursor = conn.execute(
+                """
+                SELECT
+                    document_id,
+                    source_ref,
+                    title,
+                    content,
+                    content_hash,
+                    metadata_json,
+                    created_at,
+                    updated_at
+                FROM source_documents
+                ORDER BY updated_at DESC, source_ref
+                """
+            )
+            rows = cursor.fetchall()
+        return tuple(
+            document
+            for row in rows
+            if (document := self._row_to_document(row)) is not None
+        )
+
+    def delete(self, document_id: str) -> None:
+        conn = self._conn()
+        with self._lock:
+            conn.execute("DELETE FROM source_documents WHERE document_id = ?", (document_id,))
+            conn.commit()
+
+    def count(self) -> int:
+        conn = self._conn()
+        with self._lock:
+            cursor = conn.execute("SELECT COUNT(*) AS count FROM source_documents")
+            row = cursor.fetchone()
+        return int(row["count"])
+
+    def _row_to_document(self, row: sqlite3.Row | None) -> SourceDocumentRecord | None:
         if row is None:
             return None
         return SourceDocumentRecord(
@@ -554,13 +610,6 @@ class SourceDocumentRepository(_SQLiteRepository):
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
-
-    def count(self) -> int:
-        conn = self._conn()
-        with self._lock:
-            cursor = conn.execute("SELECT COUNT(*) AS count FROM source_documents")
-            row = cursor.fetchone()
-        return int(row["count"])
 
 
 class ChunkRepository(_SQLiteRepository):
@@ -732,6 +781,33 @@ class ChunkRepository(_SQLiteRepository):
             cursor = conn.execute("SELECT COUNT(*) AS count FROM document_chunks")
             row = cursor.fetchone()
         return int(row["count"])
+
+    def count_for_document(self, document_id: str) -> int:
+        conn = self._conn()
+        with self._lock:
+            cursor = conn.execute(
+                "SELECT COUNT(*) AS count FROM document_chunks WHERE document_id = ?",
+                (document_id,),
+            )
+            row = cursor.fetchone()
+        return int(row["count"])
+
+    def update_document_metadata(self, document_id: str, metadata: dict[str, Any]) -> None:
+        conn = self._conn()
+        metadata_json = _json_dumps(metadata)
+        with self._lock:
+            conn.execute(
+                "UPDATE document_chunks SET metadata_json = ? WHERE document_id = ?",
+                (metadata_json, document_id),
+            )
+            conn.commit()
+
+    def delete_document(self, document_id: str) -> None:
+        conn = self._conn()
+        with self._lock:
+            conn.execute("DELETE FROM document_chunks_fts WHERE document_id = ?", (document_id,))
+            conn.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
+            conn.commit()
 
     def _rebuild_fts_index_locked(self, conn: sqlite3.Connection) -> None:
         cursor = conn.execute(
@@ -916,6 +992,30 @@ class VectorEntryRepository(_SQLiteRepository):
             cursor = conn.execute("SELECT COUNT(*) AS count FROM vector_entries")
             row = cursor.fetchone()
         return int(row["count"])
+
+    def delete_document(self, document_id: str) -> None:
+        conn = self._conn()
+        with self._lock:
+            conn.execute("DELETE FROM vector_entries WHERE document_id = ?", (document_id,))
+            conn.commit()
+
+    def get_embedding_model_for_document(self, document_id: str) -> str:
+        conn = self._conn()
+        with self._lock:
+            cursor = conn.execute(
+                """
+                SELECT embedding_model
+                FROM vector_entries
+                WHERE document_id = ?
+                ORDER BY updated_at DESC, chunk_id
+                LIMIT 1
+                """,
+                (document_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return ""
+        return str(row["embedding_model"])
 
     def _row_to_chunk_record(self, row: sqlite3.Row) -> DocumentChunkRecord:
         return DocumentChunkRecord(
@@ -1932,6 +2032,182 @@ class OptimizerRollbackRecordRepository(_SQLiteRepository):
         return tuple(OptimizerRollbackRecord.from_dict(_json_loads(row["payload_json"])) for row in rows)
 
 
+class OptimizerSuggestionRecordRepository(_SQLiteRepository):
+    """Append-only persisted advisory suggestions emitted by the optimizer."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optimizer_suggestion_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                suggestion_id TEXT NOT NULL,
+                cycle_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_suggestion_records_cycle "
+            "ON optimizer_suggestion_records (cycle_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_suggestion_records_suggestion "
+            "ON optimizer_suggestion_records (suggestion_id);"
+        )
+        conn.commit()
+
+    def append_many(self, records: Sequence[OptimizerSuggestionRecord]) -> None:
+        if not records:
+            return
+        conn = self._conn()
+        with self._lock:
+            conn.executemany(
+                """
+                INSERT INTO optimizer_suggestion_records (
+                    suggestion_id,
+                    cycle_id,
+                    kind,
+                    payload_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        record.suggestion_id,
+                        record.cycle_id,
+                        record.kind.value,
+                        _json_dumps(record.to_dict()),
+                        record.created_at.isoformat(),
+                    )
+                    for record in records
+                ],
+            )
+            conn.commit()
+
+    def list(
+        self,
+        *,
+        cycle_id: str | None = None,
+        suggestion_id: str | None = None,
+    ) -> tuple[OptimizerSuggestionRecord, ...]:
+        conn = self._conn()
+        clauses: list[str] = []
+        values: list[str] = []
+        if cycle_id is not None:
+            clauses.append("cycle_id = ?")
+            values.append(cycle_id)
+        if suggestion_id is not None:
+            clauses.append("suggestion_id = ?")
+            values.append(suggestion_id)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cursor = conn.execute(
+                f"""
+                SELECT payload_json
+                FROM optimizer_suggestion_records
+                {where_clause}
+                ORDER BY id
+                """,
+                tuple(values),
+            )
+            rows = cursor.fetchall()
+        return tuple(OptimizerSuggestionRecord.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
+class OptimizerSuggestionUsageRepository(_SQLiteRepository):
+    """Append-only persisted live-usage decisions for advisory suggestions."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optimizer_suggestion_usage_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usage_id TEXT NOT NULL,
+                suggestion_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                disposition TEXT NOT NULL,
+                cycle_index INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_suggestion_usage_session "
+            "ON optimizer_suggestion_usage_records (session_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_optimizer_suggestion_usage_suggestion "
+            "ON optimizer_suggestion_usage_records (suggestion_id);"
+        )
+        conn.commit()
+
+    def append_many(self, records: Sequence[OptimizerSuggestionUsageRecord]) -> None:
+        if not records:
+            return
+        conn = self._conn()
+        with self._lock:
+            conn.executemany(
+                """
+                INSERT INTO optimizer_suggestion_usage_records (
+                    usage_id,
+                    suggestion_id,
+                    session_id,
+                    disposition,
+                    cycle_index,
+                    payload_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        record.usage_id,
+                        record.suggestion_id,
+                        record.session_id,
+                        record.disposition.value,
+                        record.cycle_index,
+                        _json_dumps(record.to_dict()),
+                        record.created_at.isoformat(),
+                    )
+                    for record in records
+                ],
+            )
+            conn.commit()
+
+    def list(
+        self,
+        *,
+        session_id: str | None = None,
+        suggestion_id: str | None = None,
+    ) -> tuple[OptimizerSuggestionUsageRecord, ...]:
+        conn = self._conn()
+        clauses: list[str] = []
+        values: list[str] = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            values.append(session_id)
+        if suggestion_id is not None:
+            clauses.append("suggestion_id = ?")
+            values.append(suggestion_id)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cursor = conn.execute(
+                f"""
+                SELECT payload_json
+                FROM optimizer_suggestion_usage_records
+                {where_clause}
+                ORDER BY id
+                """,
+                tuple(values),
+            )
+            rows = cursor.fetchall()
+        return tuple(OptimizerSuggestionUsageRecord.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
 class StorageManager:
     """Owns local persistence lifecycle and additively exposes specialized repositories."""
 
@@ -1949,6 +2225,8 @@ class StorageManager:
         self._lock = threading.Lock()
         self._vector_index: VectorIndexAdapter | None = None
         self._foreground_task_count = 0
+        self._runtime_event_listeners: list[Callable[[RuntimeEvent], None]] = []
+        self._agent_status_listeners: list[Callable[[AgentStatus], None]] = []
 
         self.events = EventLogRepository(self)
         self.kv = KeyValueRepository(self)
@@ -1970,6 +2248,8 @@ class StorageManager:
         self.optimizer_proposal_records = OptimizerProposalRecordRepository(self)
         self.optimizer_activation_records = OptimizerActivationRecordRepository(self)
         self.optimizer_rollback_records = OptimizerRollbackRecordRepository(self)
+        self.optimizer_suggestion_records = OptimizerSuggestionRecordRepository(self)
+        self.optimizer_suggestion_usage_records = OptimizerSuggestionUsageRepository(self)
         self.retrieval = LocalRetrievalService(
             settings=self.config.retrieval,
             lexical_store=self.chunks,
@@ -2014,6 +2294,8 @@ class StorageManager:
             self.optimizer_proposal_records,
             self.optimizer_activation_records,
             self.optimizer_rollback_records,
+            self.optimizer_suggestion_records,
+            self.optimizer_suggestion_usage_records,
         ):
             repository.create_tables()
 
@@ -2201,16 +2483,36 @@ class StorageManager:
         self.events.append(runtime_event, events_path=self._events_path)
         if runtime_event.stage.startswith("researcher.web_"):
             _append_jsonl(self._web_path, runtime_event.to_dict())
+        for listener in tuple(self._runtime_event_listeners):
+            try:
+                listener(runtime_event)
+            except Exception as exc:  # pragma: no cover - defensive observer guard
+                self.logger.warning("Runtime event listener failed: %s", exc)
 
     async def list_runtime_events(self, *, stage: str | None = None) -> tuple[RuntimeEvent, ...]:
         """Return persisted runtime events in append order."""
         self._require_conn()
         return self.events.list(stage=stage)
 
+    def add_runtime_event_listener(self, listener: Callable[[RuntimeEvent], None]) -> None:
+        """Register a best-effort runtime-event listener."""
+        if listener not in self._runtime_event_listeners:
+            self._runtime_event_listeners.append(listener)
+
+    def add_agent_status_listener(self, listener: Callable[[AgentStatus], None]) -> None:
+        """Register a best-effort agent-status listener."""
+        if listener not in self._agent_status_listeners:
+            self._agent_status_listeners.append(listener)
+
     async def record_agent_status(self, status: AgentStatus | dict[str, Any]) -> None:
         """Persist one typed agent-status update to SQLite and JSONL."""
         agent_status = coerce_agent_status(status)
         self.agent_statuses.append(agent_status, status_path=self._status_path)
+        for listener in tuple(self._agent_status_listeners):
+            try:
+                listener(agent_status)
+            except Exception as exc:  # pragma: no cover - defensive observer guard
+                self.logger.warning("Agent status listener failed: %s", exc)
 
     async def list_agent_statuses(
         self,
@@ -2256,6 +2558,126 @@ class StorageManager:
         """Read and decode a value from kv_store."""
         return self.kv.get(key)
 
+    async def save_user_settings_profile(
+        self,
+        profile: UserSettingsProfile | dict[str, Any],
+    ) -> None:
+        """Persist one named user-settings profile in the KV store."""
+        settings_profile = coerce_user_settings_profile(profile)
+        key = f"user_settings_profile:{settings_profile.profile_name}"
+        profile_names = {
+            str(name)
+            for name in (self.kv.get("user_settings_profile_names") or [])
+            if str(name).strip()
+        }
+        profile_names.add(settings_profile.profile_name)
+        self.kv.set(key, settings_profile.to_dict())
+        self.kv.set("user_settings_profile_names", sorted(profile_names))
+
+    async def load_user_settings_profile(self, profile_name: str = "default") -> UserSettingsProfile | None:
+        """Load one persisted user-settings profile by name."""
+        payload = self.kv.get(f"user_settings_profile:{profile_name}")
+        if payload is None:
+            return None
+        return coerce_user_settings_profile(payload)
+
+    async def list_user_settings_profiles(self) -> tuple[UserSettingsProfile, ...]:
+        """List persisted user-settings profiles in a stable order."""
+        profile_names = tuple(
+            str(name)
+            for name in (self.kv.get("user_settings_profile_names") or [])
+            if str(name).strip()
+        )
+        profiles: list[UserSettingsProfile] = []
+        for profile_name in profile_names:
+            payload = self.kv.get(f"user_settings_profile:{profile_name}")
+            if payload is None:
+                continue
+            profiles.append(coerce_user_settings_profile(payload))
+        return tuple(profiles)
+
+    async def save_long_horizon_session(
+        self,
+        session: LongHorizonSession | dict[str, Any],
+    ) -> None:
+        """Persist one long-horizon session summary in the KV store."""
+        normalized = coerce_long_horizon_session(session)
+        key = f"long_horizon_session:{normalized.session_id}"
+        session_ids = {
+            str(item)
+            for item in (self.kv.get("long_horizon_session_ids") or [])
+            if str(item).strip()
+        }
+        session_ids.add(normalized.session_id)
+        self.kv.set(key, normalized.to_dict())
+        self.kv.set("long_horizon_session_ids", sorted(session_ids))
+
+    async def load_long_horizon_session(self, session_id: str) -> LongHorizonSession | None:
+        """Load one persisted long-horizon session by ID."""
+        payload = self.kv.get(f"long_horizon_session:{session_id}")
+        if payload is None:
+            return None
+        return coerce_long_horizon_session(payload)
+
+    async def list_long_horizon_sessions(self) -> tuple[LongHorizonSession, ...]:
+        """List persisted long-horizon sessions in a stable order."""
+        session_ids = tuple(
+            str(item)
+            for item in (self.kv.get("long_horizon_session_ids") or [])
+            if str(item).strip()
+        )
+        sessions: list[LongHorizonSession] = []
+        for session_id in session_ids:
+            payload = self.kv.get(f"long_horizon_session:{session_id}")
+            if payload is None:
+                continue
+            sessions.append(coerce_long_horizon_session(payload))
+        return tuple(sorted(sessions, key=lambda item: (item.updated_at, item.session_id)))
+
+    async def save_long_horizon_checkpoint(
+        self,
+        checkpoint: LongHorizonCheckpoint | dict[str, Any],
+    ) -> None:
+        """Persist one long-horizon checkpoint in the KV store."""
+        normalized = coerce_long_horizon_checkpoint(checkpoint)
+        key = f"long_horizon_checkpoint:{normalized.session_id}:{normalized.cycle_index}"
+        cycle_key = f"long_horizon_checkpoint_cycles:{normalized.session_id}"
+        stored_cycles = {
+            int(item)
+            for item in (self.kv.get(cycle_key) or [])
+        }
+        stored_cycles.add(normalized.cycle_index)
+        self.kv.set(key, normalized.to_dict())
+        self.kv.set(cycle_key, sorted(stored_cycles))
+
+    async def load_long_horizon_checkpoint(
+        self,
+        session_id: str,
+        cycle_index: int,
+    ) -> LongHorizonCheckpoint | None:
+        """Load one persisted long-horizon checkpoint by session ID and cycle number."""
+        payload = self.kv.get(f"long_horizon_checkpoint:{session_id}:{int(cycle_index)}")
+        if payload is None:
+            return None
+        return coerce_long_horizon_checkpoint(payload)
+
+    async def list_long_horizon_checkpoints(
+        self,
+        session_id: str,
+    ) -> tuple[LongHorizonCheckpoint, ...]:
+        """List persisted checkpoints for one session in cycle order."""
+        cycle_numbers = tuple(
+            int(item)
+            for item in (self.kv.get(f"long_horizon_checkpoint_cycles:{session_id}") or [])
+        )
+        checkpoints: list[LongHorizonCheckpoint] = []
+        for cycle_index in cycle_numbers:
+            payload = self.kv.get(f"long_horizon_checkpoint:{session_id}:{cycle_index}")
+            if payload is None:
+                continue
+            checkpoints.append(coerce_long_horizon_checkpoint(payload))
+        return tuple(sorted(checkpoints, key=lambda item: item.cycle_index))
+
     async def record_task_result(self, result: TaskResult | dict[str, Any]) -> None:
         """Persist the final typed task result snapshot."""
         task_result = coerce_task_result(result)
@@ -2276,6 +2698,22 @@ class StorageManager:
         """Return persisted task results ordered by update time."""
         self._require_conn()
         return self.tasks.list(limit=limit)
+
+    async def export_user_settings_profile(self, profile_name: str, export_path: Path) -> Path:
+        """Write one settings profile to a machine-readable JSON file."""
+        profile = await self.load_user_settings_profile(profile_name)
+        if profile is None:
+            raise ValueError(f"Unknown user settings profile: {profile_name}")
+        ensure_directory(export_path.parent)
+        export_path.write_text(_json_dumps(profile.to_dict()) + "\n", encoding="utf-8")
+        return export_path
+
+    async def import_user_settings_profile(self, import_path: Path) -> UserSettingsProfile:
+        """Load one settings profile from disk and persist it locally."""
+        payload = _json_loads(import_path.read_text(encoding="utf-8"))
+        profile = coerce_user_settings_profile(payload)
+        await self.save_user_settings_profile(profile)
+        return profile
 
     async def enter_foreground_task(self) -> int:
         """Increment the foreground task counter used to freeze activation state."""
@@ -2545,6 +2983,57 @@ class StorageManager:
         self._require_conn()
         return self.optimizer_rollback_records.list(cycle_id=cycle_id, proposal_id=proposal_id)
 
+    async def record_optimizer_suggestion_records(
+        self,
+        records: Sequence[OptimizerSuggestionRecord | dict[str, Any]],
+    ) -> None:
+        """Persist append-only advisory suggestions emitted by the optimizer."""
+        normalized = tuple(coerce_optimizer_suggestion_record(item) for item in records)
+        self.optimizer_suggestion_records.append_many(normalized)
+
+    async def list_optimizer_suggestion_records(
+        self,
+        *,
+        cycle_id: str | None = None,
+        suggestion_id: str | None = None,
+    ) -> tuple[OptimizerSuggestionRecord, ...]:
+        """Return persisted advisory suggestion records in append order."""
+        self._require_conn()
+        return self.optimizer_suggestion_records.list(cycle_id=cycle_id, suggestion_id=suggestion_id)
+
+    async def record_optimizer_suggestion_usage_records(
+        self,
+        records: Sequence[OptimizerSuggestionUsageRecord | dict[str, Any]],
+    ) -> None:
+        """Persist append-only live usage decisions for advisory suggestions."""
+        normalized = tuple(coerce_optimizer_suggestion_usage_record(item) for item in records)
+        self.optimizer_suggestion_usage_records.append_many(normalized)
+
+    async def list_optimizer_suggestion_usage_records(
+        self,
+        *,
+        session_id: str | None = None,
+        suggestion_id: str | None = None,
+    ) -> tuple[OptimizerSuggestionUsageRecord, ...]:
+        """Return persisted advisory usage records in append order."""
+        self._require_conn()
+        return self.optimizer_suggestion_usage_records.list(session_id=session_id, suggestion_id=suggestion_id)
+
+    async def save_model_registry_view(
+        self,
+        registry_view: ModelRegistryView | dict[str, Any],
+    ) -> None:
+        """Persist the latest local-AI registry view for the dashboard/control plane."""
+        normalized = coerce_model_registry_view(registry_view)
+        self.kv.set("model_registry_view", normalized.to_dict())
+
+    async def load_model_registry_view(self) -> ModelRegistryView:
+        """Load the persisted local-AI registry view or return an empty default view."""
+        payload = self.kv.get("model_registry_view")
+        if payload is None:
+            return ModelRegistryView()
+        return coerce_model_registry_view(payload)
+
     async def register_macro(self, macro: Macro) -> None:
         """Persist a versioned macro definition."""
         self.macros.upsert(macro)
@@ -2685,6 +3174,52 @@ class StorageManager:
                 for export_row in exports:
                     handle.write(_json_dumps(coerce_verified_deep_trace_export(export_row).to_dict()) + "\n")
         return exports
+
+    async def export_long_horizon_session_bundle(
+        self,
+        session_id: str,
+        *,
+        export_dir: Path,
+    ) -> LongHorizonExportBundle:
+        """Export one machine-readable long-horizon session plus its checkpoints."""
+        session = await self.load_long_horizon_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown long-horizon session: {session_id}")
+        checkpoints = await self.list_long_horizon_checkpoints(session_id)
+        bundle_dir = Path(export_dir)
+        ensure_directory(bundle_dir)
+
+        session_path = bundle_dir / f"{session_id}_session.json"
+        checkpoints_path = bundle_dir / f"{session_id}_checkpoints.jsonl"
+        verified_trace_export_path = bundle_dir / f"{session_id}_verified_trace.jsonl"
+
+        session_path.write_text(_json_dumps(session.to_dict()) + "\n", encoding="utf-8")
+        with checkpoints_path.open("w", encoding="utf-8") as handle:
+            for checkpoint in checkpoints:
+                handle.write(_json_dumps(checkpoint.to_dict()) + "\n")
+
+        verified_export_path_value = ""
+        result = await self.get_task_result(session.last_task_id) if session.last_task_id else None
+        if result is not None and self._is_verified_deep_task_result(result):
+            export_row = self._build_verified_deep_trace_export(result)
+            verified_trace_export_path.write_text(
+                _json_dumps(export_row.to_dict()) + "\n",
+                encoding="utf-8",
+            )
+            verified_export_path_value = str(verified_trace_export_path)
+
+        bundle = LongHorizonExportBundle(
+            session_id=session.session_id,
+            session_path=str(session_path),
+            checkpoints_path=str(checkpoints_path),
+            verified_trace_export_path=verified_export_path_value,
+        )
+        manifest_path = bundle_dir / f"{session_id}_export_bundle.json"
+        manifest_path.write_text(
+            _json_dumps(coerce_long_horizon_export_bundle(bundle).to_dict()) + "\n",
+            encoding="utf-8",
+        )
+        return bundle
 
     def _is_verified_deep_task_result(self, result: TaskResult) -> bool:
         reasoning_mode = ""
@@ -3016,6 +3551,92 @@ class StorageManager:
         """Return the current persisted chunk count."""
         self._require_conn()
         return self.chunks.count()
+
+    async def list_source_documents(self) -> tuple[SourceDocumentRecord, ...]:
+        """Return persisted source documents ordered by update time."""
+        self._require_conn()
+        return self.documents.list()
+
+    async def get_source_document(self, source_ref: str) -> SourceDocumentRecord | None:
+        """Return one source document by source reference."""
+        self._require_conn()
+        return self.documents.get_by_source_ref(source_ref)
+
+    async def count_document_chunks(self, document_id: str) -> int:
+        """Return the persisted chunk count for one source document."""
+        self._require_conn()
+        return self.chunks.count_for_document(document_id)
+
+    async def get_document_embedding_model(self, document_id: str) -> str:
+        """Return the embedding model name used for one source document."""
+        self._require_conn()
+        return self.vectors.get_embedding_model_for_document(document_id)
+
+    async def remove_document(self, source_ref: str) -> bool:
+        """Remove one source document plus its chunk/vector state."""
+        self._require_conn()
+        document = self.documents.get_by_source_ref(source_ref)
+        if document is None:
+            return False
+        self.chunks.delete_document(document.document_id)
+        self.vectors.delete_document(document.document_id)
+        self.documents.delete(document.document_id)
+        self._require_vector_index().delete_document(document.document_id)
+        return True
+
+    async def set_document_archived(self, source_ref: str, *, archived: bool) -> SourceDocumentRecord | None:
+        """Mark a document archived/unarchived and keep retrieval state aligned."""
+        self._require_conn()
+        document = self.documents.get_by_source_ref(source_ref)
+        if document is None:
+            return None
+        metadata = dict(document.metadata)
+        metadata["archived"] = bool(archived)
+        updated = SourceDocumentRecord(
+            document_id=document.document_id,
+            source_ref=document.source_ref,
+            title=document.title,
+            content=document.content,
+            content_hash=document.content_hash,
+            metadata=metadata,
+            created_at=document.created_at,
+            updated_at=utc_now_iso(),
+        )
+        self.documents.upsert(updated)
+        chunk_metadata = {"title": document.title, **metadata}
+        self.chunks.update_document_metadata(document.document_id, chunk_metadata)
+        if archived:
+            self._require_vector_index().delete_document(document.document_id)
+        else:
+            chunk_records = tuple(
+                chunk
+                for chunk in self.vectors.list_chunk_records()
+                if chunk.document_id == document.document_id
+            )
+            if chunk_records:
+                self._require_vector_index().upsert_chunks(chunk_records)
+        return updated
+
+    async def rebuild_document(
+        self,
+        source_ref: str,
+        *,
+        embed_document: Callable[[str], Awaitable[list[float]]] | None = None,
+        embedding_model_name: str | None = None,
+    ) -> SourceDocumentRecord:
+        """Re-embed one persisted source document and refresh its chunks/index state."""
+        self._require_conn()
+        document = self.documents.get_by_source_ref(source_ref)
+        if document is None:
+            raise ValueError(f"Unknown source document: {source_ref}")
+        return await self.ingest_document(
+            source_ref=document.source_ref,
+            title=document.title,
+            content=document.content,
+            metadata=document.metadata,
+            embed_document=embed_document,
+            embedding_model_name=embedding_model_name,
+        )
 
     def _start_vector_index(self) -> VectorIndexAdapter:
         candidates = [

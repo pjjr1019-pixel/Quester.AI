@@ -63,23 +63,43 @@ class ReasoningService:
         model_manager: ModelManager,
         storage: StorageManager | None = None,
         config: AppConfig = APP_CONFIG,
+        structured_generation: StructuredGenerationService | None = None,
     ):
         self.model_manager = model_manager
         self.storage = storage
         self.config = config
-        self.structured_generation = StructuredGenerationService(model_manager=model_manager, config=config)
+        self.structured_generation = structured_generation or StructuredGenerationService(
+            model_manager=model_manager,
+            config=config,
+        )
         self._last_runtime_subset: CompressionRuntimeSubset | None = None
         self._last_handoff: ResearchReasonerHandoff | None = None
 
     @property
     def last_runtime_subset(self) -> CompressionRuntimeSubset | None:
+        """Return the last active runtime subset loaded for reasoning, if any."""
         return self._last_runtime_subset
 
     @property
     def last_handoff(self) -> ResearchReasonerHandoff | None:
+        """Return the last typed Researcher -> Reasoner handoff, if any."""
         return self._last_handoff
 
     async def reason(self, handoff: ResearchReasonerHandoff) -> CompressedTrace:
+        """Return a typed reasoning trace from one validated handoff.
+
+        Input:
+        - `handoff`: the typed Researcher -> Reasoner boundary payload.
+
+        Output:
+        - A `CompressedTrace` normalized against the active runtime subset and
+          budget limits.
+
+        Failure behavior:
+        - Invalid structured model output gets one repair attempt and then falls
+          back to the deterministic trace builder instead of retrying
+          indefinitely.
+        """
         self._last_handoff = handoff
         runtime_subset = await self._prepare_runtime_subset(handoff)
         self._last_runtime_subset = runtime_subset
@@ -120,6 +140,7 @@ class ReasoningService:
         trace: CompressedTrace,
         budget,
     ) -> ReasonerCriticHandoff:
+        """Build the typed Reasoner -> Critic handoff for downstream review."""
         return ReasonerCriticHandoff.from_inputs(
             plan=plan,
             evidence=evidence,
@@ -1067,6 +1088,15 @@ class ReasoningService:
                 verified = evidence_support_score >= 0.85 or total_score >= 0.78
                 if not verified:
                     degraded_reason = degraded_reason or "no_candidate_met_verification_threshold"
+            if (
+                handoff.reasoning_mode == "deep"
+                and verifier_type == "tool.evidence_grounding"
+                and self._question_prefers_multi_evidence_answer(handoff.plan.question)
+            ):
+                if len(supporting_evidence_ids) > 1:
+                    total_score = round(min(0.97, total_score + 0.08), 3)
+                elif strategy == "top_evidence":
+                    total_score = round(max(0.0, total_score - 0.05), 3)
             scored_candidates.append(
                 {
                     **candidate,
@@ -1303,6 +1333,21 @@ class ReasoningService:
         if len(sentence) <= limit:
             return sentence
         return sentence[: limit - 3].rstrip() + "..."
+
+    def _question_prefers_multi_evidence_answer(self, question: str) -> bool:
+        lowered = question.lower()
+        return any(
+            token in lowered
+            for token in (
+                " both ",
+                " two ",
+                " compare ",
+                " difference ",
+                " versus ",
+                " pair ",
+                " layers",
+            )
+        )
 
     def _extract_trace_answer(self, trace: CompressedTrace) -> str:
         for step in reversed(trace.operation_stream):

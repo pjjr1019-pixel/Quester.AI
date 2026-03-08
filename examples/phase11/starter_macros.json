@@ -1,0 +1,74 @@
+{
+  "pack_version": "v1",
+  "macros": [
+    {
+      "macro_name": "summarize_demo_storage_layers",
+      "expansion": [
+        "lookup demo_storage_a",
+        "lookup demo_storage_b",
+        "bind storage_layers",
+        "emit storage_layers"
+      ],
+      "version": 1,
+      "parameters": [],
+      "opcode_pattern": [
+        "lookup",
+        "bind",
+        "emit"
+      ],
+      "invariants": [
+        "demo_only",
+        "uncertainty_preserving"
+      ],
+      "proof_fingerprint": "demo_storage_layers_v1",
+      "semantic_kind": "demo_reasoning_pattern",
+      "is_active": true,
+      "decoder_template": "demo_storage_summary"
+    },
+    {
+      "macro_name": "compare_aurora_conflict",
+      "expansion": [
+        "lookup aurora_doc_a",
+        "lookup aurora_doc_b",
+        "compare aurora_claims",
+        "emit aurora_conflict"
+      ],
+      "version": 1,
+      "parameters": [],
+      "opcode_pattern": [
+        "lookup",
+        "compare",
+        "emit"
+      ],
+      "invariants": [
+        "demo_only",
+        "uncertainty_preserving"
+      ],
+      "proof_fingerprint": "demo_aurora_conflict_v1",
+      "semantic_kind": "demo_reasoning_pattern",
+      "is_active": true,
+      "decoder_template": "demo_conflict_notice"
+    },
+    {
+      "macro_name": "emit_verified_python_result",
+      "expansion": [
+        "check python_result",
+        "emit python_result"
+      ],
+      "version": 1,
+      "parameters": [],
+      "opcode_pattern": [
+        "check",
+        "emit"
+      ],
+      "invariants": [
+        "bounded_execution",
+        "demo_only"
+      ],
+      "proof_fingerprint": "demo_python_result_v1",
+      "semantic_kind": "demo_reasoning_pattern",
+      "is_active": true,
+      "decoder_template": "verified_answer"
+    }
+  ]
+}

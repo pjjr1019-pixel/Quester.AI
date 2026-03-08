@@ -9,6 +9,13 @@ from typing import Any, Callable, Generic, Mapping, TypeVar
 from config import APP_CONFIG, AppConfig
 from model_manager import ModelManager
 
+try:  # pragma: no cover - optional dependency path
+    from jsonschema import ValidationError as JsonSchemaValidationError
+    from jsonschema import validate as jsonschema_validate
+except Exception:  # pragma: no cover - optional dependency path
+    JsonSchemaValidationError = None
+    jsonschema_validate = None
+
 DecodedType = TypeVar("DecodedType")
 
 
@@ -28,6 +35,7 @@ class StructuredGenerationService:
     """Generate and validate schema-constrained JSON with one bounded repair."""
 
     def __init__(self, model_manager: ModelManager, config: AppConfig = APP_CONFIG):
+        """Store the shared model manager and structured-output tuning config."""
         self.model_manager = model_manager
         self.config = config
 
@@ -40,6 +48,24 @@ class StructuredGenerationService:
         fallback_factory: Callable[[str | None], DecodedType],
         max_tokens: int | None = None,
     ) -> StructuredDecodeResult[DecodedType]:
+        """Return one typed decode result after at most one repair attempt.
+
+        Inputs:
+        - `prompt`: the task-specific structured-generation instruction.
+        - `schema`: the JSON schema the model output must satisfy.
+        - `parser`: converts the validated payload into a typed domain object.
+        - `fallback_factory`: builds the deterministic fallback value when both
+          decode attempts fail.
+
+        Output:
+        - A `StructuredDecodeResult` carrying the typed value plus repair and
+          fallback metadata.
+
+        Failure behavior:
+        - The method never loops indefinitely. It performs one initial decode,
+          one repair attempt, and then returns the fallback value with the parse
+          error captured in the result metadata.
+        """
         request_prompt = self._build_structured_prompt(prompt=prompt, schema=schema)
         raw_text = await self.model_manager.generate(request_prompt, max_tokens=max_tokens)
         parsed, error_message = self._try_parse_payload(raw_text, schema, parser)
@@ -124,6 +150,13 @@ class StructuredGenerationService:
         *,
         path: str = "$",
     ) -> None:
+        if jsonschema_validate is not None and JsonSchemaValidationError is not None:
+            try:
+                jsonschema_validate(instance=payload, schema=schema)
+            except JsonSchemaValidationError as exc:
+                raise ValueError(self._format_jsonschema_error(exc)) from exc
+            return
+
         schema_type = schema.get("type")
         if schema_type == "object":
             if not isinstance(payload, dict):
@@ -176,6 +209,18 @@ class StructuredGenerationService:
         if schema_type == "null":
             if payload is not None:
                 raise ValueError(f"{path} must be null")
+
+    def _format_jsonschema_error(self, exc: Exception) -> str:
+        if JsonSchemaValidationError is None or not isinstance(exc, JsonSchemaValidationError):
+            return str(exc)
+        path = "$"
+        for part in exc.absolute_path:
+            if isinstance(part, int):
+                path += f"[{part}]"
+            else:
+                path += f".{part}"
+        message = exc.message or "schema validation failed"
+        return f"{path}: {message}"
 
     def _extract_json_payload(self, text: str) -> Any:
         trimmed = text.strip()

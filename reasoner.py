@@ -1,4 +1,4 @@
-"""Reasoner agent scaffold."""
+"""Reasoner agent wrapper around the typed reasoning service."""
 
 from __future__ import annotations
 
@@ -22,19 +22,20 @@ if TYPE_CHECKING:
 
 
 class ReasonerAgent:
-    """Produces a compressed-style reasoning trace placeholder."""
+    """Produces typed reasoning traces for downstream critique and translation."""
 
     def __init__(
         self,
         model_manager: ModelManager,
         storage: StorageManager | None = None,
         config: AppConfig = APP_CONFIG,
+        service: ReasoningService | None = None,
     ):
         self.model_manager = model_manager
         self.storage = storage
         self.config = config
         self.logger = logging.getLogger("quester.reasoner")
-        self.service = ReasoningService(model_manager=model_manager, storage=storage, config=config)
+        self.service = service or ReasoningService(model_manager=model_manager, storage=storage, config=config)
         self._started = False
 
     @property
@@ -48,11 +49,13 @@ class ReasonerAgent:
         return self.service.last_handoff
 
     async def start(self) -> None:
+        """Mark the reasoner ready to accept typed handoffs."""
         if self._started:
             return
         self._started = True
 
     async def stop(self) -> None:
+        """Reject future reasoning requests until the reasoner is restarted."""
         self._started = False
 
     async def reason(

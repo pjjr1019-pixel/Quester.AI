@@ -1,17 +1,45 @@
 # Progress Summary
 
-Last updated: March 7, 2026
+Last updated: March 8, 2026
 
 ## Current status
 
 - Phases 0.5, 1, 2, 3, and 4 are complete.
-- The compatibility contract is mostly enforced and covered by tests.
-- Phase 5 is functionally complete except for deferred `sqlite-vec` follow-up, Phase 6 is complete, Phase 7 is functionally complete in stub mode, and Phase 8 is functionally complete in proposal-only mode.
+- The compatibility contract is enforced additively and covered by tests.
+- Phase 5 is complete with `sqlite-vec` intentionally deferred by policy, Phase 6 is complete, Phase 7 is functionally complete in stub mode, Phase 8 is functionally complete in proposal-only mode, and Phases 9, 10, and 11 are complete and reconciled.
 - The optimizer now records proposal lifecycle, activation decisions, rollback snapshots, and verified `deep`-trace exports while keeping live runtime activation blocked by policy.
+- The local Tkinter app shell now includes structured panels for task submission, answer/citations, critique, evidence, provenance, web activity, runtime health, agent status, persisted settings and profiles, task history, knowledge management, readiness, and capability-gating explanations.
+- `jsonschema` is now the first optional structured-output helper on the repo path, while `outlines`, `msgspec`, and `z3-solver` remain deliberately off the default path.
+- Phase 12 acceptance coverage is now materially better across preflight/readiness, GUI state, history/knowledge actions, translation correctness, verified-trace export eligibility, end-to-end examples, and proof/agreement failure paths.
+- Phase 16 gate codification is now complete: the repo has explicit subsystem plus project-wide gates for data, storage, model, macro, agent, orchestrator, optimizer, dashboard, resource, smoke, release, and project-completion checks.
+- Phase 17 is complete and Phase 18 is now complete with a typed local-AI registry, advisory control plane, bounded cache layer, and shared compression prior-scoring path.
+- Phase 19 is now complete: optional reranker, local `speech_to_text`, `vad`, `text_to_speech`, offline `translation`, and `code_specialist` are routed through one typed control plane with app-surface actions, bounded compressor insights, pinned lightweight defaults, and Phase 19 regression coverage while preserving the default `generation + embedding` runtime.
+- Phase 20 is now started: the first local-first desktop/control guardrail is codified and tested so future desktop or cloud helpers must extend the current runtime rather than replace core local execution.
+- The next major implementation target is `20.0.2` plus `20.0.3` and `20.1`: add typed desktop capability contracts while keeping those tiers opt-in before any live computer-control executors land.
 
 ## Completed in the current checkpoint
 
 - Added typed contracts, compatibility tests, and a stable public API surface.
+- Added a typed Phase 16 validation-gate registry so subsystem done gates now name explicit local and compatibility commands instead of living only in roadmap prose.
+- Added explicit Phase 16 agent, orchestrator, and dashboard gates with direct stage-order, typed dashboard-state, and compatibility regressions.
+- Added explicit Phase 16 data, storage, macro, and optimizer gates, plus direct restart-safe storage and optimizer-decision regressions so those gates are backed by executable proof instead of checklist text.
+- Added explicit Phase 16 resource, pre-release smoke, release, and project-completion gates, plus a real-mode packaged launch-ready smoke regression so the remaining project-wide release checks are executable.
+- Added tested Phase 17 long-horizon control behavior: sessions can now pause, resume, cancel, and survive safe shutdown, and long-horizon cycle budgets now throttle under explicit fallback, queue-pressure, and backend-health pressure instead of pushing deeper work blindly.
+- Added a Phase 17 dashboard time-control surface with explicit presets, active pause or resume or cancel actions, live checkpoint progress, elapsed and ETA reporting, and a typed “what extra time bought” summary across evidence, candidates, verification passes, repairs, and confidence gain.
+- Closed the remaining Phase 17 tail: long-horizon runs now record advisor request/accept/reject/defer outcomes in checkpoints and dashboard state, export machine-readable bundles that only include verified final traces, and can early-stop with a structured no-improvement explanation instead of spending the full wall-clock budget blindly.
+- Added the Phase 18 local-AI registry foundation: typed model roles, typed registrations, routed capability decisions, heavy-slot scheduling, sidecar classification, persisted model-registry views, and an integrated dashboard control-plane panel.
+- Added bounded cross-agent advisory and cache integration: the existing runtime event/status surfaces now carry typed optimizer suggestions, model registry state is persisted and surfaced in the app shell, and the shared bounded-cache layer now covers embeddings, retrieval candidates, runtime subsets, strategy artifacts, and compression artifacts.
+- Added shared lightweight compression prior scoring so the compressor and Self-Optimizer can reuse bounded compression-artifact summaries instead of creating a second proposal store.
+- Started Phase 19 specialist-role expansion: `model_manager.py` now applies per-role user settings, reroutes a bounded opt-in reranker role, and keeps reranker plus `speech_to_text` plus `vad` independently enableable, unloadable, and disabled without weakening the base runtime.
+- Surfaced the first Phase 19 specialist controls in the app shell: Settings now persist reranker and `speech_to_text` and `vad` enablement, Readiness now reports specialist-role status, and the Local AI control-plane panel now summarizes one visible registration per role instead of truncating the registry arbitrarily.
+- Added direct Phase 19 regressions for specialist-role routing, bounded reranker behavior, Researcher metadata, and dashboard/control-plane projections.
+- Completed the bounded local voice-input slice of Phase 19: `local_audio.py` now provides WAV-only clipping, deterministic local VAD, transcript normalization, optional Windows `System.Speech` transcription, and stub transcription fallback; the dashboard now exposes a voice-input tab that can transcribe a local audio file and import the transcript into the question box.
+- Closed the current Phase 19 control-plane tail: the integrated Local AI panel now shows all typed local roles, recent routed decisions, recent fallback reasons, and recent optimizer suggestions together, plus per-role install/enable/disable/warm/unload/test/fallback quick actions with typed action reports.
+- Added the optional bounded local `text_to_speech` role: `model_manager.py` now routes and synthesizes local WAV output through stub or Windows `System.Speech`, `local_audio.py` now owns deterministic stub synthesis plus bounded WAV export, and the dashboard Audio tab can synthesize custom text or the current answer into local voice output.
+- Closed the rest of Phase 19: `local_translation.py` now provides bounded local translation through stub or optional Argos routing, `local_code_specialist.py` now provides bounded file or snippet analysis through an opt-in code-specialist role, the dashboard now has Translation and Code tabs, task inspectors now explain specialist-role use plus advisor suggestions, and the Local AI panel now shows typed compressor insights.
+- Pinned and surfaced the recommended lightweight specialist defaults in the runtime guidance and README: `jinaai/jina-reranker-v1-tiny-en`, `whisper.cpp` or `openai/whisper-tiny`, `Silero VAD`, `Piper`, `Argos Translate`, and `Qwen/Qwen2.5-Coder-1.5B-Instruct`.
+- Added `capability_guardrails.py` and `tests/test_phase20_local_first_guardrail.py` so the first Phase 20 rule is executable: desktop or cloud helpers must stay additive to the existing orchestrator, keep `Orchestrator.run_task(question, thinking_minutes)` public, preserve the base local runtime and storage path, remain opt-in, and never make cloud execution primary.
+- Added explicit Phase 12 acceptance thresholds for validity, compression, and bounded resource usage, and wired the current foreground compression caps to that registry.
 - Implemented shared model management, bounded concurrency, backend fallback rules, and health snapshots.
 - Finished Phase 4 budget mapping so `thinking_minutes` changes real planner, researcher, reasoner, and critic behavior.
 - Added a retrieval/storage foundation:
@@ -123,6 +151,44 @@ Last updated: March 7, 2026
   - `orchestrator.py` now marks foreground task entry/exit explicitly so future optimizer activation work cannot mutate the active macro set during a live user run.
   - `self_optimizer.py` now emits a recorded `propose -> simulate -> validate -> activate` lifecycle, logs blocked or rejected activation decisions, prepares rollback snapshots for eligible proposals, defers cycles while foreground work is active, and keeps live activation policy-blocked by default.
   - `tests/test_phase5_persistence.py` and `tests/test_phase7_boundaries.py` now cover lifecycle persistence, verified-trace export, and foreground-safe optimizer deferral.
+- Reconciled the Phase 9 checklist with the real runtime:
+  - `orchestrator.py` already owns the foreground pipeline, keeps `run_task(...)` as the primary entrypoint, keeps `run_pipeline(...)` as a thin compatibility wrapper, persists typed status and event updates, and retries only bounded transient failures.
+  - `dashboard.py` already provides the bounded internal event queue used by the dashboard surface, including overflow visibility through dropped-event markers.
+  - `tests/test_phase7_boundaries.py` now adds explicit cancellation coverage so task cancellation emits `pipeline.cancelled` and clears foreground-task state cleanly.
+- Closed the last Phase 9 orchestration gap and started the Phase 10 app-shell foundation:
+  - `data_structures.py` now defines `RuntimeCondition`, `DashboardRuntimeHealth`, `DashboardTaskState`, `DashboardAppState`, and `UserSettingsProfile` so runtime-condition events, dashboard state, and persisted user settings stay typed.
+  - `orchestrator.py` now emits first-class degraded, fallback, resource-pressure, backpressure, and health-snapshot events, and bootstraps a default persisted user settings profile for the dashboard.
+  - `dashboard.py` now maintains a typed app-state projection, shows a lightweight structured summary pane, and keeps the raw event log as a debug surface instead of the only UI representation.
+  - `storage.py` now persists named user settings profiles through the existing machine-readable KV boundary.
+  - `tests/test_phase5_persistence.py` and `tests/test_phase7_boundaries.py` now cover settings-profile persistence, dashboard app-state projection, and the new runtime-condition event surfaces.
+- Continued Phase 10 from foundation into a usable local app shell:
+  - `dashboard.py` now renders purpose-built Tkinter panels for question input, thinking-time slider, final answer, citations, critique summary, evidence inspection, provenance/runtime subset details, web lookup activity, agent status, runtime health, runtime conditions, settings, and a collapsible raw-event debug pane.
+  - `orchestrator.py` now attaches thread-safe dashboard callbacks for task submission and named settings-profile saves, while keeping dashboard actions routed back through the orchestrator and storage instead of creating a second source of truth.
+  - `storage.py` now fans out persisted runtime events and agent statuses to listeners, so service-level activity such as `researcher.web_lookup` reaches the dashboard app-state path consistently.
+  - `tests/test_phase5_persistence.py` and `tests/test_phase7_boundaries.py` now cover settings-profile persistence, dashboard controller callbacks, and delivery of service-level web lookup events into the dashboard state path.
+- Finished the remaining Phase 10 local-app surfaces:
+  - `data_structures.py` now carries typed task-history, task-inspector, knowledge-source, readiness-check, readiness-report, capability-gating, and richer settings-profile state for the app shell.
+  - `storage.py` now supports source-document listing, archive/unarchive, rebuild, removal, chunk/model summaries, and settings profile import/export in machine-readable form.
+  - `dashboard.py` now includes persisted settings/profile management, task history and run inspector views, a knowledge-library panel with ingest/archive/rebuild/remove actions, a readiness panel, and visible capability-gating explanations for future desktop, observation, and cloud controls.
+  - `orchestrator.py` now bootstraps those app-shell surfaces on startup, routes dashboard refresh/import/export/archive actions back through the runtime, and publishes readiness plus capability-gating state without making the UI a source of truth.
+  - `research_service.py` now excludes archived sources from local retrieval by default so knowledge-library archive actions are retrieval-safe.
+  - `tests/test_phase5_persistence.py` and `tests/test_phase7_boundaries.py` now cover profile import/export, source-library lifecycle, headless dashboard state for history/knowledge/readiness, and orchestrator-driven Phase 10 shell refresh actions.
+- Reconciled the remaining pre-Phase-11 roadmap drift:
+  - `Masterplan.txt` now marks the completed compatibility, deferred-infrastructure, structured-output, and Phase 10 app-shell items correctly instead of leaving stale unchecked boxes behind the real code.
+  - `structured_generation.py` now uses `jsonschema` when available and falls back to the existing lightweight validator when the optional dependency is not installed.
+  - `pyproject.toml` now exposes `jsonschema` as the first optional structured-output dependency without changing the default lightweight install path.
+- Completed Phase 11 demo content and launcher integration:
+  - `examples/phase11/` now ships a versioned opt-in demo pack with a deterministic local demo corpus, five sample tasks, conservative starter macros, a starter runtime add-on pack, and a packaged verified `deep`-trace export fixture.
+  - `phase11_content.py` now validates those fixtures, loads them into storage with demo-only metadata, registers the starter macro/opcode/decoder pack, and exports the packaged verified-trace example through a typed loader boundary.
+  - `orchestrator.py` and `dashboard.py` now surface Phase 11 as a first-class Examples panel with refresh/load/select/run/export actions, plus demo-pack status in app state instead of hiding sample content behind files.
+  - `verification_tools.py`, `critique_service.py`, and `reasoning_service.py` now support the Phase 11 contradiction and `fast` vs `deep` sample behavior with deterministic evidence-conflict detection and a bounded multi-evidence scoring preference in `deep` mode.
+  - `tests/test_phase11_content.py` now covers fixture parsing, demo-pack persistence, example action flow, the packaged export fixture, fully local/web-backed samples, the `fast` vs `deep` comparison pair, and the contradiction/code-verification examples.
+- Added the Phase 12 acceptance-hardening tranche:
+  - `orchestrator.py` now exposes patchable readiness helpers for dependency checks, Ollama service probing, and llama.cpp model-file validation so real-mode readiness is deterministic under test.
+  - `tests/test_phase12_preflight.py` now covers missing `chromadb`, `sentence-transformers`, `llama_cpp`, missing Ollama service, missing llama.cpp model files, stub-mode real-mode blocking, and unsupported future capability toggles.
+  - `tests/test_phase12_gui_acceptance.py` now covers headless dashboard settings round-trip, readiness-state parity, knowledge ingest/archive/rebuild/remove flows, demo-vs-user corpus separation, history browsing, and trace-debug export actions.
+  - `tests/test_phase12_translation_exports.py` now covers translation claim/evidence preservation plus verified-`deep` export eligibility filtering.
+  - `tests/test_phase12_end_to_end.py` now covers end-to-end example questions, `fast` vs `deep` improvement, tool-backed verification, planner fallback, web-timeout degradation, public API checklist assertions, proof-hash stability, candidate-agreement ranking, and provenance or macro-signature failure paths.
 
 ## Phase 5 items completed
 
@@ -165,15 +231,25 @@ Last updated: March 7, 2026
 ## Verified state
 
 - Full test suite passes: `python -m pytest -q --cache-clear`
-- Current passing count: `105 passed`
+- Current passing count: `220 passed`
 
 ## Main gaps remaining
 
-- `5.0.6`: optional `sqlite-vec` secondary adapter
+- Phase 12 now also has constructor-level dependency injection for the main agents plus explicit mocked unit coverage for agent delegation, candidate generation, verifier scoring, abstain handling, dashboard backpressure, deep-mode bounds, and optimizer simulation-before-activation behavior.
+- Phase 12 cleanup is now effectively closed: retrieval no longer carries dead prompt coupling, stale placeholder wording was replaced with phase-accurate capability gating, duplicated orchestrator trace-selection logic was consolidated, and the long-horizon completion path now emits the real aggregated final result.
+- Phase 12 now also has explicit acceptance thresholds in repo artifacts: validity, compression, and bounded resource expectations are no longer implicit checklist text only.
+- Phase 17 is now complete: long-horizon scheduling, control actions, pressure-aware throttling, advisor explainability, bounded validation, machine-readable export bundles, and structured early-stop behavior are all implemented and test-backed.
+- Phase 12 is now functionally complete apart from optional `hypothesis` property-test coverage (`12.15.2`).
+- The remaining Phase 13 async-safety gaps are now closed: dashboard debug draining is bounded per poll, queue overflow keeps explicit eviction/drop markers, and dashboard-triggered background futures are tracked and cancelled during orchestrator shutdown.
+- Phase 13 is now mostly codified in repo artifacts: there is a standing implementation task template, the stub/real-mode split and typed boundary validation are covered by tests, the one-repair structured-output rule is locked, and the main public runtime surface now has explicit docstrings. The remaining open Phase 13 items are `13.3` and `13.9`, which are ongoing design-review guardrails rather than isolated feature patches.
+- The skipped Phase 12 to 14 tail is now mostly reconciled: compatibility fixtures, direct `MacroEngine` coverage, model/resource bounds, structured Planner/Reasoner/Critic behavior, non-placeholder compression, and orchestrator cancellation or retry or warning flow are all reflected in the roadmap; `14.12` remains open because optimizer activation is still proposal-only by policy.
+- Phase 16 is now fully codified in repo artifacts: subsystem and project-wide completion are tied to named validation commands instead of checklist text alone.
+- Phase 18 is now complete: typed model routing, heavy-slot governance, sidecar classification, persisted registry state, integrated control-plane UI, bounded cross-agent advisory flow, and bounded cache sharing are implemented and covered by deterministic tests.
+- Packaged Windows app, onboarding, and release-hardening work are still future-phase items.
+- `7.6.1.1`: `z3-solver` remains intentionally deferred until deterministic contradiction or satisfiability checks become a real Critic requirement.
 
 ## Recommended next steps
 
-1. Expand the dashboard from the current event console into a richer operator view over verifier type, candidate score, repair actions, degraded reasons, replay scores, activation decisions, rollback snapshots, and citations.
-2. Keep live optimizer activation policy-gated and off by default until there is a concrete operator workflow for approval, rollback, and post-activation monitoring.
-3. Keep `5.0.6` deferred infrastructure, not the next coding target.
-4. Keep the real web provider policy unchanged: do not broaden beyond MediaWiki until the persisted evidence/provenance path has seen more use.
+1. Continue Phase 20 with `20.0.2` and `20.0.3`: define typed capability contracts first and keep heavy observation or desktop-control tiers opt-in by default.
+2. Then implement `20.1` to `20.3`: add typed capability contracts, a capability registry, and a policy engine that returns `allowed`, `requires_approval`, `denied`, or `degraded` before any action runs.
+3. Keep `20.4` to `20.7` in the same tranche: dangerous capabilities blocked by default, explicit allowlists, audit records, and stub executors with deterministic tests before OS adapters.

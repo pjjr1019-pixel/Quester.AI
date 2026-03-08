@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
+from typing import Callable
 
+from acceptance_thresholds import PHASE12_ACCEPTANCE_THRESHOLDS
 from agent_schema import compressor_output_schema, parse_compressor_output
 from config import APP_CONFIG, AppConfig
 from data_structures import CompressedTrace, Macro, MacroProposal, ReasoningLog
@@ -19,19 +22,31 @@ class CompressionService:
 
     output_contract = "macro_proposal_list_v1"
     implementation_mode = "deterministic_stub"
+    MAX_FOREGROUND_PROPOSALS = PHASE12_ACCEPTANCE_THRESHOLDS.compression.max_foreground_proposals
 
-    def __init__(self, model_manager: ModelManager, config: AppConfig = APP_CONFIG):
+    def __init__(
+        self,
+        model_manager: ModelManager,
+        config: AppConfig = APP_CONFIG,
+        structured_generation: StructuredGenerationService | None = None,
+        macro_engine_factory: Callable[[], MacroEngine] | None = None,
+    ):
         self.model_manager = model_manager
         self.config = config
-        self.structured_generation = StructuredGenerationService(model_manager=model_manager, config=config)
+        self.structured_generation = structured_generation or StructuredGenerationService(
+            model_manager=model_manager,
+            config=config,
+        )
+        self._macro_engine_factory: Callable[[], MacroEngine] = macro_engine_factory or MacroEngine
 
     async def propose(
         self,
         trace: CompressedTrace,
         logs: list[ReasoningLog],
     ) -> list[MacroProposal]:
+        """Return bounded macro proposals, preferring structured output but preserving deterministic fallback."""
         chain = trace.expanded_preview or trace.tokens
-        engine = MacroEngine()
+        engine = self._macro_engine_factory()
         fallback_proposals = self._build_deterministic_proposals(
             trace=trace,
             chain=tuple(str(item) for item in chain),
@@ -51,13 +66,16 @@ class CompressionService:
             fallback_factory=lambda _error_message: tuple(fallback_proposals),
             max_tokens=self.config.model_tuning.default_max_tokens,
         )
-        if decode_result.used_fallback:
-            return fallback_proposals
-        return self._normalize_structured_proposals(
-            proposals=decode_result.value,
-            engine=engine,
-            fallback_proposals=fallback_proposals,
+        proposals = (
+            fallback_proposals
+            if decode_result.used_fallback
+            else self._normalize_structured_proposals(
+                proposals=decode_result.value,
+                engine=engine,
+                fallback_proposals=fallback_proposals,
+            )
         )
+        return self._apply_prior_scoring(proposals)
 
     def _build_deterministic_proposals(
         self,
@@ -164,7 +182,7 @@ class CompressionService:
         )
         suggestions.sort(key=lambda proposal: proposal.simulation_score, reverse=True)
         if suggestions:
-            return suggestions[:5]
+            return suggestions[: self.MAX_FOREGROUND_PROPOSALS]
 
         token_counts = Counter(trace.tokens)
         for token, count in token_counts.items():
@@ -182,7 +200,7 @@ class CompressionService:
                 example=token,
                 simulation_score=min(1.0, 0.25 + (count / 4.0) + verification_bonus),
             )
-        return suggestions[:5]
+        return suggestions[: self.MAX_FOREGROUND_PROPOSALS]
 
     def _append_validated_proposal(
         self,
@@ -383,3 +401,60 @@ class CompressionService:
             seen_ids.add(proposal.proposal_id)
             normalized.append(engine.validate_macro_proposal(proposal))
         return normalized or fallback_proposals
+
+    def _apply_prior_scoring(self, proposals: list[MacroProposal]) -> list[MacroProposal]:
+        lookup_cache = getattr(self.model_manager, "lookup_cache", None)
+        rescored: list[MacroProposal] = []
+        for proposal in proposals:
+            cached_summary = (
+                lookup_cache("compression_artifacts", proposal.proof_fingerprint or proposal.proposal_id)
+                if callable(lookup_cache)
+                else None
+            )
+            score_bonus = 0.0
+            if isinstance(cached_summary, dict):
+                try:
+                    effectiveness_score = float(cached_summary.get("effectiveness_score", 0.0))
+                    validation_pass_rate = float(cached_summary.get("validation_pass_rate", 0.0))
+                except (TypeError, ValueError):
+                    effectiveness_score = 0.0
+                    validation_pass_rate = 0.0
+                score_bonus = min(
+                    0.12,
+                    max(0.0, effectiveness_score) * 0.08 + max(0.0, validation_pass_rate) * 0.04,
+                )
+            rescored.append(
+                replace(
+                    proposal,
+                    simulation_score=min(1.0, proposal.simulation_score + score_bonus),
+                )
+            )
+        rescored.sort(key=lambda item: item.simulation_score, reverse=True)
+        self._publish_compression_artifact_summaries(rescored)
+        return rescored[: self.MAX_FOREGROUND_PROPOSALS]
+
+    def _publish_compression_artifact_summaries(self, proposals: list[MacroProposal]) -> None:
+        warm_cache = getattr(self.model_manager, "warm_cache", None)
+        if not callable(warm_cache):
+            return
+        for proposal in proposals[: self.MAX_FOREGROUND_PROPOSALS]:
+            warm_cache(
+                "compression_artifacts",
+                proposal.proof_fingerprint or proposal.proposal_id,
+                {
+                    "proposal_id": proposal.proposal_id,
+                    "proof_fingerprint": proposal.proof_fingerprint,
+                    "macro_name": proposal.macro.macro_name,
+                    "effectiveness_score": round(proposal.simulation_score, 3),
+                    "validation_pass_rate": round(float(proposal.validation_passed), 3),
+                    "compression_gain": round(proposal.simulation_score, 3),
+                    "validation_state": "validated" if proposal.validation_passed else "blocked",
+                    "blocked_reason": (
+                        proposal.validation_issues[0] if proposal.validation_issues else "validation_failed"
+                    ) if not proposal.validation_passed else "",
+                    "accepted": bool(proposal.validation_passed),
+                    "evidence_basis": "deterministic_analysis",
+                    "origin_component": "compression_service",
+                    "source": "compression_service",
+                },
+            )

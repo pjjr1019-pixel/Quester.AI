@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -35,14 +36,31 @@ from data_structures import (
     TaskResult,
     TaskState,
 )
+from macro_engine import MacroEngine
+from model_manager import ModelHealthSnapshot, ModelManager
 from orchestrator import Orchestrator
 from planner import PlannerAgent
 from reasoner import ReasonerAgent
 from researcher import ResearcherAgent
+from self_optimizer import SelfOptimizer
 from storage import StorageManager
 
 _FIXTURE_DIR = Path(__file__).parent / "fixtures" / "compatibility"
 _FIXTURE_TIMESTAMP = datetime(2026, 3, 7, 12, 0, tzinfo=UTC)
+
+
+def _unlink_with_retries(path: Path, *, attempts: int = 10, delay_s: float = 0.05) -> None:
+    """Best-effort Windows-friendly file cleanup for test SQLite files."""
+    for attempt in range(attempts):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay_s)
 
 
 def _load_compatibility_fixture(name: str) -> dict[str, object]:
@@ -260,6 +278,8 @@ class CompatibilityPublicApiTests(unittest.TestCase):
     """Verify current public signatures remain stable during migrations."""
 
     def test_agent_and_orchestrator_signatures_match_contract(self) -> None:
+        self.assertEqual(tuple(signature(Orchestrator.start).parameters), ("self",))
+        self.assertEqual(tuple(signature(Orchestrator.stop).parameters), ("self",))
         self.assertEqual(tuple(signature(PlannerAgent.plan).parameters), ("self", "question", "budget"))
         self.assertEqual(
             tuple(signature(ResearcherAgent.research).parameters),
@@ -285,6 +305,38 @@ class CompatibilityPublicApiTests(unittest.TestCase):
             tuple(signature(Orchestrator.run_pipeline).parameters),
             ("self", "question"),
         )
+
+    def test_model_manager_signatures_match_contract(self) -> None:
+        self.assertEqual(tuple(signature(ModelManager.start).parameters), ("self",))
+        self.assertEqual(tuple(signature(ModelManager.stop).parameters), ("self",))
+        self.assertEqual(tuple(signature(ModelManager.generate).parameters), ("self", "prompt", "max_tokens"))
+        self.assertEqual(tuple(signature(ModelManager.embed).parameters), ("self", "text"))
+        self.assertEqual(tuple(signature(ModelManager.embed_query).parameters), ("self", "text"))
+        self.assertEqual(tuple(signature(ModelManager.embed_document).parameters), ("self", "text"))
+        self.assertEqual(tuple(signature(ModelManager.health_snapshot).parameters), ("self",))
+
+    def test_macro_and_optimizer_signatures_match_contract(self) -> None:
+        self.assertEqual(tuple(signature(MacroEngine.compress).parameters), ("self", "steps", "task_id"))
+        self.assertEqual(tuple(signature(MacroEngine.expand).parameters), ("self", "tokens"))
+        self.assertEqual(tuple(signature(MacroEngine.verify_round_trip).parameters), ("self", "trace"))
+        self.assertEqual(tuple(signature(SelfOptimizer.run_cycle).parameters), ("self",))
+
+    def test_dashboard_service_signatures_match_contract(self) -> None:
+        self.assertEqual(tuple(signature(DashboardService.start).parameters), ("self",))
+        self.assertEqual(tuple(signature(DashboardService.stop).parameters), ("self",))
+        self.assertEqual(tuple(signature(DashboardService.app_state_snapshot).parameters), ("self",))
+        self.assertEqual(
+            tuple(signature(DashboardService.attach_controller).parameters),
+            ("self", "submit_task", "save_settings", "perform_action"),
+        )
+        self.assertEqual(tuple(signature(DashboardService.apply_user_settings).parameters), ("self", "profile"))
+        self.assertEqual(
+            tuple(signature(DashboardService.request_task_submission).parameters),
+            ("self", "question", "thinking_minutes"),
+        )
+        self.assertEqual(tuple(signature(DashboardService.request_settings_save).parameters), ("self", "profile"))
+        self.assertEqual(tuple(signature(DashboardService.request_action).parameters), ("self", "action", "payload"))
+        self.assertEqual(tuple(signature(DashboardService.publish_event).parameters), ("self", "event"))
 
 
 class CompatibilityEnumTests(unittest.TestCase):
@@ -331,6 +383,25 @@ class CompatibilityFieldContractTests(unittest.TestCase):
         for name, keys in expected_fields.items():
             payload = examples[name].to_dict()
             self.assertTrue(keys.issubset(payload.keys()), msg=f"Missing compatibility fields for {name}")
+
+    def test_model_health_snapshot_fields_remain_additive(self) -> None:
+        expected_fields = {
+            "started",
+            "generation_backend",
+            "embedding_backend",
+            "active_generation_jobs",
+            "active_embedding_jobs",
+            "last_used_at",
+            "fallback_active",
+            "fallback_reason",
+            "available_ram_gb",
+            "total_ram_gb",
+            "generation_backend_vram_gb",
+            "embedding_backend_vram_gb",
+            "telemetry_enabled",
+            "last_error",
+        }
+        self.assertTrue(expected_fields.issubset(ModelHealthSnapshot.__dataclass_fields__.keys()))
 
 
 class CompatibilitySerializationTests(unittest.TestCase):
@@ -540,7 +611,7 @@ class CompatibilityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.storage.stop()
             self.storage = None
         if self.test_db.exists():
-            self.test_db.unlink()
+            _unlink_with_retries(self.test_db)
         if self.test_logs.exists():
             shutil.rmtree(self.test_logs)
 

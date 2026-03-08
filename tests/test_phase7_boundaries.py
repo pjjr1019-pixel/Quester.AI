@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 from types import SimpleNamespace
@@ -39,13 +40,15 @@ from data_structures import (
     ResourceBudget,
     SourceType,
     SymbolTableSnapshot,
+    UserSettingsProfile,
 )
 from critique_service import CritiqueService
 from dashboard import DashboardService
+from model_manager import ModelHealthSnapshot
 from orchestrator import Orchestrator
 from planner_service import PlannerService
 from reasoning_service import ReasoningService
-from runtime_errors import ModelTimeoutError
+from runtime_errors import ModelTimeoutError, ResourcePressureError
 from self_optimizer import SelfOptimizer
 from translation_service import TranslationService
 
@@ -1095,6 +1098,206 @@ class DashboardBackpressureTests(unittest.TestCase):
         self.assertEqual(event["queue_overflow"], "evicted_oldest")
 
 
+class DashboardAppStateTests(unittest.TestCase):
+    """Verify the dashboard projects a typed app-state from runtime events."""
+
+    def test_dashboard_app_state_tracks_health_task_and_conditions(self) -> None:
+        config = replace(
+            APP_CONFIG,
+            dashboard=replace(APP_CONFIG.dashboard, enable_ui=False),
+        )
+        dashboard = DashboardService(config=config)
+        dashboard.apply_user_settings(
+            UserSettingsProfile(
+                profile_name="quiet",
+                reasoning={"thinking_minutes": 60, "mode": "deep"},
+                ui={"show_debug_pane": False, "app_shell": "tkinter"},
+            )
+        )
+
+        dashboard.publish_event(
+            {
+                "stage": "runtime.health_snapshot",
+                "generation_backend": "stub_generation",
+                "embedding_backend": "stub_embedding",
+                "active_generation_jobs": 0,
+                "active_embedding_jobs": 0,
+                "fallback_active": False,
+                "telemetry_enabled": False,
+            }
+        )
+        dashboard.publish_event(
+            {
+                "stage": "pipeline.received",
+                "question": "What is 2 + 2?",
+                "thinking_minutes": 30,
+            }
+        )
+        dashboard.publish_event(
+            {
+                "stage": "status.updated",
+                "component": "planner",
+                "state": "running",
+                "task_id": "task-1",
+                "severity": "low",
+                "message": "planner started",
+            }
+        )
+        dashboard.publish_event(
+            {
+                "stage": "runtime.degraded",
+                "category": "degraded",
+                "component": "researcher",
+                "reason": "web_fallback_returned_no_results",
+                "severity": "medium",
+                "task_id": "task-1",
+                "metadata": {"web_result_count": 0},
+            }
+        )
+        dashboard.publish_event(
+            {
+                "stage": "pipeline.completed",
+                "task_id": "task-1",
+                "answer_text": "Verified answer: 4.",
+                "citation_refs": ["local://ev-1"],
+                "warning_count": 1,
+                "candidate_trace_count": 1,
+                "critique_result": "valid",
+            }
+        )
+
+        state = dashboard.app_state_snapshot()
+
+        self.assertEqual(state.user_settings.profile_name, "quiet")
+        self.assertEqual(state.runtime_health.generation_backend, "stub_generation")
+        self.assertEqual(state.active_task.question, "What is 2 + 2?")
+        self.assertEqual(state.active_task.answer_text, "Verified answer: 4.")
+        self.assertEqual(state.active_task.citation_refs, ("local://ev-1",))
+        self.assertEqual(state.statuses["planner"].message, "planner started")
+        self.assertEqual(state.recent_conditions[0].reason, "web_fallback_returned_no_results")
+
+    def test_dashboard_controller_callbacks_receive_requests(self) -> None:
+        config = replace(
+            APP_CONFIG,
+            dashboard=replace(APP_CONFIG.dashboard, enable_ui=False),
+        )
+        dashboard = DashboardService(config=config)
+        submitted: list[tuple[str, int]] = []
+        saved_profiles: list[UserSettingsProfile] = []
+        dashboard.attach_controller(
+            submit_task=lambda question, minutes: submitted.append((question, minutes)),
+            save_settings=lambda profile: saved_profiles.append(profile),
+        )
+
+        save_result = dashboard.request_settings_save(
+            UserSettingsProfile(
+                profile_name="local_ui",
+                reasoning={"thinking_minutes": 45, "mode": "deep"},
+                ui={"show_debug_pane": False, "app_shell": "tkinter"},
+            )
+        )
+        run_result = dashboard.request_task_submission("What is 2 + 2?", 45)
+
+        self.assertTrue(save_result)
+        self.assertTrue(run_result)
+        self.assertEqual(submitted, [("What is 2 + 2?", 45)])
+        self.assertEqual(saved_profiles[0].profile_name, "local_ui")
+        self.assertEqual(dashboard.app_state_snapshot().user_settings.profile_name, "local_ui")
+
+    def test_dashboard_tracks_history_knowledge_and_readiness_in_headless_mode(self) -> None:
+        config = replace(
+            APP_CONFIG,
+            dashboard=replace(APP_CONFIG.dashboard, enable_ui=False),
+        )
+        dashboard = DashboardService(config=config)
+
+        dashboard.publish_event(
+            {
+                "stage": "dashboard.settings_profiles_loaded",
+                "profiles": [
+                    UserSettingsProfile(profile_name="default").to_dict(),
+                    UserSettingsProfile(profile_name="deep", reasoning={"thinking_minutes": 90, "mode": "deep"}).to_dict(),
+                ],
+            }
+        )
+        dashboard.publish_event(
+            {
+                "stage": "dashboard.task_history_loaded",
+                "history": [
+                    {
+                        "task_id": "task-history-1",
+                        "question": "What is 2 + 2?",
+                        "answer_preview": "Verified answer: 4.",
+                        "critique_result": "valid",
+                        "warning_count": 0,
+                        "candidate_trace_count": 1,
+                    }
+                ],
+            }
+        )
+        dashboard.publish_event(
+            {
+                "stage": "dashboard.task_detail_loaded",
+                "task": {
+                    "task_id": "task-history-1",
+                    "question": "What is 2 + 2?",
+                    "answer_text": "Verified answer: 4.",
+                    "citation_refs": ["local://sample"],
+                    "optimizer_lifecycle": ["proposal:p1:proposed:0.75"],
+                },
+            }
+        )
+        dashboard.publish_event(
+            {
+                "stage": "dashboard.knowledge_library_loaded",
+                "sources": [
+                    {
+                        "document_id": "doc-1",
+                        "source_ref": "local://knowledge/doc1",
+                        "title": "Knowledge Doc",
+                        "chunk_count": 2,
+                        "embedding_model": "stub-embed",
+                        "archived": False,
+                    }
+                ],
+            }
+        )
+        dashboard.publish_event(
+            {
+                "stage": "dashboard.readiness_loaded",
+                "report": {
+                    "stub_mode_ready": True,
+                    "real_mode_ready": False,
+                    "checks": [
+                        {
+                            "check_id": "stub_mode",
+                            "title": "Stub Mode",
+                            "status": "ready",
+                            "detail": "Stub mode is ready.",
+                        }
+                    ],
+                    "capabilities": [
+                        {
+                            "capability_name": "desktop_control",
+                            "status": "blocked_by_policy",
+                            "reason": "phase_20_21_not_implemented",
+                        }
+                    ],
+                    "guidance": ["Keep heavy capabilities disabled by default."],
+                },
+            }
+        )
+
+        state = dashboard.app_state_snapshot()
+
+        self.assertEqual(tuple(profile.profile_name for profile in state.settings_profiles), ("default", "deep"))
+        self.assertEqual(state.task_history[0].task_id, "task-history-1")
+        self.assertEqual(state.selected_task.citation_refs, ("local://sample",))
+        self.assertEqual(state.knowledge_sources[0].source_ref, "local://knowledge/doc1")
+        self.assertTrue(state.readiness_report.stub_mode_ready)
+        self.assertEqual(state.readiness_report.capabilities[0].capability_name, "desktop_control")
+
+
 class OrchestratorRepairLoopTests(unittest.IsolatedAsyncioTestCase):
     """Verify the orchestrator applies bounded repair actions before finalizing results."""
 
@@ -1229,6 +1432,17 @@ class OrchestratorRepairLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("repair_applied:abstain_due_to_low_grounding", result.warnings)
         self.assertIn("critique_degraded", result.warnings)
 
+        degraded_events = await self.orchestrator.storage.list_runtime_events(stage="runtime.degraded")
+
+        self.assertTrue(degraded_events)
+        self.assertTrue(
+            any(
+                event.payload["component"] == "critic"
+                and event.payload["reason"] == "low_evidence_support"
+                for event in degraded_events
+            )
+        )
+
 
 class OrchestratorRetryTests(unittest.IsolatedAsyncioTestCase):
     """Verify transient component failures are retried once by the orchestrator."""
@@ -1280,6 +1494,164 @@ class OrchestratorRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "ok")
         self.assertEqual(attempts, 2)
+
+    async def test_run_task_cancellation_surfaces_event_and_clears_foreground_count(self) -> None:
+        started = asyncio.Event()
+
+        async def slow_plan(question: str, budget) -> Plan:
+            _ = (question, budget)
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        self.orchestrator.planner.plan = slow_plan
+
+        task = asyncio.create_task(
+            self.orchestrator.run_task("Cancel this task", thinking_minutes=30),
+            name="phase9-cancel-test",
+        )
+        await started.wait()
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        cancelled_events = await self.orchestrator.storage.list_runtime_events(stage="pipeline.cancelled")
+        foreground_count = await self.orchestrator.storage.get_foreground_task_count()
+
+        self.assertEqual(len(cancelled_events), 1)
+        self.assertEqual(cancelled_events[0].payload["question"], "Cancel this task")
+        self.assertEqual(foreground_count, 0)
+
+    async def test_run_component_surfaces_fallback_event_when_model_state_changes(self) -> None:
+        snapshots = iter(
+            (
+                ModelHealthSnapshot(
+                    started=True,
+                    generation_backend="primary_gen",
+                    embedding_backend="primary_embed",
+                    active_generation_jobs=0,
+                    active_embedding_jobs=0,
+                    last_used_at=None,
+                    fallback_active=False,
+                    fallback_reason=None,
+                    available_ram_gb=None,
+                    total_ram_gb=None,
+                    generation_backend_vram_gb=None,
+                    embedding_backend_vram_gb=None,
+                    telemetry_enabled=False,
+                    last_error=None,
+                ),
+                ModelHealthSnapshot(
+                    started=True,
+                    generation_backend="fallback_gen",
+                    embedding_backend="primary_embed",
+                    active_generation_jobs=0,
+                    active_embedding_jobs=0,
+                    last_used_at=None,
+                    fallback_active=True,
+                    fallback_reason="generation fallback activated: low memory",
+                    available_ram_gb=0.9,
+                    total_ram_gb=8.0,
+                    generation_backend_vram_gb=5.8,
+                    embedding_backend_vram_gb=0.1,
+                    telemetry_enabled=False,
+                    last_error="low memory",
+                ),
+            )
+        )
+        self.orchestrator.model_manager.health_snapshot = lambda: next(snapshots)
+
+        async def succeed() -> str:
+            return "ok"
+
+        result = await self.orchestrator._run_component(
+            "reasoner",
+            task_id="task-fallback",
+            start_stage="pipeline.reasoner_started",
+            done_stage="pipeline.reasoner_done",
+            start_payload={"task_id": "task-fallback"},
+            run=succeed,
+        )
+
+        fallback_events = await self.orchestrator.storage.list_runtime_events(stage="runtime.fallback_activated")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(fallback_events), 1)
+        self.assertEqual(fallback_events[0].payload["component"], "model_manager")
+        self.assertEqual(
+            fallback_events[0].payload["reason"],
+            "generation fallback activated: low memory",
+        )
+
+    async def test_run_component_surfaces_resource_pressure_event(self) -> None:
+        async def pressure() -> str:
+            raise ResourcePressureError("available RAM 0.90GB is below headroom 1.00GB")
+
+        with self.assertRaises(ResourcePressureError):
+            await self.orchestrator._run_component(
+                "reasoner",
+                task_id="task-pressure",
+                start_stage="pipeline.reasoner_started",
+                done_stage="pipeline.reasoner_done",
+                start_payload={"task_id": "task-pressure"},
+                run=pressure,
+            )
+
+        pressure_events = await self.orchestrator.storage.list_runtime_events(
+            stage="runtime.resource_pressure_detected"
+        )
+
+        self.assertEqual(len(pressure_events), 1)
+        self.assertEqual(pressure_events[0].payload["component"], "model_manager")
+        self.assertIn("available RAM 0.90GB", pressure_events[0].payload["reason"])
+
+    async def test_dashboard_receives_service_level_web_lookup_events_via_storage(self) -> None:
+        await self.orchestrator.run_task(
+            "What is the latest runtime status today?",
+            thinking_minutes=30,
+        )
+
+        state = self.orchestrator.dashboard.app_state_snapshot()
+
+        self.assertEqual(state.active_task.web_query, "What is the latest runtime status today?")
+        self.assertTrue(state.active_task.used_web_fallback)
+        self.assertTrue(state.active_task.web_source_refs)
+
+    async def test_dashboard_actions_populate_phase10_shell_surfaces(self) -> None:
+        await self.orchestrator.storage.save_user_settings_profile(
+            UserSettingsProfile(
+                profile_name="deep_shell",
+                reasoning={"thinking_minutes": 90, "mode": "deep"},
+            )
+        )
+        await self.orchestrator.storage.ingest_document(
+            source_ref="local://phase10/doc",
+            title="Phase 10 Doc",
+            content="Phase 10 knowledge content used by the local app shell test.",
+            metadata={"corpus_origin": "user_local", "corpus_tier": "user", "archived": False},
+            embed_document=self.orchestrator.model_manager.embed_document,
+            embedding_model_name="stub-embed",
+        )
+        await self.orchestrator.run_task("What is 2 + 2?", thinking_minutes=30)
+
+        await self.orchestrator._run_dashboard_action(
+            action="settings.refresh_profiles",
+            payload={"active_profile_name": "default"},
+        )
+        await self.orchestrator._run_dashboard_action(action="knowledge.refresh", payload={})
+        await self.orchestrator._run_dashboard_action(action="history.refresh", payload={})
+        await self.orchestrator._run_dashboard_action(action="readiness.refresh", payload={})
+
+        state = self.orchestrator.dashboard.app_state_snapshot()
+
+        self.assertIn("deep_shell", tuple(profile.profile_name for profile in state.settings_profiles))
+        self.assertTrue(state.task_history)
+        self.assertEqual(state.selected_task.task_id, state.task_history[0].task_id)
+        self.assertTrue(state.knowledge_sources)
+        self.assertEqual(state.knowledge_sources[0].source_ref, "local://phase10/doc")
+        self.assertTrue(state.readiness_report.checks)
+        self.assertTrue(state.readiness_report.capabilities)
 
 
 class SelfOptimizerCycleTests(unittest.IsolatedAsyncioTestCase):

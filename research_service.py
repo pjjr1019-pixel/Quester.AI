@@ -3,27 +3,58 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any, Protocol
 
 from config import APP_CONFIG, AppConfig
 from data_structures import (
     EvidenceBundle,
     EvidenceItem,
+    ModelRouteDecision,
     Plan,
     ResourceBudget,
     SourceType,
     WebEvidenceRecord,
 )
 from model_manager import ModelManager
-from prompts import RESEARCHER_PROMPT
 from retrieval import stable_hash
 from runtime_errors import WebLookupError
-from storage import StorageManager
 from web_adapter import (
     StubWebSearchAdapter,
     WebSearchAdapter,
     WebSearchResponse,
     WikipediaWebSearchAdapter,
 )
+
+
+class ResearchStorage(Protocol):
+    """Minimal storage surface needed by the retrieval service."""
+
+    async def log_event(self, stage: str, payload: dict[str, Any]) -> None: ...
+
+    async def search_local_chunks(
+        self,
+        *,
+        query_text: str,
+        query_vector: list[float],
+        top_k: int,
+        metadata_exclusions: dict[str, Any] | None = None,
+        allow_rerank: bool = True,
+    ): ...
+
+    async def record_web_evidence_batch(self, records) -> None: ...
+
+    async def count_documents(self) -> int: ...
+
+    async def ingest_document(
+        self,
+        *,
+        source_ref: str,
+        title: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+        embed_document,
+        embedding_model_name: str | None = None,
+    ): ...
 
 
 class ResearchService:
@@ -104,7 +135,7 @@ class ResearchService:
     def __init__(
         self,
         model_manager: ModelManager,
-        storage: StorageManager,
+        storage: ResearchStorage,
         config: AppConfig = APP_CONFIG,
         web_adapter: WebSearchAdapter | None = None,
     ):
@@ -115,15 +146,16 @@ class ResearchService:
         self._seeded = False
 
     async def reset(self) -> None:
+        """Clear per-process seed state so a fresh startup reseeds deterministically."""
         self._seeded = False
 
     async def research(self, plan: Plan, budget: ResourceBudget) -> EvidenceBundle:
-        _ = RESEARCHER_PROMPT
+        """Return a typed evidence bundle using local retrieval before bounded web fallback."""
         await self._ensure_seed_corpus()
 
         question = plan.question
         query_vector = await self.model_manager.embed_query(question)
-        local_results = await self._build_local_results(question, budget, query_vector)
+        local_results, reranker_decision = await self._build_local_results(question, budget, query_vector)
         web_results: tuple[EvidenceItem, ...] = ()
         used_web_fallback = False
         if self._should_use_web_fallback(question, budget, local_results):
@@ -150,6 +182,13 @@ class ResearchService:
                 "used_web_fallback": evidence.used_web_fallback,
                 "retrieval_top_k": budget.retrieval_top_k,
                 "max_web_queries": budget.max_web_queries,
+                "specialist_reranker_used": bool(reranker_decision and reranker_decision.allowed),
+                "specialist_reranker_backend": (
+                    reranker_decision.selected_backend if reranker_decision is not None else ""
+                ),
+                "specialist_reranker_reason": (
+                    reranker_decision.fallback_reason if reranker_decision is not None else ""
+                ),
                 "handoff_contract": self.handoff_contract,
                 "final_text_policy": self.final_text_policy,
             },
@@ -161,16 +200,28 @@ class ResearchService:
         question: str,
         budget: ResourceBudget,
         query_vector: list[float],
-    ) -> tuple[EvidenceItem, ...]:
+    ) -> tuple[tuple[EvidenceItem, ...], ModelRouteDecision | None]:
+        requested_top_k = budget.retrieval_top_k
+        search_top_k = self._local_result_window(budget)
         results = await self.storage.search_local_chunks(
             query_text=question,
             query_vector=query_vector,
-            top_k=budget.retrieval_top_k,
-            metadata_exclusions=self._seed_corpus_exclusions(),
+            top_k=search_top_k,
+            metadata_exclusions=self._default_metadata_exclusions(),
             allow_rerank=self._should_rerank(budget),
         )
+        reranker_decision: ModelRouteDecision | None = None
+        if self._should_rerank(budget):
+            results, reranker_decision = await self.model_manager.rerank_local_results(
+                query_text=question,
+                results=tuple(results),
+                top_k=requested_top_k,
+            )
+        else:
+            results = tuple(results[:requested_top_k])
         evidence_items: list[EvidenceItem] = []
         for rank, result in enumerate(results, start=1):
+            specialist_reranked = bool(reranker_decision and reranker_decision.allowed)
             evidence_items.append(
                 EvidenceItem(
                     id=result.chunk.chunk_id,
@@ -188,12 +239,22 @@ class ResearchService:
                         "combined_score": round(result.combined_score, 3),
                         "rerank_score": round(result.rerank_score, 3),
                         "reranked": result.rerank_score > 0.0,
+                        "specialist_reranked": specialist_reranked,
+                        "specialist_reranker_backend": (
+                            reranker_decision.selected_backend if reranker_decision is not None else ""
+                        ),
+                        "specialist_reranker_model": (
+                            reranker_decision.selected_model_identifier if reranker_decision is not None else ""
+                        ),
+                        "specialist_reranker_reason": (
+                            reranker_decision.fallback_reason if reranker_decision is not None else ""
+                        ),
                         "embedding_model": result.chunk.embedding_model,
                     },
                     vector_preview=result.chunk.vector[:8],
                 )
             )
-        return tuple(evidence_items)
+        return tuple(evidence_items), reranker_decision
 
     async def _build_web_results(
         self,
@@ -328,6 +389,17 @@ class ResearchService:
             and budget.retrieval_top_k >= self.config.retrieval.rerank_min_budget_top_k
         )
 
+    def _local_result_window(self, budget: ResourceBudget) -> int:
+        if not self._should_rerank(budget):
+            return budget.retrieval_top_k
+        return max(
+            budget.retrieval_top_k,
+            min(
+                self.config.retrieval.max_rerank_candidates,
+                budget.retrieval_top_k * 2,
+            ),
+        )
+
     def _should_seed_default_corpus(self) -> bool:
         if not self.config.retrieval.seed_default_corpus:
             return False
@@ -338,16 +410,20 @@ class ResearchService:
             return True
         return self.config.preflight.flags.stub_mode
 
-    def _seed_corpus_exclusions(self) -> dict[str, str] | None:
+    def _default_metadata_exclusions(self) -> dict[str, Any]:
+        exclusions: dict[str, Any] = {"archived": True}
         if (
             self.config.preflight.flags.stub_mode
             or not self.config.retrieval.exclude_seed_corpus_from_live_queries
         ):
-            return None
-        return {
-            "corpus_tier": self.config.retrieval.seed_corpus_tier,
-            "tier": self._SEED_TIER_LEGACY,
-        }
+            return exclusions
+        exclusions.update(
+            {
+                "corpus_tier": self.config.retrieval.seed_corpus_tier,
+                "tier": self._SEED_TIER_LEGACY,
+            }
+        )
+        return exclusions
 
     def _build_web_adapter(self) -> WebSearchAdapter:
         if self.config.preflight.flags.stub_mode and not self.config.web.live_web_in_stub_mode:

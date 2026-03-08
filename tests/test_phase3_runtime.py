@@ -102,6 +102,8 @@ class FakeEmbeddingBackend:
         self.calls = 0
         self.query_calls = 0
         self.document_calls = 0
+        self.max_inflight = 0
+        self._inflight = 0
 
     async def start(self) -> None:
         if self.start_error is not None:
@@ -128,8 +130,13 @@ class FakeEmbeddingBackend:
         if self.embed_error is not None:
             raise self.embed_error
         self.calls += 1
-        await asyncio.sleep(self.delay_s)
-        return vector
+        self._inflight += 1
+        self.max_inflight = max(self.max_inflight, self._inflight)
+        try:
+            await asyncio.sleep(self.delay_s)
+            return vector
+        finally:
+            self._inflight -= 1
 
     async def health(self) -> BackendHealth:
         return BackendHealth(
@@ -256,6 +263,20 @@ class Phase3ModelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(manager.stop)
 
         await asyncio.gather(manager.generate("a"), manager.generate("b"))
+
+        self.assertEqual(backend.max_inflight, 1)
+
+    async def test_embedding_semaphore_limits_concurrency(self) -> None:
+        backend = FakeEmbeddingBackend("slow_embed", delay_s=0.03)
+        manager = ModelManager(
+            config=self._build_config(),
+            generation_backend=FakeGenerationBackend("primary_gen"),
+            embedding_backend=backend,
+        )
+        await manager.start()
+        self.addAsyncCleanup(manager.stop)
+
+        await asyncio.gather(manager.embed("a"), manager.embed("b"))
 
         self.assertEqual(backend.max_inflight, 1)
 

@@ -7,10 +7,14 @@ import logging
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, Callable
 
 from config import APP_CONFIG, AppConfig
 from data_structures import (
     CompressedTrace,
+    CritiqueResult,
+    LongHorizonCheckpoint,
+    LongHorizonSession,
     Macro,
     MacroProposal,
     OptimizerActivationDecision,
@@ -20,8 +24,12 @@ from data_structures import (
     OptimizerReplayEvaluation,
     OptimizerReplaySample,
     OptimizerRollbackRecord,
+    OptimizerSuggestionKind,
+    OptimizerSuggestionRecord,
     PerformanceMetric,
+    ResourceBudget,
     ReasoningLog,
+    TaskResult,
     VerifiedDeepTraceExport,
 )
 from macro_engine import MacroEngine
@@ -33,7 +41,14 @@ from utils import cancel_task, utc_now_iso
 class SelfOptimizer:
     """Runs non-blocking optimization cycles while the app is live."""
 
-    def __init__(self, storage: StorageManager, config: AppConfig = APP_CONFIG):
+    def __init__(
+        self,
+        storage: StorageManager,
+        config: AppConfig = APP_CONFIG,
+        *,
+        cache_lookup: Callable[[str, str], Any | None] | None = None,
+        cache_warm: Callable[[str, str, Any], None] | None = None,
+    ):
         self.storage = storage
         self.config = config
         self.logger = logging.getLogger("quester.self_optimizer")
@@ -41,6 +56,8 @@ class SelfOptimizer:
         self._started = False
         self._stop_event = asyncio.Event()
         self._last_evaluations: tuple[OptimizerReplayEvaluation, ...] = ()
+        self._cache_lookup = cache_lookup
+        self._cache_warm = cache_warm
 
     async def start(self) -> None:
         """Start optimizer loop if enabled."""
@@ -106,6 +123,10 @@ class SelfOptimizer:
         if evaluations:
             await self.storage.record_optimizer_replay_evaluations(evaluations)
             proposals = self._apply_replay_scores(proposals, evaluations)
+        self._publish_compression_artifact_summaries(
+            proposals=tuple(proposals),
+            evaluations=evaluations,
+        )
         proposal_summaries = self._summarize_proposal_states(
             proposals=tuple(proposals),
             evaluations=evaluations,
@@ -164,6 +185,206 @@ class SelfOptimizer:
             limit=self.config.self_optimizer.replay_history_limit,
         )
 
+    async def suggest_for_long_horizon(
+        self,
+        *,
+        session: LongHorizonSession,
+        cycle_index: int,
+        latest_result: TaskResult,
+        checkpoints: tuple[LongHorizonCheckpoint, ...],
+        budget: ResourceBudget,
+    ) -> tuple[OptimizerSuggestionRecord, ...]:
+        """Return bounded typed advice for the next long-horizon cycle."""
+        suggestions: list[OptimizerSuggestionRecord] = []
+        recent_proposals = (await self.storage.list_optimizer_proposal_records())[-8:]
+        candidate_count = len(latest_result.reasoning.candidate_traces)
+        evidence_count = len(latest_result.evidence.local_results) + len(latest_result.evidence.web_results)
+        repair_count = len(latest_result.critique.repair_actions)
+        max_budget = self.config.budget_calibration
+        source_task_ids = tuple(
+            dict.fromkeys(
+                item
+                for item in (
+                    *(checkpoint.task_id for checkpoint in checkpoints[-3:]),
+                    latest_result.task_id,
+                )
+                if str(item).strip()
+            )
+        )
+
+        if latest_result.critique.result != CritiqueResult.VALID and (
+            budget.max_web_queries < max_budget.max_web_queries
+            or budget.retrieval_top_k < max_budget.max_retrieval_top_k
+        ):
+            suggestions.append(
+                self._make_suggestion_record(
+                    cycle_id=f"{session.session_id}:cycle:{cycle_index}",
+                    kind=OptimizerSuggestionKind.RETRIEVAL_STRATEGY,
+                    summary="Refresh retrieval more aggressively on the next bounded cycle.",
+                    rationale=(
+                        "The current cycle ended without a fully valid critique result, so bounded retrieval depth "
+                        "and optional web refresh can increase evidence coverage."
+                    ),
+                    target_components=("researcher", "reasoner"),
+                    confidence=0.74,
+                    source_task_ids=source_task_ids,
+                    metadata={
+                        "budget_delta": {
+                            "retrieval_top_k": 1 if budget.retrieval_top_k < max_budget.max_retrieval_top_k else 0,
+                            "max_web_queries": 1 if budget.max_web_queries < max_budget.max_web_queries else 0,
+                        }
+                    },
+                )
+            )
+        if repair_count > 0 and budget.critic_passes < max_budget.max_critic_passes:
+            suggestions.append(
+                self._make_suggestion_record(
+                    cycle_id=f"{session.session_id}:cycle:{cycle_index}",
+                    kind=OptimizerSuggestionKind.CRITIQUE_HEURISTIC,
+                    summary="Spend one more bounded verifier pass on the next cycle.",
+                    rationale=(
+                        "Repair actions were needed in the current cycle, which is a strong signal that another "
+                        "critic pass is more useful than a larger single prompt."
+                    ),
+                    target_components=("critic",),
+                    confidence=0.71,
+                    source_task_ids=source_task_ids,
+                    metadata={"budget_delta": {"critic_passes": 1}},
+                )
+            )
+        if candidate_count <= 1 and (
+            budget.reasoner_passes < max_budget.max_reasoner_passes or budget.macro_depth < max_budget.max_macro_depth
+        ):
+            suggestions.append(
+                self._make_suggestion_record(
+                    cycle_id=f"{session.session_id}:cycle:{cycle_index}",
+                    kind=OptimizerSuggestionKind.PLANNING_TEMPLATE,
+                    summary="Broaden the next bounded reasoning batch instead of waiting longer.",
+                    rationale=(
+                        "Only one candidate survived this cycle, so adding a small bounded reasoning expansion is "
+                        "more useful than preserving the same narrow search."
+                    ),
+                    target_components=("planner", "reasoner"),
+                    confidence=0.69,
+                    source_task_ids=source_task_ids,
+                    metadata={
+                        "budget_delta": {
+                            "reasoner_passes": 1 if budget.reasoner_passes < max_budget.max_reasoner_passes else 0,
+                            "macro_depth": 1 if budget.macro_depth < max_budget.max_macro_depth else 0,
+                        }
+                    },
+                )
+            )
+        eligible_macro_records = [record for record in recent_proposals if record.activation_eligible]
+        if eligible_macro_records:
+            top_records = sorted(
+                eligible_macro_records,
+                key=lambda record: (
+                    self._compression_effectiveness_score(record.proposal),
+                    record.pass_rate,
+                    record.mean_simulation_score,
+                ),
+                reverse=True,
+            )[:2]
+            suggestions.append(
+                self._make_suggestion_record(
+                    cycle_id=f"{session.session_id}:cycle:{cycle_index}",
+                    kind=OptimizerSuggestionKind.MACRO_ADVICE,
+                    summary="Carry forward the latest replay-approved macro candidates as advisory context.",
+                    rationale=(
+                        "Recent optimizer proposals passed replay gating, but live activation remains policy-blocked, "
+                        "so the next cycle should treat them as explainable deferred advice only."
+                    ),
+                    target_components=("compressor", "reasoner", "critic"),
+                    confidence=0.66,
+                    source_task_ids=source_task_ids,
+                    metadata={
+                        "proposal_ids": tuple(record.proposal_id for record in top_records),
+                        "proof_fingerprints": tuple(record.proposal.proof_fingerprint for record in top_records),
+                        "budget_delta": {},
+                        "advisory_only_reason": "proposal_only_policy",
+                    },
+                )
+            )
+        if not suggestions and evidence_count > 0:
+            suggestions.append(
+                self._make_suggestion_record(
+                    cycle_id=f"{session.session_id}:cycle:{cycle_index}",
+                    kind=OptimizerSuggestionKind.DASHBOARD_HINT,
+                    summary="Keep the next cycle bounded; the current evidence set is already materially populated.",
+                    rationale=(
+                        "No stronger optimizer hint was discovered, so the safest advisory action is to preserve the "
+                        "current bounded schedule and surface that choice explicitly."
+                    ),
+                    target_components=("dashboard",),
+                    confidence=0.6,
+                    source_task_ids=source_task_ids,
+                    metadata={"budget_delta": {}},
+                )
+            )
+        return tuple(suggestions[: min(4, self.config.self_optimizer.proposal_limit)])
+
+    def _compression_effectiveness_score(self, proposal: MacroProposal) -> float:
+        if self._cache_lookup is None:
+            return 0.0
+        cache_key = proposal.proof_fingerprint or proposal.proposal_id
+        cached_summary = self._cache_lookup("compression_artifacts", cache_key)
+        if not isinstance(cached_summary, dict):
+            return 0.0
+        try:
+            return float(cached_summary.get("effectiveness_score", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _publish_compression_artifact_summaries(
+        self,
+        *,
+        proposals: tuple[MacroProposal, ...],
+        evaluations: tuple[OptimizerReplayEvaluation, ...],
+    ) -> None:
+        if self._cache_warm is None:
+            return
+        evaluation_by_proposal_id = {item.proposal_id: item for item in evaluations}
+        for proposal in proposals[: self.config.self_optimizer.proposal_limit]:
+            evaluation = evaluation_by_proposal_id.get(proposal.proposal_id)
+            summary = {
+                "proposal_id": proposal.proposal_id,
+                "proof_fingerprint": proposal.proof_fingerprint,
+                "macro_name": proposal.macro.macro_name,
+                "effectiveness_score": round(
+                    evaluation.aggregate_score if evaluation is not None else proposal.simulation_score,
+                    3,
+                ),
+                "validation_pass_rate": round(
+                    evaluation.critique_validity if evaluation is not None else float(proposal.validation_passed),
+                    3,
+                ),
+                "compression_gain": round(
+                    evaluation.compression_gain if evaluation is not None else proposal.simulation_score,
+                    3,
+                ),
+                "accepted": bool(evaluation.accepted) if evaluation is not None else bool(proposal.validation_passed),
+                "validation_state": (
+                    "validated"
+                    if (evaluation.accepted if evaluation is not None else proposal.validation_passed)
+                    else "blocked"
+                ),
+                "blocked_reason": (
+                    evaluation.rejection_reason
+                    if evaluation is not None and evaluation.rejection_reason
+                    else (
+                        proposal.validation_issues[0]
+                        if proposal.validation_issues and not proposal.validation_passed
+                        else ""
+                    )
+                ),
+                "evidence_basis": "replay_evidence",
+                "origin_component": "self_optimizer",
+                "source": "self_optimizer",
+            }
+            cache_key = proposal.proof_fingerprint or proposal.proposal_id
+            self._cache_warm("compression_artifacts", cache_key, summary)
+
     async def _load_reasoning_logs(self) -> tuple[ReasoningLog, ...]:
         payloads = await self.storage.list_reasoning_history()
         logs: list[ReasoningLog] = []
@@ -182,6 +403,41 @@ class SelfOptimizer:
         if len(samples) <= limit:
             return samples
         return samples[-limit:]
+
+    def _make_suggestion_record(
+        self,
+        *,
+        cycle_id: str,
+        kind: OptimizerSuggestionKind,
+        summary: str,
+        rationale: str,
+        target_components: tuple[str, ...],
+        confidence: float,
+        source_task_ids: tuple[str, ...],
+        metadata: dict[str, object],
+    ) -> OptimizerSuggestionRecord:
+        seed = "|".join(
+            (
+                cycle_id,
+                kind.value,
+                summary,
+                ",".join(target_components),
+                ",".join(source_task_ids),
+                repr(sorted(metadata.items())),
+            )
+        )
+        return OptimizerSuggestionRecord(
+            suggestion_id=f"suggestion:{stable_hash(seed)[:16]}",
+            cycle_id=cycle_id,
+            kind=kind,
+            summary=summary,
+            rationale=rationale,
+            target_components=target_components,
+            source_task_ids=source_task_ids,
+            confidence=confidence,
+            advisory_only=True,
+            metadata=metadata,
+        )
 
     def _build_cycle_id(
         self,

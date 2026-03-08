@@ -18,12 +18,21 @@ class PlannerService:
     output_contract = "planner_plan_v1"
     implementation_mode = "deterministic_stub"
 
-    def __init__(self, model_manager: ModelManager, config: AppConfig = APP_CONFIG):
+    def __init__(
+        self,
+        model_manager: ModelManager,
+        config: AppConfig = APP_CONFIG,
+        structured_generation: StructuredGenerationService | None = None,
+    ):
         self.model_manager = model_manager
         self.config = config
-        self.structured_generation = StructuredGenerationService(model_manager=model_manager, config=config)
+        self.structured_generation = structured_generation or StructuredGenerationService(
+            model_manager=model_manager,
+            config=config,
+        )
 
     async def plan(self, question: str, budget: ResourceBudget) -> Plan:
+        """Return a typed plan, falling back to a bounded deterministic plan on schema failure."""
         prompt = (
             f"{PLANNER_PROMPT}\n"
             f"Question: {question}\n"

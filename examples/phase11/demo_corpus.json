@@ -1,0 +1,53 @@
+{
+  "pack_version": "v1",
+  "documents": [
+    {
+      "source_ref": "local://phase11/storage/sqlite",
+      "title": "Phase 11 Storage Layer: SQLite",
+      "content": "In the Phase 11 demo pack, one of Quester.AI's two default persistence layers is SQLite, which stores task runs, settings profiles, and knowledge metadata.",
+      "metadata": {
+        "topic": "storage",
+        "demo_task_category": "multi_hop_retrieval"
+      },
+      "sample_task_ids": [
+        "storage_layers_comparison"
+      ]
+    },
+    {
+      "source_ref": "local://phase11/storage/jsonl",
+      "title": "Phase 11 Storage Layer: JSONL",
+      "content": "In the Phase 11 demo pack, the other default persistence layer is JSONL, which mirrors append-only runtime events, traces, and status history.",
+      "metadata": {
+        "topic": "storage",
+        "demo_task_category": "multi_hop_retrieval"
+      },
+      "sample_task_ids": [
+        "storage_layers_comparison"
+      ]
+    },
+    {
+      "source_ref": "local://phase11/aurora/march",
+      "title": "Project Aurora Demo Note A",
+      "content": "Project Aurora launch month is March according to Phase 11 demo note A.",
+      "metadata": {
+        "topic": "conflict",
+        "demo_task_category": "contradiction"
+      },
+      "sample_task_ids": [
+        "project_aurora_conflict"
+      ]
+    },
+    {
+      "source_ref": "local://phase11/aurora/april",
+      "title": "Project Aurora Demo Note B",
+      "content": "Project Aurora launch month is April according to Phase 11 demo note B.",
+      "metadata": {
+        "topic": "conflict",
+        "demo_task_category": "contradiction"
+      },
+      "sample_task_ids": [
+        "project_aurora_conflict"
+      ]
+    }
+  ]
+}

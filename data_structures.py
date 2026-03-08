@@ -104,6 +104,18 @@ class TaskState(str, Enum):
     FAILED = "failed"
 
 
+class LongHorizonSessionState(str, Enum):
+    """Lifecycle state for long-horizon checkpointed task sessions."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    CHECKPOINTED = "checkpointed"
+    PAUSED = "paused"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class SeverityLevel(str, Enum):
     """Severity values for issues and diagnostics."""
 
@@ -144,6 +156,57 @@ class OptimizerActivationDecision(str, Enum):
     ROLLED_BACK = "rolled_back"
 
 
+class OptimizerSuggestionKind(str, Enum):
+    """Typed advisory categories emitted by the optimizer."""
+
+    MACRO_ADVICE = "macro_advice"
+    RETRIEVAL_STRATEGY = "retrieval_strategy"
+    PLANNING_TEMPLATE = "planning_template"
+    CRITIQUE_HEURISTIC = "critique_heuristic"
+    DASHBOARD_HINT = "dashboard_hint"
+    MODEL_LOADING = "model_loading"
+    CACHE_PREFETCH = "cache_prefetch"
+
+
+class OptimizerSuggestionDisposition(str, Enum):
+    """Lifecycle disposition for one advisory suggestion in a foreground run."""
+
+    REQUESTED = "requested"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    DEFERRED = "deferred"
+
+
+class ModelRole(str, Enum):
+    """Typed local-model roles supported by the registry and router."""
+
+    GENERATION = "generation"
+    EMBEDDING = "embedding"
+    RERANKER = "reranker"
+    SPEECH_TO_TEXT = "speech_to_text"
+    TEXT_TO_SPEECH = "text_to_speech"
+    VAD = "vad"
+    TRANSLATION = "translation"
+    CODE_SPECIALIST = "code_specialist"
+    VISION = "vision"
+    SPECIALIST_PERCEPTION = "specialist_perception"
+
+
+class ModelResourceClass(str, Enum):
+    """Resource classification used by the model scheduler."""
+
+    HEAVY = "heavy"
+    SIDECAR = "sidecar"
+
+
+class ModelLoadPolicy(str, Enum):
+    """Preferred runtime loading strategy for one registered model."""
+
+    ALWAYS_ON = "always_on"
+    ON_DEMAND = "on_demand"
+    PREFER_IDLE_UNLOAD = "prefer_idle_unload"
+
+
 @dataclass(slots=True, frozen=True)
 class ResourceBudget(DictSerializable):
     """Budget envelope attached to a single task."""
@@ -153,6 +216,13 @@ class ResourceBudget(DictSerializable):
     reasoner_passes: int = 1
     critic_passes: int = 1
     macro_depth: int = 2
+    wall_clock_minutes: int = 1
+    cycle_budget_minutes: int = 1
+    checkpoint_interval_minutes: int = 1
+    duty_cycle_ratio: float = 1.0
+    cooldown_seconds: float = 0.0
+    max_resume_count: int = 0
+    planned_cycles: int = 1
 
     def __post_init__(self) -> None:
         _require(self.retrieval_top_k > 0, "retrieval_top_k must be positive.")
@@ -160,6 +230,21 @@ class ResourceBudget(DictSerializable):
         _require(self.reasoner_passes > 0, "reasoner_passes must be positive.")
         _require(self.critic_passes > 0, "critic_passes must be positive.")
         _require(self.macro_depth > 0, "macro_depth must be positive.")
+        _require(self.wall_clock_minutes > 0, "wall_clock_minutes must be positive.")
+        _require(self.cycle_budget_minutes > 0, "cycle_budget_minutes must be positive.")
+        _require(self.checkpoint_interval_minutes > 0, "checkpoint_interval_minutes must be positive.")
+        _require(0.0 < self.duty_cycle_ratio <= 1.0, "duty_cycle_ratio must be between 0 and 1.")
+        _require(self.cooldown_seconds >= 0.0, "cooldown_seconds must be zero or positive.")
+        _require(self.max_resume_count >= 0, "max_resume_count must be zero or positive.")
+        _require(self.planned_cycles > 0, "planned_cycles must be positive.")
+        _require(
+            self.cycle_budget_minutes <= self.wall_clock_minutes,
+            "cycle_budget_minutes must not exceed wall_clock_minutes.",
+        )
+        _require(
+            self.checkpoint_interval_minutes <= self.cycle_budget_minutes,
+            "checkpoint_interval_minutes must not exceed cycle_budget_minutes.",
+        )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ResourceBudget:
@@ -169,6 +254,13 @@ class ResourceBudget(DictSerializable):
             reasoner_passes=int(data.get("reasoner_passes", 1)),
             critic_passes=int(data.get("critic_passes", 1)),
             macro_depth=int(data.get("macro_depth", 2)),
+            wall_clock_minutes=int(data.get("wall_clock_minutes", 1)),
+            cycle_budget_minutes=int(data.get("cycle_budget_minutes", 1)),
+            checkpoint_interval_minutes=int(data.get("checkpoint_interval_minutes", 1)),
+            duty_cycle_ratio=float(data.get("duty_cycle_ratio", 1.0)),
+            cooldown_seconds=float(data.get("cooldown_seconds", 0.0)),
+            max_resume_count=int(data.get("max_resume_count", 0)),
+            planned_cycles=int(data.get("planned_cycles", 1)),
         )
 
 
@@ -740,6 +832,83 @@ class OptimizerRollbackRecord(DictSerializable):
             },
             reason=str(data.get("reason", "")),
             applied=bool(data.get("applied", False)),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class OptimizerSuggestionRecord(DictSerializable):
+    """Typed advisory suggestion persisted for foreground explainability and reuse."""
+
+    suggestion_id: str
+    cycle_id: str
+    kind: OptimizerSuggestionKind
+    summary: str
+    rationale: str = ""
+    target_components: tuple[str, ...] = ()
+    source_task_ids: tuple[str, ...] = ()
+    confidence: float = 0.0
+    advisory_only: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.suggestion_id.strip()), "OptimizerSuggestionRecord.suggestion_id must not be empty.")
+        _require(bool(self.cycle_id.strip()), "OptimizerSuggestionRecord.cycle_id must not be empty.")
+        _require(bool(self.summary.strip()), "OptimizerSuggestionRecord.summary must not be empty.")
+        _require(0.0 <= self.confidence <= 1.0, "OptimizerSuggestionRecord.confidence must be between 0 and 1.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OptimizerSuggestionRecord:
+        return cls(
+            suggestion_id=str(data["suggestion_id"]),
+            cycle_id=str(data["cycle_id"]),
+            kind=_parse_enum(OptimizerSuggestionKind, data.get("kind", OptimizerSuggestionKind.MACRO_ADVICE)),
+            summary=str(data.get("summary", "")),
+            rationale=str(data.get("rationale", "")),
+            target_components=tuple(str(item) for item in data.get("target_components", ())),
+            source_task_ids=tuple(str(item) for item in data.get("source_task_ids", ())),
+            confidence=float(data.get("confidence", 0.0) or 0.0),
+            advisory_only=bool(data.get("advisory_only", True)),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class OptimizerSuggestionUsageRecord(DictSerializable):
+    """Append-only usage record for one advisory suggestion during a live task."""
+
+    usage_id: str
+    suggestion_id: str
+    session_id: str
+    disposition: OptimizerSuggestionDisposition
+    cycle_index: int = 0
+    task_id: str = ""
+    reason: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.usage_id.strip()), "OptimizerSuggestionUsageRecord.usage_id must not be empty.")
+        _require(bool(self.suggestion_id.strip()), "OptimizerSuggestionUsageRecord.suggestion_id must not be empty.")
+        _require(bool(self.session_id.strip()), "OptimizerSuggestionUsageRecord.session_id must not be empty.")
+        _require(self.cycle_index >= 0, "OptimizerSuggestionUsageRecord.cycle_index must be zero or positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OptimizerSuggestionUsageRecord:
+        return cls(
+            usage_id=str(data["usage_id"]),
+            suggestion_id=str(data["suggestion_id"]),
+            session_id=str(data["session_id"]),
+            disposition=_parse_enum(
+                OptimizerSuggestionDisposition,
+                data.get("disposition", OptimizerSuggestionDisposition.REQUESTED),
+            ),
+            cycle_index=int(data.get("cycle_index", 0)),
+            task_id=str(data.get("task_id", "")),
+            reason=str(data.get("reason", "")),
+            metadata=dict(data.get("metadata", {})),
             created_at=_parse_datetime(data.get("created_at", utc_now())),
         )
 
@@ -2389,6 +2558,1603 @@ class AgentStatus(DictSerializable):
         )
 
 
+@dataclass(slots=True, frozen=True)
+class RuntimeCondition(DictSerializable):
+    """Machine-readable runtime condition surfaced through the event stream."""
+
+    stage: str
+    category: str
+    component: str
+    reason: str
+    severity: SeverityLevel = SeverityLevel.MEDIUM
+    task_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    observed_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.stage.strip()), "RuntimeCondition.stage must not be empty.")
+        _require(bool(self.category.strip()), "RuntimeCondition.category must not be empty.")
+        _require(bool(self.component.strip()), "RuntimeCondition.component must not be empty.")
+        _require(bool(self.reason.strip()), "RuntimeCondition.reason must not be empty.")
+
+    def to_event_payload(self) -> dict[str, Any]:
+        """Return the event payload shape shared across runtime surfaces."""
+        return {
+            "category": self.category,
+            "component": self.component,
+            "reason": self.reason,
+            "severity": self.severity.value,
+            "task_id": self.task_id,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_event(
+        cls,
+        stage: str,
+        payload: Mapping[str, Any],
+        *,
+        timestamp: datetime | str | None = None,
+    ) -> RuntimeCondition:
+        return cls(
+            stage=stage,
+            category=str(payload.get("category", "runtime")),
+            component=str(payload.get("component", "runtime")),
+            reason=str(payload.get("reason", "unknown")),
+            severity=_parse_enum(SeverityLevel, payload.get("severity", SeverityLevel.MEDIUM)),
+            task_id=payload.get("task_id"),
+            metadata=dict(payload.get("metadata", {})),
+            observed_at=_parse_datetime(timestamp or payload.get("observed_at", utc_now())),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> RuntimeCondition:
+        return cls(
+            stage=str(data["stage"]),
+            category=str(data["category"]),
+            component=str(data["component"]),
+            reason=str(data["reason"]),
+            severity=_parse_enum(SeverityLevel, data.get("severity", SeverityLevel.MEDIUM)),
+            task_id=data.get("task_id"),
+            metadata=dict(data.get("metadata", {})),
+            observed_at=_parse_datetime(data.get("observed_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class LongHorizonCandidateSnapshot(DictSerializable):
+    """Compact persisted candidate summary stored in long-horizon checkpoints."""
+
+    candidate_id: str
+    strategy: str = ""
+    verifier_type: str = ""
+    verified: bool = False
+    total_score: float = 0.0
+    degraded_reason: str = ""
+    supporting_evidence_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require(bool(self.candidate_id.strip()), "LongHorizonCandidateSnapshot.candidate_id must not be empty.")
+        _require(0.0 <= self.total_score <= 1.0, "LongHorizonCandidateSnapshot.total_score must be between 0 and 1.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> LongHorizonCandidateSnapshot:
+        return cls(
+            candidate_id=str(data["candidate_id"]),
+            strategy=str(data.get("strategy", "")),
+            verifier_type=str(data.get("verifier_type", "")),
+            verified=bool(data.get("verified", False)),
+            total_score=float(data.get("total_score", 0.0)),
+            degraded_reason=str(data.get("degraded_reason", "")),
+            supporting_evidence_ids=tuple(str(item) for item in data.get("supporting_evidence_ids", ())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class LongHorizonCheckpoint(DictSerializable):
+    """Persisted checkpoint emitted after one bounded long-horizon work cycle."""
+
+    session_id: str
+    cycle_index: int
+    total_cycles: int
+    task_id: str
+    question: str
+    budget: ResourceBudget
+    candidate_summaries: tuple[LongHorizonCandidateSnapshot, ...] = ()
+    selected_candidate_id: str = ""
+    supporting_evidence_ids: tuple[str, ...] = ()
+    refreshed_web_source_refs: tuple[str, ...] = ()
+    critique_result: str = ""
+    critique_summary: tuple[str, ...] = ()
+    repair_actions: tuple[str, ...] = ()
+    answer_preview: str = ""
+    resume_count: int = 0
+    throttled: bool = False
+    throttle_reason: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.session_id.strip()), "LongHorizonCheckpoint.session_id must not be empty.")
+        _require(self.cycle_index > 0, "LongHorizonCheckpoint.cycle_index must be positive.")
+        _require(self.total_cycles >= self.cycle_index, "LongHorizonCheckpoint.total_cycles must cover cycle_index.")
+        _require(bool(self.task_id.strip()), "LongHorizonCheckpoint.task_id must not be empty.")
+        _require(bool(self.question.strip()), "LongHorizonCheckpoint.question must not be empty.")
+        _require(self.resume_count >= 0, "LongHorizonCheckpoint.resume_count must be zero or positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> LongHorizonCheckpoint:
+        return cls(
+            session_id=str(data["session_id"]),
+            cycle_index=int(data["cycle_index"]),
+            total_cycles=int(data["total_cycles"]),
+            task_id=str(data["task_id"]),
+            question=str(data["question"]),
+            budget=ResourceBudget.from_dict(data["budget"]),
+            candidate_summaries=tuple(
+                LongHorizonCandidateSnapshot.from_dict(item)
+                for item in data.get("candidate_summaries", ())
+            ),
+            selected_candidate_id=str(data.get("selected_candidate_id", "")),
+            supporting_evidence_ids=tuple(str(item) for item in data.get("supporting_evidence_ids", ())),
+            refreshed_web_source_refs=tuple(str(item) for item in data.get("refreshed_web_source_refs", ())),
+            critique_result=str(data.get("critique_result", "")),
+            critique_summary=tuple(str(item) for item in data.get("critique_summary", ())),
+            repair_actions=tuple(str(item) for item in data.get("repair_actions", ())),
+            answer_preview=str(data.get("answer_preview", "")),
+            resume_count=int(data.get("resume_count", 0)),
+            throttled=bool(data.get("throttled", False)),
+            throttle_reason=str(data.get("throttle_reason", "")),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class LongHorizonSession(DictSerializable):
+    """Persisted session summary for one multi-cycle checkpointed run."""
+
+    session_id: str
+    question: str
+    requested_minutes: int
+    budget: ResourceBudget
+    status: LongHorizonSessionState = LongHorizonSessionState.PENDING
+    total_cycles: int = 1
+    completed_cycles: int = 0
+    last_task_id: str = ""
+    last_checkpoint_cycle: int = 0
+    resume_count: int = 0
+    pause_requested: bool = False
+    cancel_requested: bool = False
+    throttled: bool = False
+    throttle_reason: str = ""
+    latest_answer_preview: str = ""
+    last_control_reason: str = ""
+    last_error: str = ""
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.session_id.strip()), "LongHorizonSession.session_id must not be empty.")
+        _require(bool(self.question.strip()), "LongHorizonSession.question must not be empty.")
+        _require(self.requested_minutes > 0, "LongHorizonSession.requested_minutes must be positive.")
+        _require(self.total_cycles > 0, "LongHorizonSession.total_cycles must be positive.")
+        _require(self.completed_cycles >= 0, "LongHorizonSession.completed_cycles must be zero or positive.")
+        _require(
+            self.completed_cycles <= self.total_cycles,
+            "LongHorizonSession.completed_cycles must not exceed total_cycles.",
+        )
+        _require(
+            0 <= self.last_checkpoint_cycle <= self.total_cycles,
+            "LongHorizonSession.last_checkpoint_cycle must be within total_cycles.",
+        )
+        _require(self.resume_count >= 0, "LongHorizonSession.resume_count must be zero or positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> LongHorizonSession:
+        return cls(
+            session_id=str(data["session_id"]),
+            question=str(data["question"]),
+            requested_minutes=int(data["requested_minutes"]),
+            budget=ResourceBudget.from_dict(data["budget"]),
+            status=_parse_enum(LongHorizonSessionState, data.get("status", LongHorizonSessionState.PENDING)),
+            total_cycles=int(data.get("total_cycles", 1)),
+            completed_cycles=int(data.get("completed_cycles", 0)),
+            last_task_id=str(data.get("last_task_id", "")),
+            last_checkpoint_cycle=int(data.get("last_checkpoint_cycle", 0)),
+            resume_count=int(data.get("resume_count", 0)),
+            pause_requested=bool(data.get("pause_requested", False)),
+            cancel_requested=bool(data.get("cancel_requested", False)),
+            throttled=bool(data.get("throttled", False)),
+            throttle_reason=str(data.get("throttle_reason", "")),
+            latest_answer_preview=str(data.get("latest_answer_preview", "")),
+            last_control_reason=str(data.get("last_control_reason", "")),
+            last_error=str(data.get("last_error", "")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ModelRegistration(DictSerializable):
+    """One typed local-model registration tracked by the router and dashboard."""
+
+    registration_id: str
+    role: ModelRole
+    backend: str
+    model_identifier: str
+    resource_class: ModelResourceClass = ModelResourceClass.HEAVY
+    enabled: bool = True
+    preferred_device: str = "auto"
+    load_policy: ModelLoadPolicy = ModelLoadPolicy.ON_DEMAND
+    supported_capabilities: tuple[str, ...] = ()
+    missing_dependencies: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.registration_id.strip()), "ModelRegistration.registration_id must not be empty.")
+        _require(bool(self.backend.strip()), "ModelRegistration.backend must not be empty.")
+        _require(bool(self.model_identifier.strip()), "ModelRegistration.model_identifier must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ModelRegistration:
+        return cls(
+            registration_id=str(data["registration_id"]),
+            role=_parse_enum(ModelRole, data.get("role", ModelRole.GENERATION)),
+            backend=str(data.get("backend", "")),
+            model_identifier=str(data.get("model_identifier", "")),
+            resource_class=_parse_enum(
+                ModelResourceClass,
+                data.get("resource_class", ModelResourceClass.HEAVY),
+            ),
+            enabled=bool(data.get("enabled", True)),
+            preferred_device=str(data.get("preferred_device", "auto")),
+            load_policy=_parse_enum(
+                ModelLoadPolicy,
+                data.get("load_policy", ModelLoadPolicy.ON_DEMAND),
+            ),
+            supported_capabilities=tuple(str(item) for item in data.get("supported_capabilities", ())),
+            missing_dependencies=tuple(str(item) for item in data.get("missing_dependencies", ())),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ModelRouteDecision(DictSerializable):
+    """Typed routing decision produced for one requested model role."""
+
+    requested_role: ModelRole
+    selected_registration_id: str = ""
+    selected_backend: str = ""
+    selected_model_identifier: str = ""
+    resource_class: ModelResourceClass = ModelResourceClass.HEAVY
+    capability: str = ""
+    allowed: bool = False
+    used_fallback: bool = False
+    fallback_reason: str = ""
+    active_heavy_roles: tuple[str, ...] = ()
+    heavy_slot_limit: int = 2
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ModelRouteDecision:
+        return cls(
+            requested_role=_parse_enum(ModelRole, data.get("requested_role", ModelRole.GENERATION)),
+            selected_registration_id=str(data.get("selected_registration_id", "")),
+            selected_backend=str(data.get("selected_backend", "")),
+            selected_model_identifier=str(data.get("selected_model_identifier", "")),
+            resource_class=_parse_enum(
+                ModelResourceClass,
+                data.get("resource_class", ModelResourceClass.HEAVY),
+            ),
+            capability=str(data.get("capability", "")),
+            allowed=bool(data.get("allowed", False)),
+            used_fallback=bool(data.get("used_fallback", False)),
+            fallback_reason=str(data.get("fallback_reason", "")),
+            active_heavy_roles=tuple(str(item) for item in data.get("active_heavy_roles", ())),
+            heavy_slot_limit=int(data.get("heavy_slot_limit", 2)),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class BoundedCacheSnapshot(DictSerializable):
+    """Read-only summary of one bounded cache namespace."""
+
+    namespace: str
+    max_entries: int
+    entry_count: int = 0
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    warm_keys: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require(bool(self.namespace.strip()), "BoundedCacheSnapshot.namespace must not be empty.")
+        _require(self.max_entries > 0, "BoundedCacheSnapshot.max_entries must be positive.")
+        _require(self.entry_count >= 0, "BoundedCacheSnapshot.entry_count must be zero or positive.")
+        _require(self.hits >= 0, "BoundedCacheSnapshot.hits must be zero or positive.")
+        _require(self.misses >= 0, "BoundedCacheSnapshot.misses must be zero or positive.")
+        _require(self.evictions >= 0, "BoundedCacheSnapshot.evictions must be zero or positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> BoundedCacheSnapshot:
+        return cls(
+            namespace=str(data["namespace"]),
+            max_entries=int(data.get("max_entries", 1)),
+            entry_count=int(data.get("entry_count", 0)),
+            hits=int(data.get("hits", 0)),
+            misses=int(data.get("misses", 0)),
+            evictions=int(data.get("evictions", 0)),
+            warm_keys=tuple(str(item) for item in data.get("warm_keys", ())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ModelRegistryView(DictSerializable):
+    """Persisted registry/control-plane projection for all local AI roles."""
+
+    registrations: tuple[ModelRegistration, ...] = ()
+    preferred_models: dict[str, str] = field(default_factory=dict)
+    active_heavy_roles: tuple[str, ...] = ()
+    heavy_slot_limit: int = 2
+    fallback_reasons: dict[str, str] = field(default_factory=dict)
+    last_route_decisions: tuple[ModelRouteDecision, ...] = ()
+    advisory_available: bool = False
+    optimizer_subscriptions: tuple[str, ...] = ()
+    recent_optimizer_suggestions: tuple[OptimizerSuggestionRecord, ...] = ()
+    cache_snapshots: tuple[BoundedCacheSnapshot, ...] = ()
+    compression_insights: tuple["CompressionInsightSummary", ...] = ()
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(self.heavy_slot_limit > 0, "ModelRegistryView.heavy_slot_limit must be positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ModelRegistryView:
+        return cls(
+            registrations=tuple(
+                ModelRegistration.from_dict(item) for item in data.get("registrations", ())
+            ),
+            preferred_models={
+                str(key): str(value)
+                for key, value in dict(data.get("preferred_models", {})).items()
+            },
+            active_heavy_roles=tuple(str(item) for item in data.get("active_heavy_roles", ())),
+            heavy_slot_limit=int(data.get("heavy_slot_limit", 2)),
+            fallback_reasons={
+                str(key): str(value)
+                for key, value in dict(data.get("fallback_reasons", {})).items()
+            },
+            last_route_decisions=tuple(
+                ModelRouteDecision.from_dict(item) for item in data.get("last_route_decisions", ())
+            ),
+            advisory_available=bool(data.get("advisory_available", False)),
+            optimizer_subscriptions=tuple(str(item) for item in data.get("optimizer_subscriptions", ())),
+            recent_optimizer_suggestions=tuple(
+                OptimizerSuggestionRecord.from_dict(item)
+                for item in data.get("recent_optimizer_suggestions", ())
+            ),
+            cache_snapshots=tuple(
+                BoundedCacheSnapshot.from_dict(item) for item in data.get("cache_snapshots", ())
+            ),
+            compression_insights=tuple(
+                CompressionInsightSummary.from_dict(item)
+                for item in data.get("compression_insights", ())
+            ),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ModelRoleActionReport(DictSerializable):
+    """Typed result of one local-AI control-plane quick action."""
+
+    role: ModelRole = ModelRole.GENERATION
+    action: str = ""
+    ok: bool = False
+    summary: str = ""
+    detail: str = ""
+    route_decision: ModelRouteDecision | None = None
+    guidance: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    generated_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ModelRoleActionReport:
+        raw_route_decision = data.get("route_decision")
+        return cls(
+            role=_parse_enum(ModelRole, data.get("role", ModelRole.GENERATION)),
+            action=str(data.get("action", "")),
+            ok=bool(data.get("ok", False)),
+            summary=str(data.get("summary", "")),
+            detail=str(data.get("detail", "")),
+            route_decision=(
+                ModelRouteDecision.from_dict(raw_route_decision)
+                if isinstance(raw_route_decision, Mapping)
+                else None
+            ),
+            guidance=tuple(str(item) for item in data.get("guidance", ())),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            generated_at=_parse_datetime(data.get("generated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CompressionInsightSummary(DictSerializable):
+    """Typed dashboard-safe summary of one bounded compressor proposal prior."""
+
+    proposal_id: str
+    macro_name: str = ""
+    proof_fingerprint: str = ""
+    estimated_gain: float = 0.0
+    validation_pass_rate: float = 0.0
+    validation_state: str = "unknown"
+    blocked_reason: str = ""
+    evidence_basis: str = ""
+    origin_component: str = ""
+    accepted: bool = False
+
+    def __post_init__(self) -> None:
+        _require(bool(self.proposal_id.strip()), "CompressionInsightSummary.proposal_id must not be empty.")
+        _require(0.0 <= self.estimated_gain <= 1.0, "CompressionInsightSummary.estimated_gain must be between 0 and 1.")
+        _require(
+            0.0 <= self.validation_pass_rate <= 1.0,
+            "CompressionInsightSummary.validation_pass_rate must be between 0 and 1.",
+        )
+        _require(bool(self.validation_state.strip()), "CompressionInsightSummary.validation_state must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CompressionInsightSummary:
+        return cls(
+            proposal_id=str(data["proposal_id"]),
+            macro_name=str(data.get("macro_name", "")),
+            proof_fingerprint=str(data.get("proof_fingerprint", "")),
+            estimated_gain=float(data.get("estimated_gain", 0.0) or 0.0),
+            validation_pass_rate=float(data.get("validation_pass_rate", 0.0) or 0.0),
+            validation_state=str(data.get("validation_state", "unknown")),
+            blocked_reason=str(data.get("blocked_reason", "")),
+            evidence_basis=str(data.get("evidence_basis", "")),
+            origin_component=str(data.get("origin_component", "")),
+            accepted=bool(data.get("accepted", False)),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class LongHorizonExportBundle(DictSerializable):
+    """Machine-readable export bundle for one checkpointed long-horizon session."""
+
+    session_id: str
+    session_path: str
+    checkpoints_path: str
+    verified_trace_export_path: str = ""
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.session_id.strip()), "LongHorizonExportBundle.session_id must not be empty.")
+        _require(bool(self.session_path.strip()), "LongHorizonExportBundle.session_path must not be empty.")
+        _require(bool(self.checkpoints_path.strip()), "LongHorizonExportBundle.checkpoints_path must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> LongHorizonExportBundle:
+        return cls(
+            session_id=str(data["session_id"]),
+            session_path=str(data.get("session_path", "")),
+            checkpoints_path=str(data.get("checkpoints_path", "")),
+            verified_trace_export_path=str(data.get("verified_trace_export_path", "")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DashboardRuntimeHealth(DictSerializable):
+    """Latest runtime-health projection shown in the local app."""
+
+    started: bool = False
+    generation_backend: str = ""
+    embedding_backend: str = ""
+    active_generation_jobs: int = 0
+    active_embedding_jobs: int = 0
+    last_used_at: str = ""
+    fallback_active: bool = False
+    fallback_reason: str = ""
+    available_ram_gb: float | None = None
+    total_ram_gb: float | None = None
+    generation_backend_vram_gb: float | None = None
+    embedding_backend_vram_gb: float | None = None
+    telemetry_enabled: bool = False
+    last_error: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DashboardRuntimeHealth:
+        return cls(
+            started=bool(data.get("started", False)),
+            generation_backend=str(data.get("generation_backend", "")),
+            embedding_backend=str(data.get("embedding_backend", "")),
+            active_generation_jobs=int(data.get("active_generation_jobs", 0)),
+            active_embedding_jobs=int(data.get("active_embedding_jobs", 0)),
+            last_used_at=str(data.get("last_used_at", "")),
+            fallback_active=bool(data.get("fallback_active", False)),
+            fallback_reason=str(data.get("fallback_reason", "")),
+            available_ram_gb=(
+                float(data["available_ram_gb"]) if data.get("available_ram_gb") is not None else None
+            ),
+            total_ram_gb=float(data["total_ram_gb"]) if data.get("total_ram_gb") is not None else None,
+            generation_backend_vram_gb=(
+                float(data["generation_backend_vram_gb"])
+                if data.get("generation_backend_vram_gb") is not None
+                else None
+            ),
+            embedding_backend_vram_gb=(
+                float(data["embedding_backend_vram_gb"])
+                if data.get("embedding_backend_vram_gb") is not None
+                else None
+            ),
+            telemetry_enabled=bool(data.get("telemetry_enabled", False)),
+            last_error=str(data.get("last_error", "")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DashboardTaskState(DictSerializable):
+    """Latest task-focused projection shown in the local app."""
+
+    task_id: str = ""
+    question: str = ""
+    thinking_minutes: int = 0
+    requested_thinking_minutes: int = 0
+    execution_mode: str = "interactive"
+    running_stage: str = ""
+    answer_text: str = ""
+    citation_refs: tuple[str, ...] = ()
+    candidate_trace_count: int = 0
+    selected_candidate_id: str = ""
+    selected_strategy: str = ""
+    selected_verifier: str = ""
+    candidate_score: float = 0.0
+    critique_result: str = ""
+    degraded_reason: str = ""
+    repair_actions: tuple[str, ...] = ()
+    failure_categories: tuple[str, ...] = ()
+    supporting_evidence_ids: tuple[str, ...] = ()
+    local_result_count: int = 0
+    web_result_count: int = 0
+    used_web_fallback: bool = False
+    web_query: str = ""
+    web_source_refs: tuple[str, ...] = ()
+    long_horizon_session_id: str = ""
+    long_horizon_status: str = ""
+    long_horizon_current_phase: str = ""
+    long_horizon_cycle_budget_minutes: int = 0
+    long_horizon_checkpoint_interval_minutes: int = 0
+    long_horizon_duty_cycle_ratio: float = 0.0
+    long_horizon_cooldown_seconds: float = 0.0
+    long_horizon_elapsed_seconds: float = 0.0
+    long_horizon_eta_seconds: float | None = None
+    long_horizon_completed_cycles: int = 0
+    long_horizon_total_cycles: int = 0
+    long_horizon_resume_count: int = 0
+    long_horizon_pause_requested: bool = False
+    long_horizon_cancel_requested: bool = False
+    long_horizon_throttled: bool = False
+    long_horizon_throttle_reason: str = ""
+    long_horizon_initial_candidate_count: int = 0
+    long_horizon_peak_candidate_count: int = 0
+    long_horizon_additional_candidate_count: int = 0
+    long_horizon_initial_supporting_evidence_count: int = 0
+    long_horizon_additional_supporting_evidence_count: int = 0
+    long_horizon_total_verification_passes: int = 0
+    long_horizon_total_repairs: int = 0
+    long_horizon_first_candidate_score: float = 0.0
+    long_horizon_confidence_gain: float = 0.0
+    long_horizon_first_critique_result: str = ""
+    long_horizon_validity_improved: bool = False
+    long_horizon_advisory_requested_count: int = 0
+    long_horizon_advisory_accepted_count: int = 0
+    long_horizon_advisory_rejected_count: int = 0
+    long_horizon_advisory_deferred_count: int = 0
+    long_horizon_advisory_entries: tuple[str, ...] = ()
+    long_horizon_early_stop_reason: str = ""
+    specialist_roles_used: tuple[str, ...] = ()
+    specialist_role_explanations: tuple[str, ...] = ()
+    advisor_summaries: tuple[str, ...] = ()
+    warning_count: int = 0
+    updated_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DashboardTaskState:
+        raw_eta_seconds = data.get("long_horizon_eta_seconds")
+        return cls(
+            task_id=str(data.get("task_id", "")),
+            question=str(data.get("question", "")),
+            thinking_minutes=int(data.get("thinking_minutes", 0)),
+            requested_thinking_minutes=int(data.get("requested_thinking_minutes", 0)),
+            execution_mode=str(data.get("execution_mode", "interactive")),
+            running_stage=str(data.get("running_stage", "")),
+            answer_text=str(data.get("answer_text", "")),
+            citation_refs=tuple(str(item) for item in data.get("citation_refs", ())),
+            candidate_trace_count=int(data.get("candidate_trace_count", 0)),
+            selected_candidate_id=str(data.get("selected_candidate_id", "")),
+            selected_strategy=str(data.get("selected_strategy", "")),
+            selected_verifier=str(data.get("selected_verifier", "")),
+            candidate_score=float(data.get("candidate_score", 0.0) or 0.0),
+            critique_result=str(data.get("critique_result", "")),
+            degraded_reason=str(data.get("degraded_reason", "")),
+            repair_actions=tuple(str(item) for item in data.get("repair_actions", ())),
+            failure_categories=tuple(str(item) for item in data.get("failure_categories", ())),
+            supporting_evidence_ids=tuple(str(item) for item in data.get("supporting_evidence_ids", ())),
+            local_result_count=int(data.get("local_result_count", 0)),
+            web_result_count=int(data.get("web_result_count", 0)),
+            used_web_fallback=bool(data.get("used_web_fallback", False)),
+            web_query=str(data.get("web_query", "")),
+            web_source_refs=tuple(str(item) for item in data.get("web_source_refs", ())),
+            long_horizon_session_id=str(data.get("long_horizon_session_id", "")),
+            long_horizon_status=str(data.get("long_horizon_status", "")),
+            long_horizon_current_phase=str(data.get("long_horizon_current_phase", "")),
+            long_horizon_cycle_budget_minutes=int(data.get("long_horizon_cycle_budget_minutes", 0)),
+            long_horizon_checkpoint_interval_minutes=int(data.get("long_horizon_checkpoint_interval_minutes", 0)),
+            long_horizon_duty_cycle_ratio=float(data.get("long_horizon_duty_cycle_ratio", 0.0) or 0.0),
+            long_horizon_cooldown_seconds=float(data.get("long_horizon_cooldown_seconds", 0.0) or 0.0),
+            long_horizon_elapsed_seconds=float(data.get("long_horizon_elapsed_seconds", 0.0) or 0.0),
+            long_horizon_eta_seconds=(
+                None
+                if raw_eta_seconds in (None, "")
+                else float(raw_eta_seconds)
+            ),
+            long_horizon_completed_cycles=int(data.get("long_horizon_completed_cycles", 0)),
+            long_horizon_total_cycles=int(data.get("long_horizon_total_cycles", 0)),
+            long_horizon_resume_count=int(data.get("long_horizon_resume_count", 0)),
+            long_horizon_pause_requested=bool(data.get("long_horizon_pause_requested", False)),
+            long_horizon_cancel_requested=bool(data.get("long_horizon_cancel_requested", False)),
+            long_horizon_throttled=bool(data.get("long_horizon_throttled", False)),
+            long_horizon_throttle_reason=str(data.get("long_horizon_throttle_reason", "")),
+            long_horizon_initial_candidate_count=int(data.get("long_horizon_initial_candidate_count", 0)),
+            long_horizon_peak_candidate_count=int(data.get("long_horizon_peak_candidate_count", 0)),
+            long_horizon_additional_candidate_count=int(data.get("long_horizon_additional_candidate_count", 0)),
+            long_horizon_initial_supporting_evidence_count=int(
+                data.get("long_horizon_initial_supporting_evidence_count", 0)
+            ),
+            long_horizon_additional_supporting_evidence_count=int(
+                data.get("long_horizon_additional_supporting_evidence_count", 0)
+            ),
+            long_horizon_total_verification_passes=int(data.get("long_horizon_total_verification_passes", 0)),
+            long_horizon_total_repairs=int(data.get("long_horizon_total_repairs", 0)),
+            long_horizon_first_candidate_score=float(data.get("long_horizon_first_candidate_score", 0.0) or 0.0),
+            long_horizon_confidence_gain=float(data.get("long_horizon_confidence_gain", 0.0) or 0.0),
+            long_horizon_first_critique_result=str(data.get("long_horizon_first_critique_result", "")),
+            long_horizon_validity_improved=bool(data.get("long_horizon_validity_improved", False)),
+            long_horizon_advisory_requested_count=int(data.get("long_horizon_advisory_requested_count", 0)),
+            long_horizon_advisory_accepted_count=int(data.get("long_horizon_advisory_accepted_count", 0)),
+            long_horizon_advisory_rejected_count=int(data.get("long_horizon_advisory_rejected_count", 0)),
+            long_horizon_advisory_deferred_count=int(data.get("long_horizon_advisory_deferred_count", 0)),
+            long_horizon_advisory_entries=tuple(
+                str(item) for item in data.get("long_horizon_advisory_entries", ())
+            ),
+            long_horizon_early_stop_reason=str(data.get("long_horizon_early_stop_reason", "")),
+            specialist_roles_used=tuple(str(item) for item in data.get("specialist_roles_used", ())),
+            specialist_role_explanations=tuple(
+                str(item) for item in data.get("specialist_role_explanations", ())
+            ),
+            advisor_summaries=tuple(str(item) for item in data.get("advisor_summaries", ())),
+            warning_count=int(data.get("warning_count", 0)),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class UserSettingsProfile(DictSerializable):
+    """Persisted user-facing settings profile for the local app shell."""
+
+    profile_name: str = "default"
+    runtime: dict[str, Any] = field(
+        default_factory=lambda: {
+            "stub_mode": True,
+            "allow_web_fallback": True,
+            "enable_self_optimizer": False,
+            "generation_backend": "ollama",
+            "embedding_backend": "sentence_transformers",
+            "vector_store_backend": "chromadb",
+        }
+    )
+    retrieval: dict[str, Any] = field(
+        default_factory=lambda: {
+            "allow_web_fallback": True,
+            "provider": "wikipedia",
+            "reranking": True,
+        }
+    )
+    reasoning: dict[str, Any] = field(
+        default_factory=lambda: {
+            "thinking_minutes": 30,
+            "mode": "auto",
+        }
+    )
+    long_horizon: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "wall_clock_minutes": 120,
+            "cycle_budget_minutes": 120,
+            "checkpoint_interval_minutes": 120,
+            "duty_cycle_ratio": 0.75,
+            "cooldown_seconds": 0.05,
+            "max_resume_count": 5,
+        }
+    )
+    optimizer: dict[str, Any] = field(
+        default_factory=lambda: {
+            "activation_policy": "proposal_only",
+            "replay_limit": 64,
+        }
+    )
+    models: dict[str, Any] = field(
+        default_factory=lambda: {
+            "preferred_by_role": {
+                "generation": "ollama:qwen2.5:3b-instruct-q4_K_M",
+                "embedding": "sentence_transformers:intfloat/e5-small-v2",
+            },
+            "enabled_roles": ("generation", "embedding"),
+        }
+    )
+    desktop: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "approval_policy": "approve_risky_only",
+        }
+    )
+    observation: dict[str, Any] = field(
+        default_factory=lambda: {
+            "tier": "screenshot_on_demand",
+            "continuous_capture": False,
+            "ocr_on_step": False,
+            "vision_on_step": False,
+        }
+    )
+    cloud: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "mode": "auxiliary_only",
+        }
+    )
+    privacy: dict[str, Any] = field(
+        default_factory=lambda: {
+            "log_runtime_events": True,
+            "allow_cloud_content": False,
+            "log_level": "INFO",
+        }
+    )
+    ui: dict[str, Any] = field(
+        default_factory=lambda: {
+            "show_debug_pane": True,
+            "app_shell": "tkinter",
+        }
+    )
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.profile_name.strip()), "UserSettingsProfile.profile_name must not be empty.")
+
+    def validate(self) -> None:
+        """Validate bounded settings values used by the lightweight local app."""
+        reasoning_mode = str(self.reasoning.get("mode", "auto"))
+        _require(reasoning_mode in {"auto", "fast", "deep"}, "reasoning.mode must be auto, fast, or deep.")
+        thinking_minutes = int(self.reasoning.get("thinking_minutes", 30) or 30)
+        _require(thinking_minutes >= 1, "reasoning.thinking_minutes must be at least 1.")
+        wall_clock_minutes = int(self.long_horizon.get("wall_clock_minutes", 120) or 120)
+        cycle_budget_minutes = int(self.long_horizon.get("cycle_budget_minutes", 120) or 120)
+        checkpoint_interval_minutes = int(
+            self.long_horizon.get("checkpoint_interval_minutes", cycle_budget_minutes) or cycle_budget_minutes
+        )
+        duty_cycle_ratio = float(self.long_horizon.get("duty_cycle_ratio", 0.75) or 0.75)
+        cooldown_seconds = float(self.long_horizon.get("cooldown_seconds", 0.05) or 0.05)
+        max_resume_count = int(self.long_horizon.get("max_resume_count", 5) or 5)
+        _require(wall_clock_minutes >= 1, "long_horizon.wall_clock_minutes must be at least 1.")
+        _require(cycle_budget_minutes >= 1, "long_horizon.cycle_budget_minutes must be at least 1.")
+        _require(
+            checkpoint_interval_minutes >= 1,
+            "long_horizon.checkpoint_interval_minutes must be at least 1.",
+        )
+        _require(
+            cycle_budget_minutes <= wall_clock_minutes,
+            "long_horizon.cycle_budget_minutes must not exceed wall_clock_minutes.",
+        )
+        _require(
+            checkpoint_interval_minutes <= cycle_budget_minutes,
+            "long_horizon.checkpoint_interval_minutes must not exceed cycle_budget_minutes.",
+        )
+        _require(
+            0.0 < duty_cycle_ratio <= 1.0,
+            "long_horizon.duty_cycle_ratio must be between 0 and 1.",
+        )
+        _require(cooldown_seconds >= 0.0, "long_horizon.cooldown_seconds must be zero or positive.")
+        _require(max_resume_count >= 0, "long_horizon.max_resume_count must be zero or positive.")
+        observation_tier = str(self.observation.get("tier", "screenshot_on_demand"))
+        _require(
+            observation_tier in {
+                "screenshot_on_demand",
+                "ocr_on_step",
+                "vision_on_step",
+                "continuous_capture",
+            },
+            "observation.tier is not recognized.",
+        )
+        cloud_mode = str(self.cloud.get("mode", "auxiliary_only"))
+        _require(cloud_mode in {"auxiliary_only", "disabled"}, "cloud.mode is not recognized.")
+        approval_policy = str(self.desktop.get("approval_policy", "approve_risky_only"))
+        _require(
+            approval_policy in {"approve_risky_only", "manual_only", "safe_auto"},
+            "desktop.approval_policy is not recognized.",
+        )
+        app_shell = str(self.ui.get("app_shell", "tkinter"))
+        _require(app_shell == "tkinter", "ui.app_shell must remain tkinter for the local app.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> UserSettingsProfile:
+        defaults = cls(profile_name=str(data.get("profile_name", "default")))
+        raw_models = dict(data.get("models", {}))
+        raw_preferred_by_role = {
+            **dict(defaults.models.get("preferred_by_role", {})),
+            **dict(raw_models.get("preferred_by_role", {})),
+        }
+        raw_enabled_roles = tuple(
+            str(item)
+            for item in raw_models.get("enabled_roles", defaults.models.get("enabled_roles", ()))
+            if str(item).strip()
+        )
+        profile = cls(
+            profile_name=defaults.profile_name,
+            runtime={**defaults.runtime, **dict(data.get("runtime", {}))},
+            retrieval={**defaults.retrieval, **dict(data.get("retrieval", {}))},
+            reasoning={**defaults.reasoning, **dict(data.get("reasoning", {}))},
+            long_horizon={**defaults.long_horizon, **dict(data.get("long_horizon", {}))},
+            optimizer={**defaults.optimizer, **dict(data.get("optimizer", {}))},
+            models={
+                **defaults.models,
+                **raw_models,
+                "preferred_by_role": raw_preferred_by_role,
+                "enabled_roles": raw_enabled_roles or tuple(defaults.models.get("enabled_roles", ())),
+            },
+            desktop={**defaults.desktop, **dict(data.get("desktop", {}))},
+            observation={**defaults.observation, **dict(data.get("observation", {}))},
+            cloud={**defaults.cloud, **dict(data.get("cloud", {}))},
+            privacy={**defaults.privacy, **dict(data.get("privacy", {}))},
+            ui={**defaults.ui, **dict(data.get("ui", {}))},
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+        profile.validate()
+        return profile
+
+
+@dataclass(slots=True, frozen=True)
+class DashboardTaskHistoryEntry(DictSerializable):
+    """Compact task-history row shown in the local app shell."""
+
+    task_id: str
+    question: str
+    answer_preview: str = ""
+    critique_result: str = ""
+    degraded_reason: str = ""
+    warning_count: int = 0
+    candidate_trace_count: int = 0
+    citation_count: int = 0
+    selected_strategy: str = ""
+    selected_verifier: str = ""
+    used_web_fallback: bool = False
+    completed_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.task_id.strip()), "DashboardTaskHistoryEntry.task_id must not be empty.")
+        _require(bool(self.question.strip()), "DashboardTaskHistoryEntry.question must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DashboardTaskHistoryEntry:
+        return cls(
+            task_id=str(data["task_id"]),
+            question=str(data["question"]),
+            answer_preview=str(data.get("answer_preview", "")),
+            critique_result=str(data.get("critique_result", "")),
+            degraded_reason=str(data.get("degraded_reason", "")),
+            warning_count=int(data.get("warning_count", 0)),
+            candidate_trace_count=int(data.get("candidate_trace_count", 0)),
+            citation_count=int(data.get("citation_count", 0)),
+            selected_strategy=str(data.get("selected_strategy", "")),
+            selected_verifier=str(data.get("selected_verifier", "")),
+            used_web_fallback=bool(data.get("used_web_fallback", False)),
+            completed_at=_parse_datetime(data.get("completed_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DashboardTaskInspector(DictSerializable):
+    """Detailed task/run inspector payload for one persisted task."""
+
+    task_id: str = ""
+    question: str = ""
+    answer_text: str = ""
+    critique_result: str = ""
+    degraded_reason: str = ""
+    warning_count: int = 0
+    warnings: tuple[str, ...] = ()
+    citation_refs: tuple[str, ...] = ()
+    repair_actions: tuple[str, ...] = ()
+    failure_categories: tuple[str, ...] = ()
+    supporting_evidence_ids: tuple[str, ...] = ()
+    candidate_trace_count: int = 0
+    selected_strategy: str = ""
+    selected_verifier: str = ""
+    used_web_fallback: bool = False
+    trace_debug_export_path: str = ""
+    optimizer_lifecycle: tuple[str, ...] = ()
+    specialist_roles_used: tuple[str, ...] = ()
+    specialist_role_explanations: tuple[str, ...] = ()
+    advisor_summaries: tuple[str, ...] = ()
+    completed_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DashboardTaskInspector:
+        return cls(
+            task_id=str(data.get("task_id", "")),
+            question=str(data.get("question", "")),
+            answer_text=str(data.get("answer_text", "")),
+            critique_result=str(data.get("critique_result", "")),
+            degraded_reason=str(data.get("degraded_reason", "")),
+            warning_count=int(data.get("warning_count", 0)),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            citation_refs=tuple(str(item) for item in data.get("citation_refs", ())),
+            repair_actions=tuple(str(item) for item in data.get("repair_actions", ())),
+            failure_categories=tuple(str(item) for item in data.get("failure_categories", ())),
+            supporting_evidence_ids=tuple(str(item) for item in data.get("supporting_evidence_ids", ())),
+            candidate_trace_count=int(data.get("candidate_trace_count", 0)),
+            selected_strategy=str(data.get("selected_strategy", "")),
+            selected_verifier=str(data.get("selected_verifier", "")),
+            used_web_fallback=bool(data.get("used_web_fallback", False)),
+            trace_debug_export_path=str(data.get("trace_debug_export_path", "")),
+            optimizer_lifecycle=tuple(str(item) for item in data.get("optimizer_lifecycle", ())),
+            specialist_roles_used=tuple(str(item) for item in data.get("specialist_roles_used", ())),
+            specialist_role_explanations=tuple(
+                str(item) for item in data.get("specialist_role_explanations", ())
+            ),
+            advisor_summaries=tuple(str(item) for item in data.get("advisor_summaries", ())),
+            completed_at=_parse_datetime(data.get("completed_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DashboardKnowledgeSource(DictSerializable):
+    """Summary of one local knowledge source for the GUI library view."""
+
+    document_id: str
+    source_ref: str
+    title: str
+    chunk_count: int = 0
+    embedding_model: str = ""
+    archived: bool = False
+    corpus_origin: str = ""
+    corpus_tier: str = ""
+    updated_at: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.document_id.strip()), "DashboardKnowledgeSource.document_id must not be empty.")
+        _require(bool(self.source_ref.strip()), "DashboardKnowledgeSource.source_ref must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DashboardKnowledgeSource:
+        return cls(
+            document_id=str(data["document_id"]),
+            source_ref=str(data["source_ref"]),
+            title=str(data.get("title", "")),
+            chunk_count=int(data.get("chunk_count", 0)),
+            embedding_model=str(data.get("embedding_model", "")),
+            archived=bool(data.get("archived", False)),
+            corpus_origin=str(data.get("corpus_origin", "")),
+            corpus_tier=str(data.get("corpus_tier", "")),
+            updated_at=str(data.get("updated_at", "")),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DashboardCapabilityAvailability(DictSerializable):
+    """Capability-gating explanation shown in readiness/settings surfaces."""
+
+    capability_name: str
+    status: str
+    reason: str = ""
+    detail: str = ""
+    recovery_actions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require(
+            bool(self.capability_name.strip()),
+            "DashboardCapabilityAvailability.capability_name must not be empty.",
+        )
+        _require(bool(self.status.strip()), "DashboardCapabilityAvailability.status must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DashboardCapabilityAvailability:
+        return cls(
+            capability_name=str(data["capability_name"]),
+            status=str(data["status"]),
+            reason=str(data.get("reason", "")),
+            detail=str(data.get("detail", "")),
+            recovery_actions=tuple(str(item) for item in data.get("recovery_actions", ())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DashboardReadinessCheck(DictSerializable):
+    """One readiness/preflight check rendered in the local app."""
+
+    check_id: str
+    title: str
+    status: str
+    detail: str = ""
+    recovery_actions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require(bool(self.check_id.strip()), "DashboardReadinessCheck.check_id must not be empty.")
+        _require(bool(self.title.strip()), "DashboardReadinessCheck.title must not be empty.")
+        _require(bool(self.status.strip()), "DashboardReadinessCheck.status must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DashboardReadinessCheck:
+        return cls(
+            check_id=str(data["check_id"]),
+            title=str(data["title"]),
+            status=str(data["status"]),
+            detail=str(data.get("detail", "")),
+            recovery_actions=tuple(str(item) for item in data.get("recovery_actions", ())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DashboardReadinessReport(DictSerializable):
+    """Readiness summary for stub mode, real mode, and optional capability tiers."""
+
+    stub_mode_ready: bool = False
+    real_mode_ready: bool = False
+    checks: tuple[DashboardReadinessCheck, ...] = ()
+    capabilities: tuple[DashboardCapabilityAvailability, ...] = ()
+    guidance: tuple[str, ...] = ()
+    generated_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DashboardReadinessReport:
+        return cls(
+            stub_mode_ready=bool(data.get("stub_mode_ready", False)),
+            real_mode_ready=bool(data.get("real_mode_ready", False)),
+            checks=tuple(
+                DashboardReadinessCheck.from_dict(item) for item in data.get("checks", ())
+            ),
+            capabilities=tuple(
+                DashboardCapabilityAvailability.from_dict(item)
+                for item in data.get("capabilities", ())
+            ),
+            guidance=tuple(str(item) for item in data.get("guidance", ())),
+            generated_at=_parse_datetime(data.get("generated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class PackagedLaunchReport(DictSerializable):
+    """Operator-facing packaged launch decision and fallback summary."""
+
+    requested_mode: str = "stub"
+    effective_mode: str = "stub"
+    launch_ready: bool = False
+    used_stub_fallback: bool = False
+    summary: str = ""
+    blocking_reason: str = ""
+    blocking_detail: str = ""
+    guidance: tuple[str, ...] = ()
+    readiness_report: DashboardReadinessReport = field(default_factory=DashboardReadinessReport)
+    generated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(
+            self.requested_mode in {"stub", "real"},
+            "PackagedLaunchReport.requested_mode must be stub or real.",
+        )
+        _require(
+            self.effective_mode in {"stub", "real"},
+            "PackagedLaunchReport.effective_mode must be stub or real.",
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PackagedLaunchReport:
+        return cls(
+            requested_mode=str(data.get("requested_mode", "stub")),
+            effective_mode=str(data.get("effective_mode", "stub")),
+            launch_ready=bool(data.get("launch_ready", False)),
+            used_stub_fallback=bool(data.get("used_stub_fallback", False)),
+            summary=str(data.get("summary", "")),
+            blocking_reason=str(data.get("blocking_reason", "")),
+            blocking_detail=str(data.get("blocking_detail", "")),
+            guidance=tuple(str(item) for item in data.get("guidance", ())),
+            readiness_report=DashboardReadinessReport.from_dict(data.get("readiness_report", {})),
+            generated_at=_parse_datetime(data.get("generated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class PackagedSupportBundle(DictSerializable):
+    """Manifest describing one exported packaged-app support bundle."""
+
+    bundle_dir: str
+    manifest_path: str = ""
+    launch_report_path: str = ""
+    readiness_report_path: str = ""
+    user_settings_path: str = ""
+    app_state_path: str = ""
+    support_readme_path: str = ""
+    copied_artifact_paths: tuple[str, ...] = ()
+    generated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.bundle_dir.strip()), "PackagedSupportBundle.bundle_dir must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PackagedSupportBundle:
+        return cls(
+            bundle_dir=str(data["bundle_dir"]),
+            manifest_path=str(data.get("manifest_path", "")),
+            launch_report_path=str(data.get("launch_report_path", "")),
+            readiness_report_path=str(data.get("readiness_report_path", "")),
+            user_settings_path=str(data.get("user_settings_path", "")),
+            app_state_path=str(data.get("app_state_path", "")),
+            support_readme_path=str(data.get("support_readme_path", "")),
+            copied_artifact_paths=tuple(str(item) for item in data.get("copied_artifact_paths", ())),
+            generated_at=_parse_datetime(data.get("generated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DemoDocumentFixture(DictSerializable):
+    """Repo-owned demo document fixture definition."""
+
+    source_ref: str
+    title: str
+    content: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    sample_task_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require(bool(self.source_ref.strip()), "DemoDocumentFixture.source_ref must not be empty.")
+        _require(bool(self.title.strip()), "DemoDocumentFixture.title must not be empty.")
+        _require(bool(self.content.strip()), "DemoDocumentFixture.content must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DemoDocumentFixture:
+        return cls(
+            source_ref=str(data["source_ref"]),
+            title=str(data["title"]),
+            content=str(data["content"]),
+            metadata=dict(data.get("metadata", {})),
+            sample_task_ids=tuple(str(item) for item in data.get("sample_task_ids", ())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class SampleTaskDefinition(DictSerializable):
+    """Typed definition for one built-in demo/sample task."""
+
+    sample_id: str = ""
+    title: str = ""
+    question: str = ""
+    category: str = ""
+    execution_profile: str = ""
+    recommended_thinking_minutes: int = 1
+    expected_behavior: str = ""
+    expected_result: str = ""
+    success_markers: tuple[str, ...] = ()
+    required_source_refs: tuple[str, ...] = ()
+    uses_web_fallback: bool = False
+    requires_demo_pack: bool = False
+    comparison_group: str = ""
+    comparison_fast_minutes: int = 0
+    comparison_deep_minutes: int = 0
+    expected_degraded_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not any((self.sample_id, self.title, self.question, self.category, self.execution_profile)):
+            return
+        _require(bool(self.sample_id.strip()), "SampleTaskDefinition.sample_id must not be empty.")
+        _require(bool(self.title.strip()), "SampleTaskDefinition.title must not be empty.")
+        _require(bool(self.question.strip()), "SampleTaskDefinition.question must not be empty.")
+        _require(bool(self.category.strip()), "SampleTaskDefinition.category must not be empty.")
+        _require(
+            bool(self.execution_profile.strip()),
+            "SampleTaskDefinition.execution_profile must not be empty.",
+        )
+        _require(
+            self.recommended_thinking_minutes >= 1,
+            "SampleTaskDefinition.recommended_thinking_minutes must be positive.",
+        )
+        _require(
+            self.comparison_fast_minutes >= 0 and self.comparison_deep_minutes >= 0,
+            "SampleTaskDefinition comparison minutes must not be negative.",
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SampleTaskDefinition:
+        return cls(
+            sample_id=str(data.get("sample_id", "")),
+            title=str(data.get("title", "")),
+            question=str(data.get("question", "")),
+            category=str(data.get("category", "")),
+            execution_profile=str(data.get("execution_profile", "")),
+            recommended_thinking_minutes=int(data.get("recommended_thinking_minutes", 1)),
+            expected_behavior=str(data.get("expected_behavior", "")),
+            expected_result=str(data.get("expected_result", "")),
+            success_markers=tuple(str(item) for item in data.get("success_markers", ())),
+            required_source_refs=tuple(str(item) for item in data.get("required_source_refs", ())),
+            uses_web_fallback=bool(data.get("uses_web_fallback", False)),
+            requires_demo_pack=bool(data.get("requires_demo_pack", False)),
+            comparison_group=str(data.get("comparison_group", "")),
+            comparison_fast_minutes=int(data.get("comparison_fast_minutes", 0)),
+            comparison_deep_minutes=int(data.get("comparison_deep_minutes", 0)),
+            expected_degraded_reason=str(data.get("expected_degraded_reason", "")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DemoRuntimePackSummary(DictSerializable):
+    """Summary of the starter runtime pack shipped with the demo content."""
+
+    pack_version: str = ""
+    macro_names: tuple[str, ...] = ()
+    opcode_names: tuple[str, ...] = ()
+    decoder_names: tuple[str, ...] = ()
+    loaded_macro_count: int = 0
+    loaded_opcode_count: int = 0
+    loaded_decoder_count: int = 0
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DemoRuntimePackSummary:
+        return cls(
+            pack_version=str(data.get("pack_version", "")),
+            macro_names=tuple(str(item) for item in data.get("macro_names", ())),
+            opcode_names=tuple(str(item) for item in data.get("opcode_names", ())),
+            decoder_names=tuple(str(item) for item in data.get("decoder_names", ())),
+            loaded_macro_count=int(data.get("loaded_macro_count", 0)),
+            loaded_opcode_count=int(data.get("loaded_opcode_count", 0)),
+            loaded_decoder_count=int(data.get("loaded_decoder_count", 0)),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DemoPackStatus(DictSerializable):
+    """Read-only summary of the built-in demo pack state."""
+
+    pack_version: str = ""
+    loaded: bool = False
+    document_count: int = 0
+    loaded_document_count: int = 0
+    sample_task_count: int = 0
+    runtime_pack: DemoRuntimePackSummary = field(default_factory=DemoRuntimePackSummary)
+    verified_trace_example_path: str = ""
+    loaded_at: str = ""
+    status_detail: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DemoPackStatus:
+        return cls(
+            pack_version=str(data.get("pack_version", "")),
+            loaded=bool(data.get("loaded", False)),
+            document_count=int(data.get("document_count", 0)),
+            loaded_document_count=int(data.get("loaded_document_count", 0)),
+            sample_task_count=int(data.get("sample_task_count", 0)),
+            runtime_pack=DemoRuntimePackSummary.from_dict(data.get("runtime_pack", {})),
+            verified_trace_example_path=str(data.get("verified_trace_example_path", "")),
+            loaded_at=str(data.get("loaded_at", "")),
+            status_detail=str(data.get("status_detail", "")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class VoiceActivitySegment(DictSerializable):
+    """Bounded speech-activity span extracted from one audio clip."""
+
+    start_ms: int = 0
+    end_ms: int = 0
+    mean_abs_level: float = 0.0
+
+    def __post_init__(self) -> None:
+        _require(self.start_ms >= 0, "VoiceActivitySegment.start_ms must be zero or positive.")
+        _require(self.end_ms >= self.start_ms, "VoiceActivitySegment.end_ms must be >= start_ms.")
+        _require(0.0 <= self.mean_abs_level <= 1.0, "VoiceActivitySegment.mean_abs_level must be between 0 and 1.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> VoiceActivitySegment:
+        return cls(
+            start_ms=int(data.get("start_ms", 0)),
+            end_ms=int(data.get("end_ms", 0)),
+            mean_abs_level=float(data.get("mean_abs_level", 0.0) or 0.0),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class VoiceActivityReport(DictSerializable):
+    """Typed local VAD summary used by optional speech workflows."""
+
+    source_path: str = ""
+    analyzer_backend: str = ""
+    sample_rate_hz: int = 0
+    channel_count: int = 0
+    duration_seconds: float = 0.0
+    analyzed_duration_seconds: float = 0.0
+    speech_ratio: float = 0.0
+    segment_count: int = 0
+    segments: tuple[VoiceActivitySegment, ...] = ()
+    warnings: tuple[str, ...] = ()
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(self.sample_rate_hz >= 0, "VoiceActivityReport.sample_rate_hz must be zero or positive.")
+        _require(self.channel_count >= 0, "VoiceActivityReport.channel_count must be zero or positive.")
+        _require(self.duration_seconds >= 0.0, "VoiceActivityReport.duration_seconds must be zero or positive.")
+        _require(
+            self.analyzed_duration_seconds >= 0.0,
+            "VoiceActivityReport.analyzed_duration_seconds must be zero or positive.",
+        )
+        _require(0.0 <= self.speech_ratio <= 1.0, "VoiceActivityReport.speech_ratio must be between 0 and 1.")
+        _require(self.segment_count >= 0, "VoiceActivityReport.segment_count must be zero or positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> VoiceActivityReport:
+        return cls(
+            source_path=str(data.get("source_path", "")),
+            analyzer_backend=str(data.get("analyzer_backend", "")),
+            sample_rate_hz=int(data.get("sample_rate_hz", 0)),
+            channel_count=int(data.get("channel_count", 0)),
+            duration_seconds=float(data.get("duration_seconds", 0.0) or 0.0),
+            analyzed_duration_seconds=float(data.get("analyzed_duration_seconds", 0.0) or 0.0),
+            speech_ratio=float(data.get("speech_ratio", 0.0) or 0.0),
+            segment_count=int(data.get("segment_count", 0)),
+            segments=tuple(
+                VoiceActivitySegment.from_dict(item) for item in data.get("segments", ())
+            ),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class AudioTranscriptionResult(DictSerializable):
+    """Typed result of one bounded local audio-input transcription request."""
+
+    source_path: str = ""
+    status: str = "idle"
+    transcript_text: str = ""
+    normalized_question: str = ""
+    transcription_backend: str = ""
+    transcription_model: str = ""
+    used_vad: bool = False
+    imported_into_question: bool = False
+    duration_seconds: float = 0.0
+    analyzed_duration_seconds: float = 0.0
+    voice_activity: VoiceActivityReport = field(default_factory=VoiceActivityReport)
+    warnings: tuple[str, ...] = ()
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.status.strip()), "AudioTranscriptionResult.status must not be empty.")
+        _require(self.duration_seconds >= 0.0, "AudioTranscriptionResult.duration_seconds must be zero or positive.")
+        _require(
+            self.analyzed_duration_seconds >= 0.0,
+            "AudioTranscriptionResult.analyzed_duration_seconds must be zero or positive.",
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> AudioTranscriptionResult:
+        return cls(
+            source_path=str(data.get("source_path", "")),
+            status=str(data.get("status", "idle")),
+            transcript_text=str(data.get("transcript_text", "")),
+            normalized_question=str(data.get("normalized_question", "")),
+            transcription_backend=str(data.get("transcription_backend", "")),
+            transcription_model=str(data.get("transcription_model", "")),
+            used_vad=bool(data.get("used_vad", False)),
+            imported_into_question=bool(data.get("imported_into_question", False)),
+            duration_seconds=float(data.get("duration_seconds", 0.0) or 0.0),
+            analyzed_duration_seconds=float(data.get("analyzed_duration_seconds", 0.0) or 0.0),
+            voice_activity=VoiceActivityReport.from_dict(data.get("voice_activity", {})),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class AudioSynthesisResult(DictSerializable):
+    """Typed result of one bounded local text-to-speech request."""
+
+    target_path: str = ""
+    status: str = "idle"
+    source_text: str = ""
+    clipped_text: str = ""
+    synthesis_backend: str = ""
+    synthesis_model: str = ""
+    duration_seconds: float = 0.0
+    sample_rate_hz: int = 0
+    warnings: tuple[str, ...] = ()
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.status.strip()), "AudioSynthesisResult.status must not be empty.")
+        _require(self.duration_seconds >= 0.0, "AudioSynthesisResult.duration_seconds must be zero or positive.")
+        _require(self.sample_rate_hz >= 0, "AudioSynthesisResult.sample_rate_hz must be zero or positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> AudioSynthesisResult:
+        return cls(
+            target_path=str(data.get("target_path", "")),
+            status=str(data.get("status", "idle")),
+            source_text=str(data.get("source_text", "")),
+            clipped_text=str(data.get("clipped_text", "")),
+            synthesis_backend=str(data.get("synthesis_backend", "")),
+            synthesis_model=str(data.get("synthesis_model", "")),
+            duration_seconds=float(data.get("duration_seconds", 0.0) or 0.0),
+            sample_rate_hz=int(data.get("sample_rate_hz", 0)),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class TextTranslationResult(DictSerializable):
+    """Typed result of one bounded local text-translation request."""
+
+    status: str = "idle"
+    source_text: str = ""
+    translated_text: str = ""
+    source_language: str = ""
+    target_language: str = ""
+    translation_backend: str = ""
+    translation_model: str = ""
+    source_scope: str = "free_text"
+    imported_into_question: bool = False
+    warnings: tuple[str, ...] = ()
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.status.strip()), "TextTranslationResult.status must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> TextTranslationResult:
+        return cls(
+            status=str(data.get("status", "idle")),
+            source_text=str(data.get("source_text", "")),
+            translated_text=str(data.get("translated_text", "")),
+            source_language=str(data.get("source_language", "")),
+            target_language=str(data.get("target_language", "")),
+            translation_backend=str(data.get("translation_backend", "")),
+            translation_model=str(data.get("translation_model", "")),
+            source_scope=str(data.get("source_scope", "free_text")),
+            imported_into_question=bool(data.get("imported_into_question", False)),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CodeSpecialistResult(DictSerializable):
+    """Typed result of one bounded optional code-specialist request."""
+
+    status: str = "idle"
+    source_scope: str = "snippet"
+    source_path: str = ""
+    request_text: str = ""
+    summary: str = ""
+    suggested_actions: tuple[str, ...] = ()
+    code_backend: str = ""
+    code_model: str = ""
+    detected_language: str = ""
+    line_count: int = 0
+    warnings: tuple[str, ...] = ()
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.status.strip()), "CodeSpecialistResult.status must not be empty.")
+        _require(self.line_count >= 0, "CodeSpecialistResult.line_count must be zero or positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CodeSpecialistResult:
+        return cls(
+            status=str(data.get("status", "idle")),
+            source_scope=str(data.get("source_scope", "snippet")),
+            source_path=str(data.get("source_path", "")),
+            request_text=str(data.get("request_text", "")),
+            summary=str(data.get("summary", "")),
+            suggested_actions=tuple(str(item) for item in data.get("suggested_actions", ())),
+            code_backend=str(data.get("code_backend", "")),
+            code_model=str(data.get("code_model", "")),
+            detected_language=str(data.get("detected_language", "")),
+            line_count=int(data.get("line_count", 0)),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DashboardAppState(DictSerializable):
+    """Typed read-only snapshot consumed by the dashboard shell."""
+
+    last_stage: str = ""
+    event_count: int = 0
+    dropped_events: int = 0
+    active_task: DashboardTaskState = field(default_factory=DashboardTaskState)
+    runtime_health: DashboardRuntimeHealth = field(default_factory=DashboardRuntimeHealth)
+    statuses: dict[str, AgentStatus] = field(default_factory=dict)
+    recent_conditions: tuple[RuntimeCondition, ...] = ()
+    user_settings: UserSettingsProfile = field(default_factory=UserSettingsProfile)
+    settings_profiles: tuple[UserSettingsProfile, ...] = ()
+    task_history: tuple[DashboardTaskHistoryEntry, ...] = ()
+    selected_task: DashboardTaskInspector = field(default_factory=DashboardTaskInspector)
+    knowledge_sources: tuple[DashboardKnowledgeSource, ...] = ()
+    readiness_report: DashboardReadinessReport = field(default_factory=DashboardReadinessReport)
+    model_registry_view: ModelRegistryView = field(default_factory=ModelRegistryView)
+    model_role_action: ModelRoleActionReport = field(default_factory=ModelRoleActionReport)
+    demo_pack_status: DemoPackStatus = field(default_factory=DemoPackStatus)
+    sample_tasks: tuple[SampleTaskDefinition, ...] = ()
+    selected_sample_task: SampleTaskDefinition = field(default_factory=SampleTaskDefinition)
+    audio_input: AudioTranscriptionResult = field(default_factory=AudioTranscriptionResult)
+    audio_output: AudioSynthesisResult = field(default_factory=AudioSynthesisResult)
+    translation_output: TextTranslationResult = field(default_factory=TextTranslationResult)
+    code_output: CodeSpecialistResult = field(default_factory=CodeSpecialistResult)
+    last_notice: str = ""
+    last_notice_severity: str = "info"
+    updated_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DashboardAppState:
+        raw_statuses = data.get("statuses", {})
+        return cls(
+            last_stage=str(data.get("last_stage", "")),
+            event_count=int(data.get("event_count", 0)),
+            dropped_events=int(data.get("dropped_events", 0)),
+            active_task=DashboardTaskState.from_dict(data.get("active_task", {})),
+            runtime_health=DashboardRuntimeHealth.from_dict(data.get("runtime_health", {})),
+            statuses={
+                str(key): AgentStatus.from_dict(value)
+                for key, value in dict(raw_statuses).items()
+            },
+            recent_conditions=tuple(
+                RuntimeCondition.from_dict(item) for item in data.get("recent_conditions", ())
+            ),
+            user_settings=UserSettingsProfile.from_dict(data.get("user_settings", {})),
+            settings_profiles=tuple(
+                UserSettingsProfile.from_dict(item) for item in data.get("settings_profiles", ())
+            ),
+            task_history=tuple(
+                DashboardTaskHistoryEntry.from_dict(item) for item in data.get("task_history", ())
+            ),
+            selected_task=DashboardTaskInspector.from_dict(data.get("selected_task", {})),
+            knowledge_sources=tuple(
+                DashboardKnowledgeSource.from_dict(item)
+                for item in data.get("knowledge_sources", ())
+            ),
+            readiness_report=DashboardReadinessReport.from_dict(
+                data.get("readiness_report", {})
+            ),
+            model_registry_view=ModelRegistryView.from_dict(data.get("model_registry_view", {})),
+            model_role_action=ModelRoleActionReport.from_dict(data.get("model_role_action", {})),
+            demo_pack_status=DemoPackStatus.from_dict(data.get("demo_pack_status", {})),
+            sample_tasks=tuple(
+                SampleTaskDefinition.from_dict(item) for item in data.get("sample_tasks", ())
+            ),
+            selected_sample_task=SampleTaskDefinition.from_dict(
+                data.get("selected_sample_task", {})
+            ),
+            audio_input=AudioTranscriptionResult.from_dict(data.get("audio_input", {})),
+            audio_output=AudioSynthesisResult.from_dict(data.get("audio_output", {})),
+            translation_output=TextTranslationResult.from_dict(data.get("translation_output", {})),
+            code_output=CodeSpecialistResult.from_dict(data.get("code_output", {})),
+            last_notice=str(data.get("last_notice", "")),
+            last_notice_severity=str(data.get("last_notice_severity", "info")),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
 def coerce_plan(value: Plan | Mapping[str, Any]) -> Plan:
     """Convert mapping payloads to Plan while preserving existing Plan values."""
     if isinstance(value, Plan):
@@ -2533,6 +4299,24 @@ def coerce_optimizer_rollback_record(
     return OptimizerRollbackRecord.from_dict(value)
 
 
+def coerce_optimizer_suggestion_record(
+    value: OptimizerSuggestionRecord | Mapping[str, Any],
+) -> OptimizerSuggestionRecord:
+    """Convert mapping payloads to OptimizerSuggestionRecord while preserving existing values."""
+    if isinstance(value, OptimizerSuggestionRecord):
+        return value
+    return OptimizerSuggestionRecord.from_dict(value)
+
+
+def coerce_optimizer_suggestion_usage_record(
+    value: OptimizerSuggestionUsageRecord | Mapping[str, Any],
+) -> OptimizerSuggestionUsageRecord:
+    """Convert mapping payloads to OptimizerSuggestionUsageRecord while preserving existing values."""
+    if isinstance(value, OptimizerSuggestionUsageRecord):
+        return value
+    return OptimizerSuggestionUsageRecord.from_dict(value)
+
+
 def coerce_verified_deep_trace_export(
     value: VerifiedDeepTraceExport | Mapping[str, Any],
 ) -> VerifiedDeepTraceExport:
@@ -2554,3 +4338,258 @@ def coerce_agent_status(value: AgentStatus | Mapping[str, Any]) -> AgentStatus:
     if isinstance(value, AgentStatus):
         return value
     return AgentStatus.from_dict(value)
+
+
+def coerce_runtime_condition(value: RuntimeCondition | Mapping[str, Any]) -> RuntimeCondition:
+    """Convert mapping payloads to RuntimeCondition while preserving existing values."""
+    if isinstance(value, RuntimeCondition):
+        return value
+    return RuntimeCondition.from_dict(value)
+
+
+def coerce_long_horizon_candidate_snapshot(
+    value: LongHorizonCandidateSnapshot | Mapping[str, Any],
+) -> LongHorizonCandidateSnapshot:
+    """Convert mapping payloads to LongHorizonCandidateSnapshot while preserving existing values."""
+    if isinstance(value, LongHorizonCandidateSnapshot):
+        return value
+    return LongHorizonCandidateSnapshot.from_dict(value)
+
+
+def coerce_long_horizon_checkpoint(
+    value: LongHorizonCheckpoint | Mapping[str, Any],
+) -> LongHorizonCheckpoint:
+    """Convert mapping payloads to LongHorizonCheckpoint while preserving existing values."""
+    if isinstance(value, LongHorizonCheckpoint):
+        return value
+    return LongHorizonCheckpoint.from_dict(value)
+
+
+def coerce_long_horizon_session(
+    value: LongHorizonSession | Mapping[str, Any],
+) -> LongHorizonSession:
+    """Convert mapping payloads to LongHorizonSession while preserving existing values."""
+    if isinstance(value, LongHorizonSession):
+        return value
+    return LongHorizonSession.from_dict(value)
+
+
+def coerce_model_registration(
+    value: ModelRegistration | Mapping[str, Any],
+) -> ModelRegistration:
+    """Convert mapping payloads to ModelRegistration while preserving existing values."""
+    if isinstance(value, ModelRegistration):
+        return value
+    return ModelRegistration.from_dict(value)
+
+
+def coerce_model_route_decision(
+    value: ModelRouteDecision | Mapping[str, Any],
+) -> ModelRouteDecision:
+    """Convert mapping payloads to ModelRouteDecision while preserving existing values."""
+    if isinstance(value, ModelRouteDecision):
+        return value
+    return ModelRouteDecision.from_dict(value)
+
+
+def coerce_bounded_cache_snapshot(
+    value: BoundedCacheSnapshot | Mapping[str, Any],
+) -> BoundedCacheSnapshot:
+    """Convert mapping payloads to BoundedCacheSnapshot while preserving existing values."""
+    if isinstance(value, BoundedCacheSnapshot):
+        return value
+    return BoundedCacheSnapshot.from_dict(value)
+
+
+def coerce_compression_insight_summary(
+    value: CompressionInsightSummary | Mapping[str, Any],
+) -> CompressionInsightSummary:
+    """Convert mapping payloads to CompressionInsightSummary while preserving existing values."""
+    if isinstance(value, CompressionInsightSummary):
+        return value
+    return CompressionInsightSummary.from_dict(value)
+
+
+def coerce_model_registry_view(
+    value: ModelRegistryView | Mapping[str, Any],
+) -> ModelRegistryView:
+    """Convert mapping payloads to ModelRegistryView while preserving existing values."""
+    if isinstance(value, ModelRegistryView):
+        return value
+    return ModelRegistryView.from_dict(value)
+
+
+def coerce_model_role_action_report(
+    value: ModelRoleActionReport | Mapping[str, Any],
+) -> ModelRoleActionReport:
+    """Convert mapping payloads to ModelRoleActionReport while preserving existing values."""
+    if isinstance(value, ModelRoleActionReport):
+        return value
+    return ModelRoleActionReport.from_dict(value)
+
+
+def coerce_audio_transcription_result(
+    value: AudioTranscriptionResult | Mapping[str, Any],
+) -> AudioTranscriptionResult:
+    """Convert mapping payloads to AudioTranscriptionResult while preserving existing values."""
+    if isinstance(value, AudioTranscriptionResult):
+        return value
+    return AudioTranscriptionResult.from_dict(value)
+
+
+def coerce_audio_synthesis_result(
+    value: AudioSynthesisResult | Mapping[str, Any],
+) -> AudioSynthesisResult:
+    """Convert mapping payloads to AudioSynthesisResult while preserving existing values."""
+    if isinstance(value, AudioSynthesisResult):
+        return value
+    return AudioSynthesisResult.from_dict(value)
+
+
+def coerce_text_translation_result(
+    value: TextTranslationResult | Mapping[str, Any],
+) -> TextTranslationResult:
+    """Convert mapping payloads to TextTranslationResult while preserving existing values."""
+    if isinstance(value, TextTranslationResult):
+        return value
+    return TextTranslationResult.from_dict(value)
+
+
+def coerce_code_specialist_result(
+    value: CodeSpecialistResult | Mapping[str, Any],
+) -> CodeSpecialistResult:
+    """Convert mapping payloads to CodeSpecialistResult while preserving existing values."""
+    if isinstance(value, CodeSpecialistResult):
+        return value
+    return CodeSpecialistResult.from_dict(value)
+
+
+def coerce_long_horizon_export_bundle(
+    value: LongHorizonExportBundle | Mapping[str, Any],
+) -> LongHorizonExportBundle:
+    """Convert mapping payloads to LongHorizonExportBundle while preserving existing values."""
+    if isinstance(value, LongHorizonExportBundle):
+        return value
+    return LongHorizonExportBundle.from_dict(value)
+
+
+def coerce_dashboard_runtime_health(
+    value: DashboardRuntimeHealth | Mapping[str, Any],
+) -> DashboardRuntimeHealth:
+    """Convert mapping payloads to DashboardRuntimeHealth while preserving existing values."""
+    if isinstance(value, DashboardRuntimeHealth):
+        return value
+    return DashboardRuntimeHealth.from_dict(value)
+
+
+def coerce_dashboard_task_state(
+    value: DashboardTaskState | Mapping[str, Any],
+) -> DashboardTaskState:
+    """Convert mapping payloads to DashboardTaskState while preserving existing values."""
+    if isinstance(value, DashboardTaskState):
+        return value
+    return DashboardTaskState.from_dict(value)
+
+
+def coerce_user_settings_profile(
+    value: UserSettingsProfile | Mapping[str, Any],
+) -> UserSettingsProfile:
+    """Convert mapping payloads to UserSettingsProfile while preserving existing values."""
+    if isinstance(value, UserSettingsProfile):
+        return value
+    return UserSettingsProfile.from_dict(value)
+
+
+def coerce_demo_document_fixture(
+    value: DemoDocumentFixture | Mapping[str, Any],
+) -> DemoDocumentFixture:
+    """Convert mapping payloads to DemoDocumentFixture while preserving existing values."""
+    if isinstance(value, DemoDocumentFixture):
+        return value
+    return DemoDocumentFixture.from_dict(value)
+
+
+def coerce_sample_task_definition(
+    value: SampleTaskDefinition | Mapping[str, Any],
+) -> SampleTaskDefinition:
+    """Convert mapping payloads to SampleTaskDefinition while preserving existing values."""
+    if isinstance(value, SampleTaskDefinition):
+        return value
+    return SampleTaskDefinition.from_dict(value)
+
+
+def coerce_demo_runtime_pack_summary(
+    value: DemoRuntimePackSummary | Mapping[str, Any],
+) -> DemoRuntimePackSummary:
+    """Convert mapping payloads to DemoRuntimePackSummary while preserving existing values."""
+    if isinstance(value, DemoRuntimePackSummary):
+        return value
+    return DemoRuntimePackSummary.from_dict(value)
+
+
+def coerce_demo_pack_status(value: DemoPackStatus | Mapping[str, Any]) -> DemoPackStatus:
+    """Convert mapping payloads to DemoPackStatus while preserving existing values."""
+    if isinstance(value, DemoPackStatus):
+        return value
+    return DemoPackStatus.from_dict(value)
+
+
+def coerce_dashboard_task_history_entry(
+    value: DashboardTaskHistoryEntry | Mapping[str, Any],
+) -> DashboardTaskHistoryEntry:
+    """Convert mapping payloads to DashboardTaskHistoryEntry while preserving existing values."""
+    if isinstance(value, DashboardTaskHistoryEntry):
+        return value
+    return DashboardTaskHistoryEntry.from_dict(value)
+
+
+def coerce_dashboard_task_inspector(
+    value: DashboardTaskInspector | Mapping[str, Any],
+) -> DashboardTaskInspector:
+    """Convert mapping payloads to DashboardTaskInspector while preserving existing values."""
+    if isinstance(value, DashboardTaskInspector):
+        return value
+    return DashboardTaskInspector.from_dict(value)
+
+
+def coerce_dashboard_knowledge_source(
+    value: DashboardKnowledgeSource | Mapping[str, Any],
+) -> DashboardKnowledgeSource:
+    """Convert mapping payloads to DashboardKnowledgeSource while preserving existing values."""
+    if isinstance(value, DashboardKnowledgeSource):
+        return value
+    return DashboardKnowledgeSource.from_dict(value)
+
+
+def coerce_dashboard_capability_availability(
+    value: DashboardCapabilityAvailability | Mapping[str, Any],
+) -> DashboardCapabilityAvailability:
+    """Convert mapping payloads to DashboardCapabilityAvailability while preserving existing values."""
+    if isinstance(value, DashboardCapabilityAvailability):
+        return value
+    return DashboardCapabilityAvailability.from_dict(value)
+
+
+def coerce_dashboard_readiness_check(
+    value: DashboardReadinessCheck | Mapping[str, Any],
+) -> DashboardReadinessCheck:
+    """Convert mapping payloads to DashboardReadinessCheck while preserving existing values."""
+    if isinstance(value, DashboardReadinessCheck):
+        return value
+    return DashboardReadinessCheck.from_dict(value)
+
+
+def coerce_dashboard_readiness_report(
+    value: DashboardReadinessReport | Mapping[str, Any],
+) -> DashboardReadinessReport:
+    """Convert mapping payloads to DashboardReadinessReport while preserving existing values."""
+    if isinstance(value, DashboardReadinessReport):
+        return value
+    return DashboardReadinessReport.from_dict(value)
+
+
+def coerce_dashboard_app_state(value: DashboardAppState | Mapping[str, Any]) -> DashboardAppState:
+    """Convert mapping payloads to DashboardAppState while preserving existing values."""
+    if isinstance(value, DashboardAppState):
+        return value
+    return DashboardAppState.from_dict(value)

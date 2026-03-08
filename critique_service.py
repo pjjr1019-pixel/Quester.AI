@@ -21,6 +21,7 @@ from prompts import CRITIC_PROMPT
 from retrieval import stable_hash
 from structured_generation import StructuredGenerationService
 from verification_tools import (
+    detect_conflicting_evidence,
     evaluate_arithmetic_question,
     evaluate_python_code_question,
     evaluate_python_expression_question,
@@ -49,23 +50,42 @@ class CritiqueService:
         model_manager: ModelManager,
         storage: StorageManager | None = None,
         config: AppConfig = APP_CONFIG,
+        structured_generation: StructuredGenerationService | None = None,
     ):
         self.model_manager = model_manager
         self.storage = storage
         self.config = config
-        self.structured_generation = StructuredGenerationService(model_manager=model_manager, config=config)
+        self.structured_generation = structured_generation or StructuredGenerationService(
+            model_manager=model_manager,
+            config=config,
+        )
         self._last_runtime_subset: CompressionRuntimeSubset | None = None
         self._last_handoff: ReasonerCriticHandoff | None = None
 
     @property
     def last_runtime_subset(self) -> CompressionRuntimeSubset | None:
+        """Return the last active runtime subset loaded for critique, if any."""
         return self._last_runtime_subset
 
     @property
     def last_handoff(self) -> ReasonerCriticHandoff | None:
+        """Return the last typed Reasoner -> Critic handoff, if any."""
         return self._last_handoff
 
     async def review(self, handoff: ReasonerCriticHandoff) -> CritiqueReport:
+        """Return a typed critique report for one validated handoff.
+
+        Input:
+        - `handoff`: the typed Reasoner -> Critic boundary payload.
+
+        Output:
+        - A `CritiqueReport` carrying verifier, provenance, and repair metadata.
+
+        Failure behavior:
+        - Deterministic checks run first. If structured model output is invalid,
+          the method allows one repair attempt and then returns the deterministic
+          baseline report rather than continuing to retry.
+        """
         self._last_handoff = handoff
         runtime_subset = await self._load_runtime_subset(handoff.plan.task_id, handoff)
         self._last_runtime_subset = runtime_subset
@@ -529,6 +549,7 @@ class CritiqueService:
         if any(token in issue for issue in lowered_issues for token in ("symbol table", "typed handoff")):
             categories.append("provenance")
         if any("evidence" in issue for issue in lowered_issues) or degraded_reason in {
+            "conflicting_evidence",
             "low_evidence_support",
             "no_candidate_met_verification_threshold",
             "no_retrieved_evidence",
@@ -867,6 +888,31 @@ class CritiqueService:
                     f"expected '{evidence_count_answer}' but trace emitted '{answer_text}'."
                 )
             return issues, checks_run, details
+        conflict_result = detect_conflicting_evidence(
+            handoff.plan.question,
+            tuple(
+                (item.id, item.content)
+                for item in (handoff.evidence.local_results + handoff.evidence.web_results)
+            ),
+        )
+        if conflict_result is not None:
+            checks_run.append("tool.evidence_conflict")
+            details["verifier_type"] = "tool.evidence_conflict"
+            details["provenance_coverage"] = self._calculate_provenance_coverage(
+                verifier_type="tool.evidence_conflict",
+                supporting_evidence_ids=conflict_result.supporting_evidence_ids,
+                evidence_handles=handoff.evidence_handles,
+                has_evidence=bool(handoff.evidence.local_results or handoff.evidence.web_results),
+            )
+            if conflict_result.conflict_detected:
+                details["candidate_score"] = 0.0
+                details["degraded_reason"] = "conflicting_evidence"
+                issues.append(
+                    "Evidence-conflict verification found conflicting values across retrieved evidence: "
+                    + ", ".join(conflict_result.conflicting_values)
+                    + "."
+                )
+                return issues, checks_run, details
         if answer_text:
             checks_run.append("tool.evidence_grounding")
             support_result = measure_evidence_support(
@@ -987,7 +1033,12 @@ class CritiqueService:
             actions.append("reload_runtime_subset")
         if "candidate_selection" in failure_categories:
             actions.append("rerun_reasoner")
-        if degraded_reason in {"low_evidence_support", "no_candidate_met_verification_threshold", "no_retrieved_evidence"}:
+        if degraded_reason in {
+            "conflicting_evidence",
+            "low_evidence_support",
+            "no_candidate_met_verification_threshold",
+            "no_retrieved_evidence",
+        }:
             actions.append("abstain_due_to_low_grounding")
         if not issues and not actions:
             actions.append("preserve_trace")

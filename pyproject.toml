@@ -26,6 +26,9 @@ dependencies = []
 test = [
   "pytest>=8.0,<9.0",
 ]
+structured = [
+  "jsonschema>=4.0,<5.0",
+]
 telemetry = [
   "psutil>=5.9,<7.0",
 ]
@@ -48,15 +51,22 @@ quester-ai = "orchestrator:main"
 
 [tool.setuptools]
 py-modules = [
+  "acceptance_thresholds",
+  "bounded_cache",
+  "capability_guardrails",
   "compressor",
   "config",
   "critic",
   "dashboard",
   "data_structures",
+  "local_audio",
+  "local_code_specialist",
+  "local_translation",
   "macro_engine",
   "model_backends",
   "model_manager",
   "orchestrator",
+  "phase11_content",
   "phase6_benchmark",
   "planner",
   "prompts",
@@ -68,6 +78,7 @@ py-modules = [
   "storage",
   "translation_service",
   "utils",
+  "validation_gates",
   "verification_tools",
   "web_adapter",
 ]

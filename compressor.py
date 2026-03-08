@@ -1,4 +1,4 @@
-"""Compressor agent scaffold."""
+"""Compressor agent wrapper around the macro-proposal service."""
 
 from __future__ import annotations
 
@@ -13,19 +13,26 @@ from model_manager import ModelManager
 class CompressorAgent:
     """Suggests macro candidates from repeated reasoning tokens."""
 
-    def __init__(self, model_manager: ModelManager, config: AppConfig = APP_CONFIG):
+    def __init__(
+        self,
+        model_manager: ModelManager,
+        config: AppConfig = APP_CONFIG,
+        service: CompressionService | None = None,
+    ):
         self.model_manager = model_manager
         self.config = config
         self.logger = logging.getLogger("quester.compressor")
-        self.service = CompressionService(model_manager=model_manager, config=config)
+        self.service = service or CompressionService(model_manager=model_manager, config=config)
         self._started = False
 
     async def start(self) -> None:
+        """Mark the compressor ready to build macro proposals."""
         if self._started:
             return
         self._started = True
 
     async def stop(self) -> None:
+        """Reject future compression requests until the compressor is restarted."""
         self._started = False
 
     async def propose(

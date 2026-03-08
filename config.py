@@ -172,12 +172,51 @@ class WebSearchSettings:
 
 
 @dataclass(frozen=True)
+class AudioSettings:
+    """Bounded local audio-input settings for optional speech features."""
+
+    max_input_duration_s: float = 30.0
+    vad_frame_ms: int = 30
+    vad_min_speech_ms: int = 180
+    vad_merge_silence_ms: int = 150
+    vad_energy_threshold: float = 0.02
+    system_speech_timeout_s: float = 20.0
+    max_transcript_chars: int = 512
+    max_tts_chars: int = 800
+    tts_sample_rate_hz: int = 16000
+    system_speech_synthesis_timeout_s: float = 20.0
+
+
+@dataclass(frozen=True)
+class TranslationSettings:
+    """Bounded local text-translation settings for optional multilingual features."""
+
+    max_input_chars: int = 2400
+    default_source_language: str = "auto"
+    default_target_language: str = "en"
+
+
+@dataclass(frozen=True)
+class CodeSpecialistSettings:
+    """Bounded local code-specialist settings for optional maintenance analysis."""
+
+    max_input_chars: int = 6000
+    max_input_lines: int = 240
+    default_request: str = "Summarize maintenance risks and the next bounded changes."
+
+
+@dataclass(frozen=True)
 class BudgetCalibrationSettings:
     """Budget caps calibrated for the baseline target and the current dev machine."""
 
     development_vram_gb: float = 4.0
     development_ram_gb: float = 8.0
     max_thinking_minutes: int = 720
+    max_cycle_budget_minutes: int = 120
+    max_checkpoint_interval_minutes: int = 120
+    min_duty_cycle_ratio: float = 0.25
+    max_cooldown_seconds: float = 1.0
+    max_resume_count: int = 8
     max_retrieval_top_k: int = 10
     max_web_queries: int = 5
     max_reasoner_passes: int = 4
@@ -192,6 +231,26 @@ class BudgetCalibrationSettings:
             reasoner_passes=max(1, min(budget.reasoner_passes, self.max_reasoner_passes)),
             critic_passes=max(1, min(budget.critic_passes, self.max_critic_passes)),
             macro_depth=max(1, min(budget.macro_depth, self.max_macro_depth)),
+            wall_clock_minutes=max(1, min(budget.wall_clock_minutes, self.max_thinking_minutes)),
+            cycle_budget_minutes=max(1, min(budget.cycle_budget_minutes, self.max_cycle_budget_minutes)),
+            checkpoint_interval_minutes=max(
+                1,
+                min(
+                    budget.checkpoint_interval_minutes,
+                    self.max_checkpoint_interval_minutes,
+                    budget.cycle_budget_minutes,
+                ),
+            ),
+            duty_cycle_ratio=max(self.min_duty_cycle_ratio, min(budget.duty_cycle_ratio, 1.0)),
+            cooldown_seconds=max(0.0, min(budget.cooldown_seconds, self.max_cooldown_seconds)),
+            max_resume_count=max(0, min(budget.max_resume_count, self.max_resume_count)),
+            planned_cycles=max(
+                1,
+                min(
+                    budget.planned_cycles,
+                    max(1, (self.max_thinking_minutes + max(1, self.max_cycle_budget_minutes) - 1) // max(1, self.max_cycle_budget_minutes)),
+                ),
+            ),
         )
 
 
@@ -213,6 +272,9 @@ class BudgetPolicy:
                 reasoner_passes=1,
                 critic_passes=1,
                 macro_depth=2,
+                wall_clock_minutes=safe_minutes,
+                cycle_budget_minutes=safe_minutes,
+                checkpoint_interval_minutes=safe_minutes,
             )
         elif safe_minutes <= 30:
             budget = ResourceBudget(
@@ -221,6 +283,9 @@ class BudgetPolicy:
                 reasoner_passes=2,
                 critic_passes=2,
                 macro_depth=3,
+                wall_clock_minutes=safe_minutes,
+                cycle_budget_minutes=safe_minutes,
+                checkpoint_interval_minutes=safe_minutes,
             )
         elif safe_minutes <= 120:
             budget = ResourceBudget(
@@ -229,14 +294,26 @@ class BudgetPolicy:
                 reasoner_passes=3,
                 critic_passes=2,
                 macro_depth=4,
+                wall_clock_minutes=safe_minutes,
+                cycle_budget_minutes=safe_minutes,
+                checkpoint_interval_minutes=safe_minutes,
             )
         else:
+            cycle_budget_minutes = min(calibration.max_cycle_budget_minutes, 120)
+            planned_cycles = max(2, (safe_minutes + cycle_budget_minutes - 1) // cycle_budget_minutes)
             budget = ResourceBudget(
                 retrieval_top_k=10,
                 max_web_queries=5,
                 reasoner_passes=4,
                 critic_passes=3,
                 macro_depth=4,
+                wall_clock_minutes=safe_minutes,
+                cycle_budget_minutes=cycle_budget_minutes,
+                checkpoint_interval_minutes=min(cycle_budget_minutes, calibration.max_checkpoint_interval_minutes),
+                duty_cycle_ratio=0.75,
+                cooldown_seconds=0.05,
+                max_resume_count=max(1, planned_cycles - 1),
+                planned_cycles=planned_cycles,
             )
         return calibration.clamp_budget(budget)
 
@@ -299,6 +376,9 @@ class AppConfig:
     backend_runtime: BackendRuntimeSettings = field(default_factory=BackendRuntimeSettings)
     retrieval: RetrievalSettings = field(default_factory=RetrievalSettings)
     web: WebSearchSettings = field(default_factory=WebSearchSettings)
+    audio: AudioSettings = field(default_factory=AudioSettings)
+    translation: TranslationSettings = field(default_factory=TranslationSettings)
+    code_specialist: CodeSpecialistSettings = field(default_factory=CodeSpecialistSettings)
     budget_calibration: BudgetCalibrationSettings = field(default_factory=BudgetCalibrationSettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
     dashboard: DashboardSettings = field(default_factory=DashboardSettings)
@@ -403,6 +483,20 @@ class AppConfig:
             raise ValueError("web.max_extract_chars must be at least 128.")
         if self.web.snippet_chars < 64:
             raise ValueError("web.snippet_chars must be at least 64.")
+        if self.audio.max_input_duration_s <= 0:
+            raise ValueError("audio.max_input_duration_s must be positive.")
+        if self.audio.vad_frame_ms < 10:
+            raise ValueError("audio.vad_frame_ms must be at least 10.")
+        if self.audio.vad_min_speech_ms < self.audio.vad_frame_ms:
+            raise ValueError("audio.vad_min_speech_ms must be at least one frame.")
+        if self.audio.vad_merge_silence_ms < 0:
+            raise ValueError("audio.vad_merge_silence_ms must be zero or positive.")
+        if not 0.0 <= self.audio.vad_energy_threshold <= 1.0:
+            raise ValueError("audio.vad_energy_threshold must be between 0 and 1.")
+        if self.audio.system_speech_timeout_s <= 0:
+            raise ValueError("audio.system_speech_timeout_s must be positive.")
+        if self.audio.max_transcript_chars < 64:
+            raise ValueError("audio.max_transcript_chars must be at least 64.")
         if self.budget_calibration.development_vram_gb <= 0:
             raise ValueError("development_vram_gb must be positive.")
         if self.budget_calibration.development_ram_gb <= 0:
@@ -413,6 +507,16 @@ class AppConfig:
             raise ValueError("development_ram_gb must not exceed the locked baseline RAM target.")
         if self.budget_calibration.max_thinking_minutes < 720:
             raise ValueError("max_thinking_minutes must support the 121-720 minute preset band.")
+        if self.budget_calibration.max_cycle_budget_minutes < 120:
+            raise ValueError("max_cycle_budget_minutes must support the bounded long-horizon cycle size.")
+        if self.budget_calibration.max_checkpoint_interval_minutes < 1:
+            raise ValueError("max_checkpoint_interval_minutes must be positive.")
+        if not 0.0 < self.budget_calibration.min_duty_cycle_ratio <= 1.0:
+            raise ValueError("min_duty_cycle_ratio must be between 0 and 1.")
+        if self.budget_calibration.max_cooldown_seconds < 0.0:
+            raise ValueError("max_cooldown_seconds must be zero or positive.")
+        if self.budget_calibration.max_resume_count < 1:
+            raise ValueError("max_resume_count must be positive.")
         if self.budget_calibration.max_retrieval_top_k < 10:
             raise ValueError("max_retrieval_top_k must support the maximum preset.")
         if self.budget_calibration.max_web_queries < 5:

@@ -1,4 +1,4 @@
-"""Critic agent scaffold."""
+"""Critic agent wrapper around the typed critique service."""
 
 from __future__ import annotations
 
@@ -30,12 +30,13 @@ class CriticAgent:
         model_manager: ModelManager,
         storage: StorageManager | None = None,
         config: AppConfig = APP_CONFIG,
+        service: CritiqueService | None = None,
     ):
         self.model_manager = model_manager
         self.storage = storage
         self.config = config
         self.logger = logging.getLogger("quester.critic")
-        self.service = CritiqueService(model_manager=model_manager, storage=storage, config=config)
+        self.service = service or CritiqueService(model_manager=model_manager, storage=storage, config=config)
         self._started = False
 
     @property
@@ -49,11 +50,13 @@ class CriticAgent:
         return self.service.last_handoff
 
     async def start(self) -> None:
+        """Mark the critic ready to validate typed reasoning traces."""
         if self._started:
             return
         self._started = True
 
     async def stop(self) -> None:
+        """Reject future review requests until the critic is restarted."""
         self._started = False
 
     async def review(

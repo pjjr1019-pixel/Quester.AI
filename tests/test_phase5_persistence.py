@@ -48,6 +48,7 @@ from data_structures import (
     SourceType,
     SymbolTableSnapshot,
     TaskResult,
+    UserSettingsProfile,
     VerifiedDeepTraceExport,
     WebEvidenceRecord,
 )
@@ -286,6 +287,30 @@ class StorageManagerTypedPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((self.test_logs / self.test_config.storage.status_log_name).exists())
         self.assertEqual(await self.storage.count_tasks(), 1)
 
+    async def test_storage_reopens_existing_database_without_schema_errors(self) -> None:
+        result = _build_task_result("persist-reopen-task")
+        reasoning_log = ReasoningLog(
+            task_id=result.task_id,
+            compressed_chain=result.reasoning.tokens,
+            macros_used=result.reasoning.macros_used,
+        )
+
+        await self.storage.record_task_result(result)
+        await self.storage.record_reasoning_log(reasoning_log)
+        await self.storage.stop()
+
+        reopened = StorageManager(config=self.test_config)
+        await reopened.start()
+        self.storage = reopened
+
+        stored_result = await self.storage.get_task_result(result.task_id)
+        reasoning_history = await self.storage.list_reasoning_history(task_id=result.task_id)
+
+        self.assertEqual(stored_result, result)
+        self.assertEqual(len(reasoning_history), 1)
+        self.assertTrue(self.test_db.exists())
+        self.assertTrue(self.test_logs.exists())
+
     async def test_storage_persists_optimizer_lifecycle_records_and_verified_deep_exports(self) -> None:
         result = _build_task_result("persist-deep-task")
         deep_context = replace(result.reasoning.context_frames[0], metadata={"rm": "deep"})
@@ -392,6 +417,70 @@ class StorageManagerTypedPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exports[0].trace_proof_hash, deep_result.reasoning.proof_hash)
         self.assertEqual(exports[0].evidence_source_refs, ("local://sample",))
         self.assertTrue(export_path.exists())
+
+    async def test_storage_persists_named_user_settings_profiles(self) -> None:
+        profile = UserSettingsProfile(
+            profile_name="deep_local",
+            reasoning={"thinking_minutes": 120, "mode": "deep"},
+            ui={"show_debug_pane": False, "app_shell": "tkinter"},
+            desktop={"enabled": False, "approval_policy": "approve_risky_only"},
+        )
+
+        await self.storage.save_user_settings_profile(profile)
+
+        loaded = await self.storage.load_user_settings_profile("deep_local")
+        profiles = await self.storage.list_user_settings_profiles()
+
+        self.assertEqual(loaded, profile)
+        self.assertEqual(profiles, (profile,))
+
+    async def test_storage_imports_and_exports_user_settings_profiles(self) -> None:
+        profile = UserSettingsProfile(
+            profile_name="portable",
+            reasoning={"thinking_minutes": 45, "mode": "fast"},
+            cloud={"enabled": False, "mode": "disabled"},
+        )
+        export_path = self.test_logs / "portable_profile.json"
+
+        await self.storage.save_user_settings_profile(profile)
+        written_path = await self.storage.export_user_settings_profile("portable", export_path)
+        imported = await self.storage.import_user_settings_profile(written_path)
+
+        self.assertTrue(written_path.exists())
+        self.assertEqual(imported.profile_name, "portable")
+        self.assertEqual(imported.reasoning["mode"], "fast")
+
+    async def test_storage_lists_archives_rebuilds_and_removes_source_documents(self) -> None:
+        async def fake_embed(text: str) -> list[float]:
+            return [float((index + len(text)) % 7) / 7.0 for index in range(APP_CONFIG.model_tuning.embedding_dimensions)]
+
+        document = await self.storage.ingest_document(
+            source_ref="local://knowledge/doc1",
+            title="Knowledge Doc",
+            content="Knowledge document content for archive and rebuild coverage.",
+            metadata={"corpus_origin": "user_local", "corpus_tier": "user"},
+            embed_document=fake_embed,
+            embedding_model_name="stub-embed",
+        )
+
+        listed = await self.storage.list_source_documents()
+        archived = await self.storage.set_document_archived(document.source_ref, archived=True)
+        rebuilt = await self.storage.rebuild_document(
+            document.source_ref,
+            embed_document=fake_embed,
+            embedding_model_name="stub-embed-v2",
+        )
+        chunk_count = await self.storage.count_document_chunks(document.document_id)
+        embedding_model = await self.storage.get_document_embedding_model(document.document_id)
+        removed = await self.storage.remove_document(document.source_ref)
+
+        self.assertEqual(listed[0].source_ref, document.source_ref)
+        self.assertGreater(chunk_count, 0)
+        self.assertTrue(bool(archived and archived.metadata.get("archived", False)))
+        self.assertEqual(rebuilt.source_ref, document.source_ref)
+        self.assertEqual(embedding_model, "stub-embed-v2")
+        self.assertTrue(removed)
+        self.assertEqual(await self.storage.list_source_documents(), ())
 
     async def test_storage_persists_web_evidence_records(self) -> None:
         record = WebEvidenceRecord(
