@@ -14,10 +14,19 @@ from config import APP_CONFIG, AppConfig
 from data_structures import (
     AgentStatus,
     BoundedCacheSnapshot,
+    CapabilityAuditRecord,
+    CapabilityRegistryView,
+    CloudOffloadRecord,
+    CodingPattern,
+    CodingPatternTier,
+    CodingTaskResult,
+    PracticeSessionResult,
     CompressedTrace,
     CompressionRuntimeSubset,
     CritiqueResult,
     DecoderEntry,
+    LocalTaskSession,
+    LocalTaskSessionState,
     LongHorizonExportBundle,
     LongHorizonCheckpoint,
     LongHorizonSession,
@@ -41,14 +50,21 @@ from data_structures import (
     VerifiedDeepTraceExport,
     WebEvidenceRecord,
     coerce_agent_status,
+    coerce_capability_audit_record,
+    coerce_capability_registry_view,
+    coerce_cloud_offload_record,
+    coerce_coding_pattern,
+    coerce_coding_task_result,
     coerce_compressed_trace,
     coerce_decoder_entry,
+    coerce_local_task_session,
     coerce_long_horizon_checkpoint,
     coerce_long_horizon_export_bundle,
     coerce_long_horizon_session,
     coerce_model_registry_view,
     coerce_optimizer_activation_record,
     coerce_optimizer_proposal_record,
+    coerce_practice_session_result,
     coerce_optimizer_replay_evaluation,
     coerce_optimizer_replay_sample,
     coerce_optimizer_rollback_record,
@@ -268,6 +284,245 @@ class TaskRepository(_SQLiteRepository):
             rows = cursor.fetchall()
         return tuple(TaskResult.from_dict(_json_loads(row["payload_json"])) for row in rows)
 
+
+class CodingTaskResultRepository(_SQLiteRepository):
+    """Bounded persistence for Coding Mode task runs."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coding_task_runs (
+                request_id TEXT PRIMARY KEY,
+                task_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                language TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_coding_task_runs_type ON coding_task_runs (task_type);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_coding_task_runs_status ON coding_task_runs (status);"
+        )
+        conn.commit()
+
+    def upsert(self, result: CodingTaskResult) -> None:
+        conn = self._conn()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO coding_task_runs (
+                    request_id,
+                    task_type,
+                    status,
+                    language,
+                    updated_at,
+                    payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(request_id) DO UPDATE SET
+                    task_type = excluded.task_type,
+                    status = excluded.status,
+                    language = excluded.language,
+                    updated_at = excluded.updated_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    result.request_id,
+                    result.task_type.value,
+                    result.status,
+                    result.language,
+                    result.updated_at.isoformat(),
+                    _json_dumps(result.to_dict()),
+                ),
+            )
+            conn.commit()
+
+    def get(self, request_id: str) -> CodingTaskResult | None:
+        conn = self._conn()
+        with self._lock:
+            row = conn.execute(
+                "SELECT payload_json FROM coding_task_runs WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CodingTaskResult.from_dict(_json_loads(row["payload_json"]))
+
+    def list(self, *, limit: int | None = None) -> tuple[CodingTaskResult, ...]:
+        conn = self._conn()
+        query = "SELECT payload_json FROM coding_task_runs ORDER BY updated_at DESC, request_id DESC"
+        values: tuple[Any, ...] = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            values = (limit,)
+        with self._lock:
+            rows = conn.execute(query, values).fetchall()
+        return tuple(CodingTaskResult.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
+class CodingPatternRepository(_SQLiteRepository):
+    """Structured indexed coding-memory persistence with gated tiers."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coding_patterns (
+                pattern_id TEXT PRIMARY KEY,
+                tier TEXT NOT NULL,
+                language TEXT NOT NULL,
+                framework TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_coding_patterns_tier ON coding_patterns (tier);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_coding_patterns_language ON coding_patterns (language);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_coding_patterns_task_type ON coding_patterns (task_type);")
+        conn.commit()
+
+    def upsert_many(self, patterns: Sequence[CodingPattern]) -> None:
+        if not patterns:
+            return
+        conn = self._conn()
+        with self._lock:
+            conn.executemany(
+                """
+                INSERT INTO coding_patterns (
+                    pattern_id,
+                    tier,
+                    language,
+                    framework,
+                    task_type,
+                    updated_at,
+                    payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pattern_id) DO UPDATE SET
+                    tier = excluded.tier,
+                    language = excluded.language,
+                    framework = excluded.framework,
+                    task_type = excluded.task_type,
+                    updated_at = excluded.updated_at,
+                    payload_json = excluded.payload_json
+                """,
+                [
+                    (
+                        pattern.pattern_id,
+                        pattern.tier.value,
+                        pattern.language,
+                        pattern.framework,
+                        pattern.task_type.value,
+                        pattern.updated_at.isoformat(),
+                        _json_dumps(pattern.to_dict()),
+                    )
+                    for pattern in patterns
+                ],
+            )
+            conn.commit()
+
+    def list(
+        self,
+        *,
+        tier: CodingPatternTier | str | None = None,
+        language: str | None = None,
+        task_type: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[CodingPattern, ...]:
+        conn = self._conn()
+        clauses: list[str] = []
+        values: list[Any] = []
+        if tier is not None:
+            resolved_tier = tier.value if isinstance(tier, CodingPatternTier) else str(tier)
+            clauses.append("tier = ?")
+            values.append(resolved_tier)
+        if language:
+            clauses.append("language = ?")
+            values.append(language)
+        if task_type:
+            clauses.append("task_type = ?")
+            values.append(task_type)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"SELECT payload_json FROM coding_patterns {where_clause} ORDER BY updated_at DESC, pattern_id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(limit)
+        with self._lock:
+            rows = conn.execute(query, tuple(values)).fetchall()
+        return tuple(CodingPattern.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
+class CodingPracticeSessionRepository(_SQLiteRepository):
+    """Bounded persistence for idle Coding Dojo practice sessions."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coding_practice_sessions (
+                session_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                language TEXT NOT NULL,
+                completed_at TEXT,
+                payload_json TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_coding_practice_sessions_status ON coding_practice_sessions (status);"
+        )
+        conn.commit()
+
+    def upsert(self, result: PracticeSessionResult) -> None:
+        conn = self._conn()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO coding_practice_sessions (
+                    session_id,
+                    status,
+                    task_type,
+                    language,
+                    completed_at,
+                    payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    status = excluded.status,
+                    task_type = excluded.task_type,
+                    language = excluded.language,
+                    completed_at = excluded.completed_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    result.session_id,
+                    result.status,
+                    result.task_type.value,
+                    result.language,
+                    result.completed_at.isoformat() if result.completed_at is not None else "",
+                    _json_dumps(result.to_dict()),
+                ),
+            )
+            conn.commit()
+
+    def list(self, *, limit: int | None = None) -> tuple[PracticeSessionResult, ...]:
+        conn = self._conn()
+        query = (
+            "SELECT payload_json FROM coding_practice_sessions "
+            "ORDER BY COALESCE(completed_at, '') DESC, session_id DESC"
+        )
+        values: tuple[Any, ...] = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            values = (limit,)
+        with self._lock:
+            rows = conn.execute(query, values).fetchall()
+        return tuple(PracticeSessionResult.from_dict(_json_loads(row["payload_json"])) for row in rows)
 
 class AgentStatusRepository(_SQLiteRepository):
     """Append-only status history shared by runtime, storage, and dashboard consumers."""
@@ -2208,6 +2463,194 @@ class OptimizerSuggestionUsageRepository(_SQLiteRepository):
         return tuple(OptimizerSuggestionUsageRecord.from_dict(_json_loads(row["payload_json"])) for row in rows)
 
 
+class CapabilityAuditRepository(_SQLiteRepository):
+    """Append-only persisted audit history for typed capability requests."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS capability_audit_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                audit_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                capability_type TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_capability_audit_request "
+            "ON capability_audit_records (request_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_capability_audit_type "
+            "ON capability_audit_records (capability_type);"
+        )
+        conn.commit()
+
+    def append_many(self, records: Sequence[CapabilityAuditRecord], *, audit_path: Path) -> None:
+        if not records:
+            return
+        conn = self._conn()
+        with self._lock:
+            conn.executemany(
+                """
+                INSERT INTO capability_audit_records (
+                    audit_id,
+                    request_id,
+                    capability_type,
+                    event_type,
+                    payload_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        record.audit_id,
+                        record.request_id,
+                        record.capability_type.value,
+                        record.event_type.value,
+                        _json_dumps(record.to_dict()),
+                        record.created_at.isoformat(),
+                    )
+                    for record in records
+                ],
+            )
+            conn.commit()
+            for record in records:
+                _append_jsonl(audit_path, record.to_dict())
+
+    def list(
+        self,
+        *,
+        request_id: str | None = None,
+        capability_type: str | None = None,
+    ) -> tuple[CapabilityAuditRecord, ...]:
+        conn = self._conn()
+        clauses: list[str] = []
+        values: list[str] = []
+        if request_id is not None:
+            clauses.append("request_id = ?")
+            values.append(request_id)
+        if capability_type is not None:
+            clauses.append("capability_type = ?")
+            values.append(capability_type)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cursor = conn.execute(
+                f"""
+                SELECT payload_json
+                FROM capability_audit_records
+                {where_clause}
+                ORDER BY id
+                """,
+                tuple(values),
+            )
+            rows = cursor.fetchall()
+        return tuple(CapabilityAuditRecord.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
+class CloudOffloadRepository(_SQLiteRepository):
+    """Append-only persisted audit history for auxiliary cloud dispatch attempts."""
+
+    def create_tables(self) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cloud_offload_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dispatch_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cloud_offload_job "
+            "ON cloud_offload_records (job_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cloud_offload_capability "
+            "ON cloud_offload_records (capability);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cloud_offload_outcome "
+            "ON cloud_offload_records (outcome);"
+        )
+        conn.commit()
+
+    def append_many(self, records: Sequence[CloudOffloadRecord], *, audit_path: Path) -> None:
+        if not records:
+            return
+        conn = self._conn()
+        with self._lock:
+            conn.executemany(
+                """
+                INSERT INTO cloud_offload_records (
+                    dispatch_id,
+                    job_id,
+                    capability,
+                    outcome,
+                    payload_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        record.dispatch_id,
+                        record.job_id,
+                        record.capability.value,
+                        record.outcome.value,
+                        _json_dumps(record.to_dict()),
+                        record.created_at.isoformat(),
+                    )
+                    for record in records
+                ],
+            )
+            conn.commit()
+            for record in records:
+                _append_jsonl(audit_path, record.to_dict())
+
+    def list(
+        self,
+        *,
+        job_id: str | None = None,
+        capability: str | None = None,
+        outcome: str | None = None,
+    ) -> tuple[CloudOffloadRecord, ...]:
+        conn = self._conn()
+        clauses: list[str] = []
+        values: list[str] = []
+        if job_id is not None:
+            clauses.append("job_id = ?")
+            values.append(job_id)
+        if capability is not None:
+            clauses.append("capability = ?")
+            values.append(capability)
+        if outcome is not None:
+            clauses.append("outcome = ?")
+            values.append(outcome)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cursor = conn.execute(
+                f"""
+                SELECT payload_json
+                FROM cloud_offload_records
+                {where_clause}
+                ORDER BY id
+                """,
+                tuple(values),
+            )
+            rows = cursor.fetchall()
+        return tuple(CloudOffloadRecord.from_dict(_json_loads(row["payload_json"])) for row in rows)
+
+
 class StorageManager:
     """Owns local persistence lifecycle and additively exposes specialized repositories."""
 
@@ -2217,6 +2660,8 @@ class StorageManager:
         self._db_path: Path = config.storage.sqlite_path
         self._logs_dir: Path = config.storage.logs_dir
         self._events_path: Path = self._logs_dir / config.storage.events_log_name
+        self._capability_audit_path: Path = self._logs_dir / config.storage.capability_audit_log_name
+        self._cloud_offload_path: Path = self._logs_dir / config.storage.cloud_offload_log_name
         self._trace_path: Path = self._logs_dir / config.storage.trace_log_name
         self._web_path: Path = self._logs_dir / config.storage.web_log_name
         self._status_path: Path = self._logs_dir / config.storage.status_log_name
@@ -2231,6 +2676,9 @@ class StorageManager:
         self.events = EventLogRepository(self)
         self.kv = KeyValueRepository(self)
         self.tasks = TaskRepository(self)
+        self.coding_tasks = CodingTaskResultRepository(self)
+        self.coding_patterns = CodingPatternRepository(self)
+        self.coding_practice_sessions = CodingPracticeSessionRepository(self)
         self.agent_statuses = AgentStatusRepository(self)
         self.web_evidence = WebEvidenceRepository(self)
         self.documents = SourceDocumentRepository(self)
@@ -2250,6 +2698,8 @@ class StorageManager:
         self.optimizer_rollback_records = OptimizerRollbackRecordRepository(self)
         self.optimizer_suggestion_records = OptimizerSuggestionRecordRepository(self)
         self.optimizer_suggestion_usage_records = OptimizerSuggestionUsageRepository(self)
+        self.capability_audits = CapabilityAuditRepository(self)
+        self.cloud_offloads = CloudOffloadRepository(self)
         self.retrieval = LocalRetrievalService(
             settings=self.config.retrieval,
             lexical_store=self.chunks,
@@ -2277,6 +2727,9 @@ class StorageManager:
             self.events,
             self.kv,
             self.tasks,
+            self.coding_tasks,
+            self.coding_patterns,
+            self.coding_practice_sessions,
             self.agent_statuses,
             self.web_evidence,
             self.documents,
@@ -2296,6 +2749,8 @@ class StorageManager:
             self.optimizer_rollback_records,
             self.optimizer_suggestion_records,
             self.optimizer_suggestion_usage_records,
+            self.capability_audits,
+            self.cloud_offloads,
         ):
             repository.create_tables()
 
@@ -2563,7 +3018,7 @@ class StorageManager:
         profile: UserSettingsProfile | dict[str, Any],
     ) -> None:
         """Persist one named user-settings profile in the KV store."""
-        settings_profile = coerce_user_settings_profile(profile)
+        settings_profile = UserSettingsProfile.from_dict(coerce_user_settings_profile(profile).to_dict())
         key = f"user_settings_profile:{settings_profile.profile_name}"
         profile_names = {
             str(name)
@@ -2595,6 +3050,61 @@ class StorageManager:
                 continue
             profiles.append(coerce_user_settings_profile(payload))
         return tuple(profiles)
+
+    async def save_local_task_session(
+        self,
+        session: LocalTaskSession | dict[str, Any],
+    ) -> None:
+        """Persist one explicit local task session summary in the KV store."""
+        normalized = coerce_local_task_session(session)
+        key = f"local_task_session:{normalized.session_id}"
+        session_ids = {
+            str(item)
+            for item in (self.kv.get("local_task_session_ids") or [])
+            if str(item).strip()
+        }
+        session_ids.add(normalized.session_id)
+        self.kv.set(key, normalized.to_dict())
+        self.kv.set("local_task_session_ids", sorted(session_ids))
+        active_session_id = str(self.kv.get("active_local_task_session_id") or "")
+        if normalized.status in {LocalTaskSessionState.RUNNING, LocalTaskSessionState.PAUSED}:
+            self.kv.set("active_local_task_session_id", normalized.session_id)
+        elif active_session_id == normalized.session_id:
+            self.kv.set("active_local_task_session_id", "")
+
+    async def load_local_task_session(self, session_id: str) -> LocalTaskSession | None:
+        """Load one persisted local task session by ID."""
+        payload = self.kv.get(f"local_task_session:{session_id}")
+        if payload is None:
+            return None
+        return coerce_local_task_session(payload)
+
+    async def list_local_task_sessions(self) -> tuple[LocalTaskSession, ...]:
+        """List persisted local task sessions in a stable order."""
+        session_ids = tuple(
+            str(item)
+            for item in (self.kv.get("local_task_session_ids") or [])
+            if str(item).strip()
+        )
+        sessions: list[LocalTaskSession] = []
+        for session_id in session_ids:
+            payload = self.kv.get(f"local_task_session:{session_id}")
+            if payload is None:
+                continue
+            sessions.append(coerce_local_task_session(payload))
+        return tuple(sorted(sessions, key=lambda item: (item.updated_at, item.session_id)))
+
+    async def save_active_local_task_session_id(self, session_id: str) -> None:
+        """Persist the currently selected local task session identifier."""
+        normalized = str(session_id).strip()
+        self.kv.set("active_local_task_session_id", normalized)
+
+    async def load_active_local_task_session(self) -> LocalTaskSession | None:
+        """Load the current active local task session, if any."""
+        session_id = str(self.kv.get("active_local_task_session_id") or "").strip()
+        if not session_id:
+            return None
+        return await self.load_local_task_session(session_id)
 
     async def save_long_horizon_session(
         self,
@@ -2698,6 +3208,70 @@ class StorageManager:
         """Return persisted task results ordered by update time."""
         self._require_conn()
         return self.tasks.list(limit=limit)
+
+    async def record_coding_task_result(
+        self,
+        result: CodingTaskResult | dict[str, Any],
+    ) -> None:
+        """Persist one bounded Coding Mode task result."""
+        normalized = coerce_coding_task_result(result)
+        self.coding_tasks.upsert(normalized)
+
+    async def get_coding_task_result(self, request_id: str) -> CodingTaskResult | None:
+        """Load one Coding Mode task result by request id."""
+        self._require_conn()
+        return self.coding_tasks.get(request_id)
+
+    async def list_coding_task_results(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> tuple[CodingTaskResult, ...]:
+        """Return persisted Coding Mode task results ordered by update time."""
+        self._require_conn()
+        return self.coding_tasks.list(limit=limit)
+
+    async def save_coding_patterns(
+        self,
+        patterns: Sequence[CodingPattern | dict[str, Any]],
+    ) -> None:
+        """Persist one or more gated coding-memory patterns."""
+        normalized = tuple(coerce_coding_pattern(item) for item in patterns)
+        self.coding_patterns.upsert_many(normalized)
+
+    async def list_coding_patterns(
+        self,
+        *,
+        tier: CodingPatternTier | str | None = None,
+        language: str | None = None,
+        task_type: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[CodingPattern, ...]:
+        """Return indexed coding-memory patterns with simple filters."""
+        self._require_conn()
+        return self.coding_patterns.list(
+            tier=tier,
+            language=language,
+            task_type=task_type,
+            limit=limit,
+        )
+
+    async def record_coding_practice_session(
+        self,
+        session: PracticeSessionResult | dict[str, Any],
+    ) -> None:
+        """Persist one idle Coding Dojo practice result."""
+        normalized = coerce_practice_session_result(session)
+        self.coding_practice_sessions.upsert(normalized)
+
+    async def list_coding_practice_sessions(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> tuple[PracticeSessionResult, ...]:
+        """Return persisted Coding Dojo practice sessions."""
+        self._require_conn()
+        return self.coding_practice_sessions.list(limit=limit)
 
     async def export_user_settings_profile(self, profile_name: str, export_path: Path) -> Path:
         """Write one settings profile to a machine-readable JSON file."""
@@ -3018,6 +3592,72 @@ class StorageManager:
         """Return persisted advisory usage records in append order."""
         self._require_conn()
         return self.optimizer_suggestion_usage_records.list(session_id=session_id, suggestion_id=suggestion_id)
+
+    async def record_capability_audit(
+        self,
+        record: CapabilityAuditRecord | dict[str, Any],
+    ) -> None:
+        """Persist one capability audit record."""
+        await self.record_capability_audits((record,))
+
+    async def record_capability_audits(
+        self,
+        records: Sequence[CapabilityAuditRecord | dict[str, Any]],
+    ) -> None:
+        """Persist capability audit records to SQLite and JSONL."""
+        normalized = tuple(coerce_capability_audit_record(item) for item in records)
+        self.capability_audits.append_many(normalized, audit_path=self._capability_audit_path)
+
+    async def list_capability_audits(
+        self,
+        *,
+        request_id: str | None = None,
+        capability_type: str | None = None,
+    ) -> tuple[CapabilityAuditRecord, ...]:
+        """Return persisted capability audit records in append order."""
+        self._require_conn()
+        return self.capability_audits.list(request_id=request_id, capability_type=capability_type)
+
+    async def record_cloud_offload_record(
+        self,
+        record: CloudOffloadRecord | dict[str, Any],
+    ) -> None:
+        """Persist one cloud offload audit record."""
+        await self.record_cloud_offload_records((record,))
+
+    async def record_cloud_offload_records(
+        self,
+        records: Sequence[CloudOffloadRecord | dict[str, Any]],
+    ) -> None:
+        """Persist auxiliary cloud offload records to SQLite and JSONL."""
+        normalized = tuple(coerce_cloud_offload_record(item) for item in records)
+        self.cloud_offloads.append_many(normalized, audit_path=self._cloud_offload_path)
+
+    async def list_cloud_offload_records(
+        self,
+        *,
+        job_id: str | None = None,
+        capability: str | None = None,
+        outcome: str | None = None,
+    ) -> tuple[CloudOffloadRecord, ...]:
+        """Return persisted auxiliary cloud offload records in append order."""
+        self._require_conn()
+        return self.cloud_offloads.list(job_id=job_id, capability=capability, outcome=outcome)
+
+    async def save_capability_registry_view(
+        self,
+        registry_view: CapabilityRegistryView | dict[str, Any],
+    ) -> None:
+        """Persist the latest capability registry view for the dashboard/control plane."""
+        normalized = coerce_capability_registry_view(registry_view)
+        self.kv.set("capability_registry_view", normalized.to_dict())
+
+    async def load_capability_registry_view(self) -> CapabilityRegistryView:
+        """Load the persisted capability registry view or return an empty default view."""
+        payload = self.kv.get("capability_registry_view")
+        if payload is None:
+            return CapabilityRegistryView()
+        return coerce_capability_registry_view(payload)
 
     async def save_model_registry_view(
         self,

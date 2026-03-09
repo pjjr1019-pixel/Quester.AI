@@ -10,8 +10,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from config import APP_CONFIG
+from data_structures import UserSettingsProfile
 from model_manager import ModelHealthSnapshot
-from orchestrator import Orchestrator, run_dashboard_app
+from orchestrator import Orchestrator, run_packaged_dashboard_app
+from storage import StorageManager
 
 
 def _build_test_config(
@@ -110,13 +112,16 @@ class Phase12PackagedSmokeTests(unittest.IsolatedAsyncioTestCase):
             models_dir=str(self.models_dir),
         )
 
-        result = await run_dashboard_app(config=config, support_bundle_dir=bundle_dir)
+        result = await run_packaged_dashboard_app(config=config, support_bundle_dir=bundle_dir)
 
         assert result is not None
         self.assertEqual(result.plan.question, "What should I build first?")
         self.assertTrue((bundle_dir / "support_bundle_manifest.json").exists())
         self.assertTrue((bundle_dir / "launch_report.json").exists())
         self.assertTrue((bundle_dir / "readiness_report.json").exists())
+        self.assertTrue((bundle_dir / "packaged_preflight_report.json").exists())
+        self.assertTrue((bundle_dir / "packaged_onboarding.txt").exists())
+        self.assertTrue((bundle_dir / "LOCAL_MODEL_SETUP.md").exists())
         self.assertTrue((bundle_dir / "user_settings_profile.json").exists())
         self.assertTrue((bundle_dir / "app_state.json").exists())
         self.assertTrue((bundle_dir / "support_bundle.txt").exists())
@@ -124,18 +129,25 @@ class Phase12PackagedSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((bundle_dir / "traces.jsonl").exists())
         self.assertTrue((bundle_dir / "status.jsonl").exists())
         launch_report = json.loads((bundle_dir / "launch_report.json").read_text(encoding="utf-8"))
+        preflight_report = json.loads((bundle_dir / "packaged_preflight_report.json").read_text(encoding="utf-8"))
         manifest = json.loads((bundle_dir / "support_bundle_manifest.json").read_text(encoding="utf-8"))
 
         self.assertEqual(launch_report["requested_mode"], "stub")
         self.assertEqual(launch_report["effective_mode"], "stub")
         self.assertTrue(launch_report["launch_ready"])
         self.assertFalse(launch_report["used_stub_fallback"])
+        self.assertEqual(
+            preflight_report["default_model_bundle"]["generation"],
+            "ollama:qwen2.5:3b-instruct-q4_K_M",
+        )
+        self.assertTrue(str(preflight_report["setup_guide_path"]).endswith("LOCAL_MODEL_SETUP.md"))
         self.assertEqual(Path(manifest["bundle_dir"]).name, bundle_dir.name)
+        self.assertTrue(str(manifest["preflight_report_path"]).endswith("packaged_preflight_report.json"))
         self.assertGreater((bundle_dir / "events.jsonl").stat().st_size, 0)
         self.assertGreater((bundle_dir / "traces.jsonl").stat().st_size, 0)
         self.assertGreater((bundle_dir / "status.jsonl").stat().st_size, 0)
 
-    async def test_packaged_launch_falls_back_to_stub_and_records_readable_failure(self) -> None:
+    async def test_packaged_first_run_uses_stub_mode_even_when_real_mode_is_requested_in_config(self) -> None:
         config, bundle_dir = _build_test_config(
             stub_mode=False,
             sqlite_name=str(self.test_db),
@@ -146,6 +158,51 @@ class Phase12PackagedSmokeTests(unittest.IsolatedAsyncioTestCase):
             generation_fallback_backend="llama_cpp",
             embedding_backend="sentence_transformers",
         )
+
+        result = await run_packaged_dashboard_app(config=config, support_bundle_dir=bundle_dir)
+
+        assert result is not None
+        launch_report = json.loads((bundle_dir / "launch_report.json").read_text(encoding="utf-8"))
+        app_state = json.loads((bundle_dir / "app_state.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(launch_report["requested_mode"], "stub")
+        self.assertEqual(launch_report["effective_mode"], "stub")
+        self.assertTrue(launch_report["launch_ready"])
+        self.assertFalse(launch_report["used_stub_fallback"])
+        self.assertEqual(launch_report["blocking_reason"], "")
+        self.assertIn("first-run local validation", launch_report["summary"])
+        self.assertTrue(app_state["user_settings"]["runtime"]["stub_mode"])
+        self.assertIn("first-run validation", app_state["last_notice"])
+
+    async def test_packaged_launch_falls_back_to_stub_for_saved_real_profile_and_records_readable_failure(self) -> None:
+        config, bundle_dir = _build_test_config(
+            stub_mode=False,
+            sqlite_name=str(self.test_db),
+            logs_name=str(self.test_logs),
+            bundle_name=str(self.test_bundle),
+            models_dir=str(self.models_dir),
+            generation_backend="ollama",
+            generation_fallback_backend="llama_cpp",
+            embedding_backend="sentence_transformers",
+        )
+        storage = StorageManager(config=config)
+        await storage.start()
+        try:
+            await storage.save_user_settings_profile(
+                UserSettingsProfile(
+                    profile_name="default",
+                    runtime={
+                        "stub_mode": False,
+                        "allow_web_fallback": True,
+                        "enable_self_optimizer": False,
+                        "generation_backend": "ollama",
+                        "embedding_backend": "sentence_transformers",
+                        "vector_store_backend": "simple_inmemory",
+                    },
+                )
+            )
+        finally:
+            await storage.stop()
 
         dependency_map = {
             "chromadb": False,
@@ -164,7 +221,7 @@ class Phase12PackagedSmokeTests(unittest.IsolatedAsyncioTestCase):
                 autospec=True,
                 return_value=(False, "Ollama service probe failed at http://localhost:11434/api/tags: refused"),
             ):
-                result = await run_dashboard_app(config=config, support_bundle_dir=bundle_dir)
+                result = await run_packaged_dashboard_app(config=config, support_bundle_dir=bundle_dir)
 
         assert result is not None
         launch_report = json.loads((bundle_dir / "launch_report.json").read_text(encoding="utf-8"))
@@ -178,6 +235,7 @@ class Phase12PackagedSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(launch_report["blocking_reason"], "missing_ollama_service")
         self.assertIn("probe failed", launch_report["blocking_detail"])
         self.assertIn("fall back to stub mode", launch_report["summary"])
+        self.assertTrue(app_state["user_settings"]["runtime"]["stub_mode"])
         self.assertIn("missing_ollama_service", support_readme)
         self.assertIn("fall back to stub mode", app_state["last_notice"])
 

@@ -346,6 +346,7 @@ class Phase3ModelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         await manager.start()
         self.addAsyncCleanup(manager.stop)
+        manager._fallback_generation_backend = None
 
         with self.assertRaises(ResourcePressureError):
             await manager.generate("hello")

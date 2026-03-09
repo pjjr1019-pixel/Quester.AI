@@ -206,6 +206,41 @@ class CodeSpecialistSettings:
 
 
 @dataclass(frozen=True)
+class CodingModeSettings:
+    """Bounded local coding-mode settings for sandboxed code tasks and idle practice."""
+
+    default_language: str = "python"
+    sandbox_timeout_s: float = 8.0
+    max_source_chars: int = 12000
+    max_source_lines: int = 400
+    max_generated_files: int = 4
+    max_candidate_patterns: int = 6
+    max_verified_patterns: int = 3
+    max_rejected_patterns: int = 6
+    practice_history_limit: int = 64
+    practice_idle_after_s: float = 300.0
+    allow_idle_practice_in_stub_mode: bool = True
+
+
+@dataclass(frozen=True)
+class ObservationRuntimeSettings:
+    """Hard caps for optional observation tiers before heavier vision features exist."""
+
+    default_capture_fps: float = 0.5
+    max_capture_fps: float = 1.0
+    default_capture_width: int = 960
+    default_capture_height: int = 540
+    max_capture_width: int = 1280
+    max_capture_height: int = 720
+    default_frame_history: int = 4
+    max_frame_history: int = 8
+    default_diff_threshold: float = 0.03
+    min_diff_threshold: float = 0.01
+    max_diff_threshold: float = 0.50
+    capture_directory_name: str = "continuous_capture"
+
+
+@dataclass(frozen=True)
 class BudgetCalibrationSettings:
     """Budget caps calibrated for the baseline target and the current dev machine."""
 
@@ -325,6 +360,8 @@ class StorageSettings:
     sqlite_path: Path = Path("quester.sqlite3")
     logs_dir: Path = Path("logs")
     events_log_name: str = "events.jsonl"
+    capability_audit_log_name: str = "capability_audit.jsonl"
+    cloud_offload_log_name: str = "cloud_offload.jsonl"
     trace_log_name: str = "traces.jsonl"
     web_log_name: str = "web.jsonl"
     status_log_name: str = "status.jsonl"
@@ -379,6 +416,8 @@ class AppConfig:
     audio: AudioSettings = field(default_factory=AudioSettings)
     translation: TranslationSettings = field(default_factory=TranslationSettings)
     code_specialist: CodeSpecialistSettings = field(default_factory=CodeSpecialistSettings)
+    coding_mode: CodingModeSettings = field(default_factory=CodingModeSettings)
+    observation_runtime: ObservationRuntimeSettings = field(default_factory=ObservationRuntimeSettings)
     budget_calibration: BudgetCalibrationSettings = field(default_factory=BudgetCalibrationSettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
     dashboard: DashboardSettings = field(default_factory=DashboardSettings)
@@ -426,6 +465,44 @@ class AppConfig:
             raise ValueError("low_vram_headroom_gb must be >= 0.")
         if self.backend_runtime.llama_cpp_context_window < 256:
             raise ValueError("llama_cpp_context_window must be at least 256.")
+        if not self.coding_mode.default_language.strip():
+            raise ValueError("coding_mode.default_language must not be empty.")
+        if self.coding_mode.sandbox_timeout_s <= 0:
+            raise ValueError("coding_mode.sandbox_timeout_s must be positive.")
+        if self.coding_mode.max_source_chars < 256:
+            raise ValueError("coding_mode.max_source_chars must be at least 256.")
+        if self.coding_mode.max_source_lines < 16:
+            raise ValueError("coding_mode.max_source_lines must be at least 16.")
+        if self.coding_mode.max_generated_files < 1:
+            raise ValueError("coding_mode.max_generated_files must be positive.")
+        if self.coding_mode.max_candidate_patterns < 1:
+            raise ValueError("coding_mode.max_candidate_patterns must be positive.")
+        if self.coding_mode.max_verified_patterns < 1:
+            raise ValueError("coding_mode.max_verified_patterns must be positive.")
+        if self.coding_mode.max_rejected_patterns < 1:
+            raise ValueError("coding_mode.max_rejected_patterns must be positive.")
+        if self.coding_mode.practice_history_limit < 1:
+            raise ValueError("coding_mode.practice_history_limit must be positive.")
+        if self.coding_mode.practice_idle_after_s < 0:
+            raise ValueError("coding_mode.practice_idle_after_s must be zero or positive.")
+        if self.observation_runtime.default_capture_fps <= 0:
+            raise ValueError("default_capture_fps must be positive.")
+        if self.observation_runtime.max_capture_fps < self.observation_runtime.default_capture_fps:
+            raise ValueError("max_capture_fps must be >= default_capture_fps.")
+        if self.observation_runtime.max_capture_width < self.observation_runtime.default_capture_width:
+            raise ValueError("max_capture_width must be >= default_capture_width.")
+        if self.observation_runtime.max_capture_height < self.observation_runtime.default_capture_height:
+            raise ValueError("max_capture_height must be >= default_capture_height.")
+        if self.observation_runtime.default_frame_history < 1:
+            raise ValueError("default_frame_history must be positive.")
+        if self.observation_runtime.max_frame_history < self.observation_runtime.default_frame_history:
+            raise ValueError("max_frame_history must be >= default_frame_history.")
+        if not 0.0 < self.observation_runtime.min_diff_threshold <= self.observation_runtime.default_diff_threshold:
+            raise ValueError("min_diff_threshold must be > 0 and <= default_diff_threshold.")
+        if self.observation_runtime.default_diff_threshold > self.observation_runtime.max_diff_threshold:
+            raise ValueError("default_diff_threshold must be <= max_diff_threshold.")
+        if not self.observation_runtime.capture_directory_name.strip():
+            raise ValueError("capture_directory_name must not be empty.")
         if self.retrieval.chunk_size_chars < 64:
             raise ValueError("chunk_size_chars must be at least 64.")
         if self.retrieval.chunk_overlap_chars < 0:
@@ -529,6 +606,10 @@ class AppConfig:
             raise ValueError("max_macro_depth must support the maximum preset.")
         if not self.storage.events_log_name.strip():
             raise ValueError("events_log_name must not be empty.")
+        if not self.storage.capability_audit_log_name.strip():
+            raise ValueError("capability_audit_log_name must not be empty.")
+        if not self.storage.cloud_offload_log_name.strip():
+            raise ValueError("cloud_offload_log_name must not be empty.")
         if not self.storage.trace_log_name.strip():
             raise ValueError("trace_log_name must not be empty.")
         if not self.storage.web_log_name.strip():

@@ -166,9 +166,9 @@ class Phase12GuiAcceptanceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(state.readiness_report, report)
         self.assertEqual(checks["specialist_roles"].status, "disabled")
-        self.assertEqual(capabilities["desktop_control"].reason, "phase_20_21_not_implemented")
-        self.assertEqual(capabilities["observation_tiers"].reason, "phase_22_not_implemented")
-        self.assertEqual(capabilities["cloud_offload"].reason, "phase_23_not_implemented")
+        self.assertEqual(capabilities["desktop_control"].reason, "desktop_capabilities_not_enabled")
+        self.assertEqual(capabilities["observation_tiers"].reason, "vision_on_step_cpu_fallback")
+        self.assertEqual(capabilities["cloud_offload"].reason, "cloud_capabilities_not_enabled")
 
     async def test_knowledge_library_actions_cover_ingest_archive_rebuild_remove_and_demo_separation(self) -> None:
         await self.orchestrator._run_dashboard_action(action="examples.load_demo_pack", payload={})

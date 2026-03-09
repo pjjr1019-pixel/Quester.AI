@@ -52,6 +52,7 @@ Run the stub-mode app entrypoint:
 
 ```bash
 python -m orchestrator
+quester-ai-packaged
 ```
 
 ## Optional Extras
@@ -93,6 +94,8 @@ Pinned defaults from the current decision log:
 - Web fallback provider: bounded MediaWiki API lookup in real mode, deterministic stub adapter in stub mode
 - Vector store target for future retrieval work: local Chroma persistent collection
 
+Step-by-step setup for that exact bundle lives in [`LOCAL_MODEL_SETUP.md`](./LOCAL_MODEL_SETUP.md).
+
 Current optional specialist-role support:
 - `reranker`: implemented as an opt-in routed local role; the dashboard Settings and Readiness views can enable it without changing the base `generation + embedding` runtime
 - `speech_to_text` and `vad`: implemented as opt-in local voice-input roles with bounded `.wav` processing, deterministic local VAD, a dashboard voice-input tab, stub-mode validation paths, and optional Windows `System.Speech` transcription when available
@@ -113,6 +116,29 @@ Pinned lightweight specialist-role defaults:
 
 Phase 20 foundation:
 - `capability_guardrails.py` now codifies the first desktop/control guardrail: future desktop or cloud helpers must extend the current local-first runtime, keep `Orchestrator.run_task(question, thinking_minutes)` as the public task entrypoint, preserve the base `generation + embedding` pair plus local storage and audit path, remain opt-in, and never make cloud helpers the primary execution path.
+- `data_structures.py` and `capability_runtime.py` now define typed capability requests for file, shell, browser, app-focus, clipboard, screenshot, OCR, and desktop-input actions, plus typed policy outcomes, capability registrations, audit records, and execution results.
+- `orchestrator.py`, `storage.py`, and `dashboard.py` now route those requests through a persisted capability registry, explicit allowlists, audit logging, approval-gated policy decisions, and bounded execution paths instead of unrestricted OS control.
+
+Phase 21 session foundation:
+- `data_structures.py` and `storage.py` now define and persist explicit local task sessions, including session state, pending approvals, active-session tracking, and dashboard session projections.
+- `orchestrator.py` now requires an active local task session before capability execution can proceed, recovers or pauses sessions safely on restart or shutdown, and exposes start, pause, resume, stop, and kill-switch controls before any live OS adapters exist.
+- `dashboard.py` now surfaces visible local-session indicators for control mode, current target, pending approvals, kill-switch state, and last action alongside the existing long-horizon run controls.
+
+Phase 21 live executor tranche:
+- `capability_runtime.py` now executes bounded live file operations inside allowlisted roots for read, write, copy, move, archive, delete, and directory listing requests.
+- `capability_runtime.py` now executes allowlisted shell commands inside allowlisted working directories with bounded timeout plus stdout or stderr capture.
+- `capability_runtime.py` now executes bounded browser `read` and `navigate` actions for allowlisted domains, visible app/window focus actions with title matching and foreground validation, and approval-gated Windows desktop input for bounded typing, key chords, mouse moves, and mouse clicks against validated targets.
+- `orchestrator.py` and `dashboard.py` now surface the live control tier explicitly, including per-capability executor kind, session safety state, loop-guard pauses, recovery pauses, and desktop-control readiness across file, shell, browser, app/window, and direct-input controls.
+
+Phase 22 observation tranche:
+- `capability_runtime.py` now executes screenshot-on-demand capture into allowlisted output paths and CPU-first OCR against allowlisted local images or selected image regions, using Windows OCR first with local `tesseract` fallback when available.
+- `config.py`, `data_structures.py`, and `orchestrator.py` now define and enforce strict continuous-capture caps for low FPS, downscaled resolution, bounded frame history, diff-threshold retention, and region-of-interest behavior, with the capture loop tied directly to local task session start, pause, resume, stop, and shutdown.
+- `orchestrator.py` now treats `ocr_on_step` and `vision_on_step` as explicit per-step observation modes instead of passive labels: successful UI-facing steps can trigger bounded observation captures, low-headroom states skip those captures, and `vision_on_step` records route-aware CPU-OCR fallback until the routed vision executor lands.
+- `model_manager.py` now registers optional routed `vision` and `specialist_perception` roles with pinned lightweight recommendations (`HuggingFaceTB/SmolVLM-256M-Instruct` and `PaddleOCR`), and the heavy-slot scheduler can swap those roles in on demand without letting the runtime exceed two active heavy roles at once.
+- `orchestrator.py` now reports `screenshot_on_demand`, `ocr_on_step`, and `continuous_capture` as live observation tiers in readiness, while `vision_on_step` becomes a routed ready tier when a concrete vision role is enabled and otherwise degrades visibly to CPU OCR fallback.
+- `tests/test_phase22_observation_execution.py` now locks the live screenshot and OCR paths directly, while the existing readiness tests expect the new partial-live observation state.
+- `tests/test_phase22_continuous_capture.py` now locks continuous-capture frame retention, hard-cap enforcement, and readiness projection.
+- `tests/test_phase22_on_step_modes.py` now locks explicit per-step OCR execution, route-aware vision fallback, and low-headroom observation gating.
 
 The code already fails clearly when real-mode prerequisites are missing:
 - missing Ollama service -> backend unavailable/startup error
@@ -253,7 +279,7 @@ This repo is not feature-complete yet.
 
 Known planned areas:
 - the current real web fallback is intentionally narrow and uses MediaWiki as the default provider
-- packaged Windows onboarding and broader release hardening are still future work
+- the packaged path now includes a separate `quester-ai-packaged` entrypoint, startup planning, exported preflight/onboarding artifacts, and stub-mode recovery diagnostics, but broader clean-machine release validation is still the remaining packaging hardening work
 - `jsonschema` is the first optional structured-output helper; heavier structured-output libraries (`outlines`, `msgspec`) and solver helpers (`z3-solver`) remain deliberately off the default path
 
 The authoritative roadmap is in [`Masterplan.txt`](./Masterplan.txt).

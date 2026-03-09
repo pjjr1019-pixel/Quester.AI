@@ -4,18 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import json
+import os
 import shutil
+import subprocess
+import threading
 import time
+import traceback
 from concurrent.futures import CancelledError as ConcurrentCancelledError
 from concurrent.futures import Future as ConcurrentFuture
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from acceptance_thresholds import PHASE12_ACCEPTANCE_THRESHOLDS
+from capability_runtime import CapabilityExecutor, CapabilityPolicyEngine
+from cloud_offload import CloudOffloadManager
+from coding_mode import CodingModeService
 from compressor import CompressorAgent
 from config import APP_CONFIG, AppConfig, BudgetPolicy
 from critic import CriticAgent
@@ -24,12 +32,35 @@ from data_structures import (
     AgentStatus,
     AudioSynthesisResult,
     AudioTranscriptionResult,
+    CapabilityAuditEventType,
+    CapabilityAuditRecord,
+    CapabilityAvailabilityStatus,
+    CapabilityExecutionResult,
+    CapabilityExecutionStatus,
+    CapabilityPolicyDecision,
+    CapabilityPolicyOutcome,
+    CapabilityRegistration,
+    CapabilityRegistryView,
+    CapabilityRequest,
+    CapabilityType,
     CandidateTrace,
+    CloudFallbackBehavior,
+    CloudJobContract,
+    CloudJobPayloadClass,
+    CloudJobPrivacyClass,
+    CloudOffloadCapability,
+    CloudOffloadMode,
+    CloudOffloadOutcome,
+    CloudOffloadRecord,
     CodeSpecialistResult,
+    CodingPattern,
+    CodingTaskRequest,
+    CodingTaskResult,
     CompressedTrace,
     CritiqueReport,
     CritiqueResult,
     DashboardCapabilityAvailability,
+    DashboardLocalTaskSessionState,
     DashboardKnowledgeSource,
     ModelRegistryView,
     ModelRoleActionReport,
@@ -38,6 +69,9 @@ from data_structures import (
     DashboardTaskHistoryEntry,
     DashboardTaskInspector,
     DecodeHint,
+    LocalTaskPendingApproval,
+    LocalTaskSession,
+    LocalTaskSessionState,
     LongHorizonCandidateSnapshot,
     LongHorizonCheckpoint,
     LongHorizonExportBundle,
@@ -51,6 +85,7 @@ from data_structures import (
     PackagedLaunchReport,
     PackagedSupportBundle,
     PerformanceMetric,
+    PracticeSessionResult,
     ModelRole,
     ReasonerCriticHandoff,
     ResearchReasonerHandoff,
@@ -89,12 +124,15 @@ from verification_tools import (
     expected_evidence_count,
 )
 
+_LOCAL_MODEL_SETUP_GUIDE = Path(__file__).resolve().with_name("LOCAL_MODEL_SETUP.md")
+
 
 @dataclass(slots=True, frozen=True)
 class _ReadinessState:
     """Internal snapshot reused by dashboard and packaged launch checks."""
 
     profile: UserSettingsProfile
+    requested_stub_mode: bool
     snapshot: ModelHealthSnapshot
     sentence_transformers_available: bool
     chromadb_available: bool
@@ -134,16 +172,112 @@ class _LongHorizonAdvisoryPlan:
     next_budget: ResourceBudget
 
 
+@dataclass(slots=True, frozen=True)
+class _PackagedStartupPlan:
+    """Internal packaged-startup plan that preserves requested vs effective runtime mode."""
+
+    requested_profile: UserSettingsProfile
+    effective_profile: UserSettingsProfile
+    launch_report: PackagedLaunchReport
+    runtime_config: AppConfig
+    first_run: bool
+    persist_effective_profile: bool
+    startup_notice: str
+    startup_notice_severity: str
+
+
+_CLOUD_OFFLOAD_CAPABILITY_DETAILS: dict[
+    CloudOffloadCapability,
+    tuple[str, CloudJobPayloadClass, CloudJobPrivacyClass, bool],
+] = {
+    CloudOffloadCapability.OFFLINE_REPLAY: (
+        "Offline Replay",
+        CloudJobPayloadClass.EXPORT_BUNDLE,
+        CloudJobPrivacyClass.APPROVED_CONTENT,
+        True,
+    ),
+    CloudOffloadCapability.EXPORT: (
+        "Export Jobs",
+        CloudJobPayloadClass.EXPORT_BUNDLE,
+        CloudJobPrivacyClass.APPROVED_CONTENT,
+        True,
+    ),
+    CloudOffloadCapability.BROWSER_HELPER: (
+        "Browser Helper",
+        CloudJobPayloadClass.TEXT_SNIPPET,
+        CloudJobPrivacyClass.APPROVED_CONTENT,
+        True,
+    ),
+    CloudOffloadCapability.OCR_HELPER: (
+        "OCR Helper",
+        CloudJobPayloadClass.IMAGE_REGION,
+        CloudJobPrivacyClass.APPROVED_CONTENT,
+        True,
+    ),
+    CloudOffloadCapability.VISION_HELPER: (
+        "Vision Helper",
+        CloudJobPayloadClass.IMAGE_REGION,
+        CloudJobPrivacyClass.APPROVED_CONTENT,
+        True,
+    ),
+    CloudOffloadCapability.EMBEDDING_HELPER: (
+        "Embedding Helper",
+        CloudJobPayloadClass.EMBEDDING_BATCH,
+        CloudJobPrivacyClass.APPROVED_CONTENT,
+        True,
+    ),
+    CloudOffloadCapability.BACKGROUND_MAINTENANCE: (
+        "Background Maintenance",
+        CloudJobPayloadClass.METADATA_ONLY,
+        CloudJobPrivacyClass.METADATA_ONLY,
+        False,
+    ),
+}
+
+
+@dataclass(slots=True, frozen=True)
+class _ContinuousCapturePlan:
+    """Bounded continuous-capture plan derived from profile settings and hard caps."""
+
+    session_id: str
+    capture_directory: Path
+    fps: float
+    interval_s: float
+    max_width: int
+    max_height: int
+    frame_history: int
+    diff_threshold: float
+    region_of_interest: str
+    warnings: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class _ObservationStepPlan:
+    """Bounded per-step observation plan derived from explicit profile settings."""
+
+    session_id: str
+    tier: str
+    capture_directory: Path
+    max_width: int
+    max_height: int
+    region_of_interest: str
+    warnings: tuple[str, ...]
+
+
 class Orchestrator:
     """Single owner of startup, pipeline execution, and clean shutdown."""
 
     COMPRESSION_HISTORY_SCAN_LIMIT = PHASE12_ACCEPTANCE_THRESHOLDS.compression.max_recent_reasoning_logs
+    LOCAL_TASK_MAX_REPEATED_REQUESTS = 3
+    OBSERVATION_TEXT_PREVIEW_CHARS = 280
 
     def __init__(
         self,
         config: AppConfig = APP_CONFIG,
         *,
         storage: StorageManager | None = None,
+        startup_profile_override: UserSettingsProfile | None = None,
+        persist_startup_profile_override: bool = False,
         model_manager: ModelManager | None = None,
         dashboard: DashboardService | None = None,
         planner: PlannerAgent | None = None,
@@ -186,13 +320,26 @@ class Orchestrator:
             cache_lookup=self.model_manager.lookup_cache,
             cache_warm=self.model_manager.warm_cache,
         )
+        self.coding_mode = CodingModeService(
+            model_manager=self.model_manager,
+            storage=self.storage,
+            config=config,
+        )
         self.translation = translation or TranslationService()
         self.phase11_content = phase11_content or Phase11ContentLoader(config=config)
+        self.capability_policy = CapabilityPolicyEngine(config=config, workspace_root=Path.cwd())
+        self.capability_executor = CapabilityExecutor(config=config, workspace_root=Path.cwd())
+        self.cloud_offload = CloudOffloadManager()
+        self._startup_profile_override = startup_profile_override
+        self._persist_startup_profile_override = bool(persist_startup_profile_override)
         self._started = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._dashboard_futures: set[ConcurrentFuture[Any]] = set()
         self._active_long_horizon_tasks: dict[str, asyncio.Task[TaskResult]] = {}
         self._shutdown_requested = False
+        self._local_task_emergency_stop = threading.Event()
+        self._continuous_capture_task: asyncio.Task[None] | None = None
+        self._continuous_capture_session_id = ""
         self.storage.add_runtime_event_listener(self._forward_runtime_event_to_dashboard)
         self.storage.add_agent_status_listener(self._forward_agent_status_to_dashboard)
 
@@ -201,54 +348,87 @@ class Orchestrator:
         if self._started:
             return
         self._loop = asyncio.get_running_loop()
-        await self.storage.start()
-        await self.model_manager.start()
-        await self.planner.start()
-        await self.researcher.start()
-        await self.reasoner.start()
-        await self.critic.start()
-        await self.compressor.start()
-        await self.dashboard.start()
-        await self.self_optimizer.start()
-        settings_profile = await self.storage.load_user_settings_profile("default")
-        if settings_profile is None:
-            settings_profile = self._default_user_settings_profile()
-            await self.storage.save_user_settings_profile(settings_profile)
-        await self._apply_runtime_settings_profile(settings_profile)
-        self.dashboard.attach_controller(
-            submit_task=self._submit_dashboard_task_request,
-            save_settings=self._save_dashboard_settings_request,
-            perform_action=self._handle_dashboard_action_request,
-        )
-        self._started = True
-        await self._emit_event(
-            "orchestrator.started",
-            {"stub_mode": self.config.preflight.flags.stub_mode},
-        )
-        startup_snapshot = self.model_manager.health_snapshot()
-        await self._emit_health_snapshot(snapshot=startup_snapshot)
-        if startup_snapshot.fallback_active:
-            await self._emit_runtime_condition_event(
-                "runtime.fallback_activated",
-                category="fallback",
-                component="model_manager",
-                reason=startup_snapshot.fallback_reason or "startup_fallback_active",
-                severity=SeverityLevel.MEDIUM,
-                metadata={
-                    "generation_backend": startup_snapshot.generation_backend,
-                    "embedding_backend": startup_snapshot.embedding_backend,
-                },
+        started_stoppers: list[callable] = []
+        persisted_startup_profile: UserSettingsProfile | None = None
+        try:
+            if self._startup_profile_override is None:
+                if isinstance(self.storage, StorageManager):
+                    persisted_startup_profile = await _load_startup_settings_profile(self.config)
+                else:
+                    persisted_startup_profile = await self.storage.load_user_settings_profile("default")
+            settings_profile = self._startup_profile_override or persisted_startup_profile
+            if settings_profile is None:
+                settings_profile = self._default_user_settings_profile()
+            self._apply_runtime_config(self._config_for_user_settings_profile(settings_profile))
+            await self.storage.start()
+            started_stoppers.append(self.storage.stop)
+            should_persist_startup_profile = (
+                self._startup_profile_override is None or self._persist_startup_profile_override
             )
-        await self._record_status(
-            "orchestrator",
-            AgentState.IDLE,
-            message="orchestrator started",
-        )
-        await self._publish_dashboard_settings_profiles(active_profile_name=settings_profile.profile_name)
-        await self._publish_dashboard_task_history()
-        await self._publish_dashboard_knowledge_library()
-        await self._publish_dashboard_readiness_report()
-        await self._publish_dashboard_examples()
+            if should_persist_startup_profile and await self.storage.load_user_settings_profile("default") is None:
+                await self.storage.save_user_settings_profile(settings_profile)
+            await self._ensure_local_ollama_service()
+            await self.model_manager.start()
+            started_stoppers.append(self.model_manager.stop)
+            await self.planner.start()
+            started_stoppers.append(self.planner.stop)
+            await self.researcher.start()
+            started_stoppers.append(self.researcher.stop)
+            await self.reasoner.start()
+            started_stoppers.append(self.reasoner.stop)
+            await self.critic.start()
+            started_stoppers.append(self.critic.stop)
+            await self.compressor.start()
+            started_stoppers.append(self.compressor.stop)
+            await self.dashboard.start()
+            started_stoppers.append(self.dashboard.stop)
+            await self.self_optimizer.start()
+            started_stoppers.append(self.self_optimizer.stop)
+            await self._apply_runtime_settings_profile(settings_profile)
+            self.dashboard.attach_controller(
+                submit_task=self._submit_dashboard_task_request,
+                save_settings=self._save_dashboard_settings_request,
+                perform_action=self._handle_dashboard_action_request,
+            )
+            self._started = True
+            await self._emit_event(
+                "orchestrator.started",
+                {"stub_mode": self.config.preflight.flags.stub_mode},
+            )
+            startup_snapshot = self.model_manager.health_snapshot()
+            await self._emit_health_snapshot(snapshot=startup_snapshot)
+            if startup_snapshot.fallback_active:
+                await self._emit_runtime_condition_event(
+                    "runtime.fallback_activated",
+                    category="fallback",
+                    component="model_manager",
+                    reason=startup_snapshot.fallback_reason or "startup_fallback_active",
+                    severity=SeverityLevel.MEDIUM,
+                    metadata={
+                        "generation_backend": startup_snapshot.generation_backend,
+                        "embedding_backend": startup_snapshot.embedding_backend,
+                    },
+                )
+            await self._record_status(
+                "orchestrator",
+                AgentState.IDLE,
+                message="orchestrator started",
+            )
+            await self._publish_dashboard_settings_profiles(active_profile_name=settings_profile.profile_name)
+            await self._publish_dashboard_task_history()
+            await self._publish_dashboard_knowledge_library()
+            await self._publish_dashboard_coding_patterns()
+            await self._publish_dashboard_recent_coding_activity()
+            await self._publish_dashboard_readiness_report()
+            await self._publish_dashboard_capability_registry_view(active_profile=settings_profile)
+            await self._recover_local_task_session()
+            await self._publish_dashboard_examples()
+        except Exception:
+            await self._cleanup_failed_start(started_stoppers)
+            self._started = False
+            self._loop = None
+            self._shutdown_requested = False
+            raise
 
     async def stop(self) -> None:
         """Stop all services and agents in reverse dependency order."""
@@ -263,6 +443,8 @@ class Orchestrator:
         await self._emit_event("orchestrator.stopping", {})
         self.dashboard.attach_controller()
         await self._request_pause_for_active_long_horizon_sessions(reason="shutdown_requested")
+        await self._pause_active_local_task_session(reason="shutdown_requested")
+        await self._stop_continuous_capture_task(reason="orchestrator_shutdown")
         self._cancel_active_long_horizon_tasks()
         await self._cancel_pending_dashboard_futures()
         await self.self_optimizer.stop()
@@ -277,6 +459,197 @@ class Orchestrator:
         self._started = False
         self._loop = None
         self._shutdown_requested = False
+
+    async def _cleanup_failed_start(self, started_stoppers: list[Callable[[], Awaitable[Any] | Any]]) -> None:
+        """Best-effort cleanup for partial startup failures before the app is marked started."""
+        self.dashboard.attach_controller()
+        for stopper in reversed(started_stoppers):
+            try:
+                await stopper()
+            except Exception:  # pragma: no cover - cleanup should not mask original failures
+                self.logger.exception("Error while cleaning up a partial startup failure.")
+
+    @staticmethod
+    def _coerce_bool_setting(value: Any, fallback: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return bool(fallback)
+
+    def _config_for_user_settings_profile(self, profile: UserSettingsProfile | None) -> AppConfig:
+        """Project one persisted settings profile onto the runtime config surface."""
+        if profile is None:
+            return self.config
+        runtime = dict(profile.runtime)
+        retrieval = dict(profile.retrieval)
+        preferred_by_role = {
+            str(key): str(value)
+            for key, value in dict(profile.models.get("preferred_by_role", {})).items()
+            if str(key).strip() and str(value).strip()
+        }
+        flags = self.config.preflight.flags
+        backends = self.config.preflight.backends
+
+        generation_backend = str(runtime.get("generation_backend", backends.generation_backend))
+        if generation_backend not in {"ollama", "llama_cpp"}:
+            generation_backend = backends.generation_backend
+        generation_model = backends.generation_model
+
+        embedding_backend = str(runtime.get("embedding_backend", backends.embedding_backend))
+        if embedding_backend not in {"sentence_transformers", "ollama_embeddings"}:
+            embedding_backend = backends.embedding_backend
+        embedding_model = backends.embedding_model
+
+        generation_preference = str(preferred_by_role.get("generation", "")).strip()
+        if ":" in generation_preference:
+            preferred_backend, preferred_model = generation_preference.split(":", 1)
+            if preferred_backend in {"ollama", "llama_cpp"} and preferred_model.strip():
+                generation_backend = preferred_backend
+                generation_model = preferred_model.strip()
+
+        embedding_preference = str(preferred_by_role.get("embedding", "")).strip()
+        if ":" in embedding_preference:
+            preferred_backend, preferred_model = embedding_preference.split(":", 1)
+            if preferred_backend in {"sentence_transformers", "ollama_embeddings"} and preferred_model.strip():
+                embedding_backend = preferred_backend
+                embedding_model = preferred_model.strip()
+
+        vector_store_backend = str(runtime.get("vector_store_backend", backends.vector_store_backend))
+        if vector_store_backend not in {"chromadb", "simple_inmemory"}:
+            vector_store_backend = backends.vector_store_backend
+
+        provider = str(retrieval.get("provider", self.config.web.provider))
+        if provider not in {"wikipedia", "stub"}:
+            provider = self.config.web.provider
+
+        requested_stub_mode = self._coerce_bool_setting(runtime.get("stub_mode", flags.stub_mode), flags.stub_mode)
+        allow_web_fallback = self._coerce_bool_setting(
+            retrieval.get("allow_web_fallback", runtime.get("allow_web_fallback", flags.allow_web_fallback)),
+            flags.allow_web_fallback,
+        )
+        enable_self_optimizer = self._coerce_bool_setting(
+            runtime.get("enable_self_optimizer", flags.enable_self_optimizer),
+            flags.enable_self_optimizer,
+        )
+        enable_reranking = self._coerce_bool_setting(
+            retrieval.get("reranking", self.config.retrieval.enable_reranking),
+            self.config.retrieval.enable_reranking,
+        )
+
+        resolved_flags = replace(
+            flags,
+            stub_mode=requested_stub_mode,
+            allow_web_fallback=allow_web_fallback,
+            enable_self_optimizer=enable_self_optimizer,
+        )
+        resolved_backends = replace(
+            backends,
+            generation_backend=generation_backend,
+            generation_model=generation_model,
+            embedding_backend=embedding_backend,
+            embedding_model=embedding_model,
+            vector_store_backend=vector_store_backend,
+        )
+        return replace(
+            self.config,
+            preflight=replace(self.config.preflight, flags=resolved_flags, backends=resolved_backends),
+            retrieval=replace(self.config.retrieval, enable_reranking=enable_reranking),
+            web=replace(self.config.web, provider=provider),
+        )
+
+    def _apply_runtime_config(self, runtime_config: AppConfig) -> None:
+        """Rebind the shared runtime config before dependent services start."""
+        self.config = runtime_config
+        for component in (
+            self.storage,
+            self.model_manager,
+            self.dashboard,
+            self.planner,
+            self.researcher,
+            self.reasoner,
+            self.critic,
+            self.compressor,
+            self.self_optimizer,
+            self.phase11_content,
+        ):
+            if hasattr(component, "config"):
+                setattr(component, "config", runtime_config)
+        self.capability_policy = CapabilityPolicyEngine(config=runtime_config, workspace_root=Path.cwd())
+        self.capability_executor = CapabilityExecutor(config=runtime_config, workspace_root=Path.cwd())
+
+    @staticmethod
+    def _config_uses_ollama(config: AppConfig) -> bool:
+        backends = config.preflight.backends
+        return any(
+            backend_name in {"ollama", "ollama_embeddings"}
+            for backend_name in (
+                backends.generation_backend,
+                backends.embedding_backend,
+                backends.generation_fallback_backend,
+                backends.embedding_fallback_backend,
+            )
+        )
+
+    def _discover_ollama_binary(self) -> Path | None:
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        candidates: list[Path] = []
+        if local_appdata:
+            candidates.append(Path(local_appdata) / "Programs" / "OllamaPortable" / "ollama.exe")
+        candidates.extend(
+            (
+                Path.home() / "AppData" / "Local" / "Programs" / "OllamaPortable" / "ollama.exe",
+                Path(r"C:\Program Files\Ollama\ollama.exe"),
+            )
+        )
+        resolved_on_path = shutil.which("ollama")
+        if resolved_on_path:
+            candidates.append(Path(resolved_on_path))
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    async def _ensure_local_ollama_service(
+        self,
+        *,
+        config: AppConfig | None = None,
+    ) -> tuple[bool, str]:
+        """Best-effort user-space Ollama startup for real-mode launches."""
+        runtime_config = config or self.config
+        if runtime_config.preflight.flags.stub_mode or not self._config_uses_ollama(runtime_config):
+            return (False, "ollama_not_required")
+        ready, detail = self._probe_ollama_service(config=runtime_config)
+        if ready:
+            return (True, detail)
+        binary = self._discover_ollama_binary()
+        if binary is None:
+            return (False, detail)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        try:
+            subprocess.Popen(
+                [str(binary), "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            return (False, f"Tried to auto-start Ollama using {binary}, but launch failed: {exc}")
+        deadline = time.monotonic() + min(
+            10.0,
+            max(2.0, float(runtime_config.preflight.flags.startup_timeout_s)),
+        )
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            ready, detail = self._probe_ollama_service(config=runtime_config)
+            if ready:
+                self.logger.info("Auto-started Ollama service using %s.", binary)
+                return (True, f"Auto-started Ollama service using {binary}.")
+        return (False, f"Tried to auto-start Ollama using {binary}, but the service is still unavailable.")
 
     async def run_task(self, question: str, thinking_minutes: int) -> TaskResult:
         """Execute the foreground workflow from Planner to Compressor."""
@@ -817,6 +1190,7 @@ class Orchestrator:
                     )
                     if advisory_plan.suggestions:
                         await self.storage.record_optimizer_suggestion_records(advisory_plan.suggestions)
+                        self.model_manager.apply_governor_advisory_inputs(advisory_plan.suggestions)
                         for suggestion in advisory_plan.suggestions:
                             self.model_manager.warm_cache(
                                 "strategy_artifacts",
@@ -2032,6 +2406,1013 @@ class Orchestrator:
             self.run_task(question, effective_minutes),
         )
 
+    def _local_task_session_id(self, *, label: str) -> str:
+        """Build a stable short identifier for one explicit local task session."""
+        return f"lts-{stable_hash(f'{label}:{utc_now().isoformat()}')[:12]}"
+
+    @staticmethod
+    def _terminal_local_task_session_states() -> frozenset[LocalTaskSessionState]:
+        return frozenset(
+            {
+                LocalTaskSessionState.STOPPED,
+                LocalTaskSessionState.KILLED,
+                LocalTaskSessionState.COMPLETED,
+                LocalTaskSessionState.FAILED,
+            }
+        )
+
+    @staticmethod
+    def _dashboard_local_task_session_state(
+        session: LocalTaskSession | None,
+    ) -> DashboardLocalTaskSessionState:
+        if session is None:
+            return DashboardLocalTaskSessionState()
+        return DashboardLocalTaskSessionState(
+            session_id=session.session_id,
+            label=session.label,
+            profile_name=session.profile_name,
+            status=session.status.value,
+            control_mode=session.control_mode,
+            current_target=session.current_target,
+            last_action_summary=session.last_action_summary,
+            last_request_id=session.last_request_id,
+            continuous_capture_active=session.continuous_capture_active,
+            continuous_capture_directory=session.continuous_capture_directory,
+            continuous_capture_frame_count=session.continuous_capture_frame_count,
+            continuous_capture_retained_frame_count=session.continuous_capture_retained_frame_count,
+            continuous_capture_last_frame_path=session.continuous_capture_last_frame_path,
+            continuous_capture_region=session.continuous_capture_region,
+            continuous_capture_fps=session.continuous_capture_fps,
+            continuous_capture_max_width=session.continuous_capture_max_width,
+            continuous_capture_max_height=session.continuous_capture_max_height,
+            continuous_capture_last_diff_ratio=session.continuous_capture_last_diff_ratio,
+            continuous_capture_warnings=session.continuous_capture_warnings,
+            continuous_capture_last_capture_at=session.continuous_capture_last_capture_at,
+            requested_observation_tier=session.requested_observation_tier,
+            effective_observation_tier=session.effective_observation_tier,
+            observation_degraded_reason=session.observation_degraded_reason,
+            observation_degraded_features=session.observation_degraded_features,
+            last_observation_tier=session.last_observation_tier,
+            last_observation_status=session.last_observation_status,
+            last_observation_summary=session.last_observation_summary,
+            last_observation_output_ref=session.last_observation_output_ref,
+            last_observation_text_preview=session.last_observation_text_preview,
+            last_observation_backend=session.last_observation_backend,
+            last_observation_warnings=session.last_observation_warnings,
+            last_observation_at=session.last_observation_at,
+            pending_approval_summaries=tuple(item.summary for item in session.pending_approvals),
+            pause_requested=session.pause_requested,
+            stop_requested=session.stop_requested,
+            kill_switch_engaged=session.kill_switch_engaged,
+            last_control_reason=session.last_control_reason,
+            last_error=session.last_error,
+            created_at=session.created_at,
+            updated_at=session.updated_at,
+            ended_at=session.ended_at,
+        )
+
+    async def _publish_dashboard_local_task_session(
+        self,
+        session: LocalTaskSession | None = None,
+    ) -> None:
+        resolved_session = session if session is not None else await self.storage.load_active_local_task_session()
+        dashboard_state = self._dashboard_local_task_session_state(resolved_session)
+        self.dashboard.publish_event(
+            {
+                "stage": "dashboard.local_task_session_loaded",
+                "local_task_session": dashboard_state.to_dict(),
+            }
+        )
+
+    def _session_continuous_capture_directory(self, session_id: str) -> Path:
+        return self.config.storage.logs_dir / self.config.observation_runtime.capture_directory_name / session_id
+
+    def _session_observation_step_directory(self, session_id: str) -> Path:
+        return self.config.storage.logs_dir / "observation_steps" / session_id
+
+    @staticmethod
+    def _requested_observation_tier(profile: UserSettingsProfile) -> str:
+        return str(profile.observation.get("tier", "screenshot_on_demand") or "screenshot_on_demand")
+
+    @staticmethod
+    def _effective_observation_tier(requested_tier: str, snapshot: ModelHealthSnapshot) -> str:
+        if requested_tier == "continuous_capture":
+            return "continuous_capture" if snapshot.allow_continuous_capture else "screenshot_on_demand"
+        if requested_tier == "vision_on_step":
+            if snapshot.allow_vision_on_step:
+                return "vision_on_step"
+            if snapshot.allow_ocr_on_step:
+                return "ocr_on_step"
+            return "screenshot_on_demand"
+        if requested_tier == "ocr_on_step":
+            return "ocr_on_step" if snapshot.allow_ocr_on_step else "screenshot_on_demand"
+        return "screenshot_on_demand"
+
+    def _session_with_observation_governor(
+        self,
+        session: LocalTaskSession,
+        *,
+        profile: UserSettingsProfile,
+        snapshot: ModelHealthSnapshot | None = None,
+        updated_at: Any | None = None,
+    ) -> LocalTaskSession:
+        snapshot = snapshot or self.model_manager.health_snapshot()
+        requested_tier = self._requested_observation_tier(profile)
+        effective_tier = self._effective_observation_tier(requested_tier, snapshot)
+        degraded_reason = ""
+        if effective_tier != requested_tier and snapshot.governor_pressure_reasons:
+            degraded_reason = ",".join(snapshot.governor_pressure_reasons)
+        return replace(
+            session,
+            requested_observation_tier=requested_tier,
+            effective_observation_tier=effective_tier,
+            observation_degraded_reason=degraded_reason,
+            observation_degraded_features=snapshot.governor_degraded_features,
+            updated_at=updated_at if updated_at is not None else session.updated_at,
+        )
+
+    def _observation_step_plan_for_profile(
+        self,
+        session_id: str,
+        profile: UserSettingsProfile,
+    ) -> _ObservationStepPlan | None:
+        observation = dict(profile.observation)
+        tier = str(observation.get("tier", "screenshot_on_demand"))
+        if tier not in {"ocr_on_step", "vision_on_step"}:
+            return None
+        if not bool(profile.desktop.get("enabled", False)):
+            return None
+        if tier == "ocr_on_step" and not bool(observation.get("ocr_on_step", False)):
+            return None
+        if tier == "vision_on_step" and not bool(observation.get("vision_on_step", False)):
+            return None
+        caps = self.config.observation_runtime
+        warnings: list[str] = []
+        requested_width = int(observation.get("capture_max_width", caps.default_capture_width) or caps.default_capture_width)
+        max_width = max(64, min(requested_width, caps.max_capture_width))
+        if max_width != requested_width:
+            warnings.append("observation_step_width_capped")
+        requested_height = int(
+            observation.get("capture_max_height", caps.default_capture_height) or caps.default_capture_height
+        )
+        max_height = max(64, min(requested_height, caps.max_capture_height))
+        if max_height != requested_height:
+            warnings.append("observation_step_height_capped")
+        region_of_interest, region_warnings = self._observation_step_region(
+            str(observation.get("region_of_interest", "full_screen")),
+            max_width=max_width,
+            max_height=max_height,
+        )
+        warnings.extend(region_warnings)
+        return _ObservationStepPlan(
+            session_id=session_id,
+            tier=tier,
+            capture_directory=self._session_observation_step_directory(session_id),
+            max_width=max_width,
+            max_height=max_height,
+            region_of_interest=region_of_interest,
+            warnings=tuple(dict.fromkeys(warnings)),
+        )
+
+    @staticmethod
+    def _observation_step_region(
+        raw_region: str,
+        *,
+        max_width: int,
+        max_height: int,
+    ) -> tuple[str, tuple[str, ...]]:
+        normalized = raw_region.strip() or "full_screen"
+        if normalized.lower() == "full_screen":
+            return "full_screen", ()
+        parts = [part.strip() for part in normalized.split(",")]
+        if len(parts) != 4:
+            return "full_screen", ("observation_step_region_reset",)
+        try:
+            left, top, width, height = (int(part) for part in parts)
+        except ValueError:
+            return "full_screen", ("observation_step_region_reset",)
+        warnings: list[str] = []
+        if left < 0 or top < 0:
+            left = max(0, left)
+            top = max(0, top)
+            warnings.append("observation_step_region_clamped")
+        if width <= 0 or height <= 0:
+            return "full_screen", ("observation_step_region_reset",)
+        bounded_width = min(width, max_width)
+        bounded_height = min(height, max_height)
+        if bounded_width != width or bounded_height != height:
+            warnings.append("observation_step_region_clamped")
+        return f"{left},{top},{bounded_width},{bounded_height}", tuple(dict.fromkeys(warnings))
+
+    def _continuous_capture_plan_for_profile(
+        self,
+        session_id: str,
+        profile: UserSettingsProfile,
+    ) -> _ContinuousCapturePlan | None:
+        observation = dict(profile.observation)
+        if str(observation.get("tier", "screenshot_on_demand")) != "continuous_capture":
+            return None
+        desktop_enabled = bool(profile.desktop.get("enabled", False))
+        enabled_capabilities = {
+            str(item)
+            for item in profile.desktop.get("enabled_capabilities", ())
+            if str(item).strip()
+        }
+        if not desktop_enabled or "screenshot" not in enabled_capabilities:
+            return None
+        caps = self.config.observation_runtime
+        warnings: list[str] = []
+
+        requested_fps = float(observation.get("capture_fps", caps.default_capture_fps) or caps.default_capture_fps)
+        fps = max(0.05, min(requested_fps, caps.max_capture_fps))
+        if fps != requested_fps:
+            warnings.append("continuous_capture_fps_capped")
+
+        requested_width = int(observation.get("capture_max_width", caps.default_capture_width) or caps.default_capture_width)
+        max_width = max(64, min(requested_width, caps.max_capture_width))
+        if max_width != requested_width:
+            warnings.append("continuous_capture_width_capped")
+
+        requested_height = int(
+            observation.get("capture_max_height", caps.default_capture_height) or caps.default_capture_height
+        )
+        max_height = max(64, min(requested_height, caps.max_capture_height))
+        if max_height != requested_height:
+            warnings.append("continuous_capture_height_capped")
+
+        requested_history = int(
+            observation.get("capture_frame_history", caps.default_frame_history) or caps.default_frame_history
+        )
+        frame_history = max(1, min(requested_history, caps.max_frame_history))
+        if frame_history != requested_history:
+            warnings.append("continuous_capture_history_capped")
+
+        requested_diff_threshold = float(
+            observation.get("capture_diff_threshold", caps.default_diff_threshold) or caps.default_diff_threshold
+        )
+        diff_threshold = max(caps.min_diff_threshold, min(requested_diff_threshold, caps.max_diff_threshold))
+        if diff_threshold != requested_diff_threshold:
+            warnings.append("continuous_capture_diff_threshold_capped")
+
+        region_of_interest, region_warnings = self._continuous_capture_region(
+            str(observation.get("region_of_interest", "full_screen")),
+            max_width=max_width,
+            max_height=max_height,
+        )
+        warnings.extend(region_warnings)
+
+        return _ContinuousCapturePlan(
+            session_id=session_id,
+            capture_directory=self._session_continuous_capture_directory(session_id),
+            fps=fps,
+            interval_s=max(0.05, 1.0 / fps),
+            max_width=max_width,
+            max_height=max_height,
+            frame_history=frame_history,
+            diff_threshold=diff_threshold,
+            region_of_interest=region_of_interest,
+            warnings=tuple(warnings),
+        )
+
+    @staticmethod
+    def _continuous_capture_region(
+        raw_region: str,
+        *,
+        max_width: int,
+        max_height: int,
+    ) -> tuple[str, tuple[str, ...]]:
+        normalized = raw_region.strip() or "full_screen"
+        if normalized.lower() == "full_screen":
+            return "full_screen", ()
+        parts = [part.strip() for part in normalized.split(",")]
+        if len(parts) != 4:
+            return "full_screen", ("continuous_capture_region_reset",)
+        try:
+            left, top, width, height = (int(part) for part in parts)
+        except ValueError:
+            return "full_screen", ("continuous_capture_region_reset",)
+        warnings: list[str] = []
+        if left < 0 or top < 0:
+            left = max(0, left)
+            top = max(0, top)
+            warnings.append("continuous_capture_region_clamped")
+        if width <= 0 or height <= 0:
+            return "full_screen", ("continuous_capture_region_reset",)
+        bounded_width = min(width, max_width)
+        bounded_height = min(height, max_height)
+        if bounded_width != width or bounded_height != height:
+            warnings.append("continuous_capture_region_clamped")
+        return f"{left},{top},{bounded_width},{bounded_height}", tuple(dict.fromkeys(warnings))
+
+    @staticmethod
+    def _byte_diff_ratio(previous: bytes, current: bytes) -> float:
+        if not previous and not current:
+            return 0.0
+        compared = max(len(previous), len(current))
+        if compared <= 0:
+            return 0.0
+        mismatches = abs(len(previous) - len(current))
+        mismatches += sum(1 for prior, next_byte in zip(previous, current) if prior != next_byte)
+        return mismatches / compared
+
+    @staticmethod
+    def _should_run_observation_step(
+        request: CapabilityRequest,
+        result: CapabilityExecutionResult,
+    ) -> bool:
+        if result.status != CapabilityExecutionStatus.SUCCEEDED:
+            return False
+        if request.capability_type == CapabilityType.APP_WINDOW_FOCUS:
+            return True
+        if request.capability_type == CapabilityType.DESKTOP_INPUT:
+            return True
+        if request.capability_type == CapabilityType.BROWSER_ACTION and request.browser_action is not None:
+            return request.browser_action.action.strip().lower() == "navigate"
+        return False
+
+    def _observation_step_gate_reasons(self, tier: str) -> tuple[str, ...]:
+        snapshot = self.model_manager.health_snapshot()
+        if tier == "vision_on_step" and not snapshot.allow_vision_on_step:
+            return snapshot.governor_pressure_reasons or ("hardware_governor_degraded",)
+        if tier == "ocr_on_step" and not snapshot.allow_ocr_on_step:
+            return snapshot.governor_pressure_reasons or ("hardware_governor_degraded",)
+        return ()
+
+    async def _save_local_task_observation_state(
+        self,
+        session: LocalTaskSession,
+        *,
+        tier: str,
+        status: str,
+        summary: str,
+        output_ref: str = "",
+        text_preview: str = "",
+        backend: str = "",
+        warnings: tuple[str, ...] = (),
+    ) -> LocalTaskSession:
+        updated = replace(
+            session,
+            last_observation_tier=tier,
+            last_observation_status=status,
+            last_observation_summary=summary,
+            last_observation_output_ref=output_ref,
+            last_observation_text_preview=text_preview[: self.OBSERVATION_TEXT_PREVIEW_CHARS],
+            last_observation_backend=backend,
+            last_observation_warnings=tuple(dict.fromkeys(str(item) for item in warnings if str(item).strip())),
+            last_observation_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        await self.storage.save_local_task_session(updated)
+        await self._publish_dashboard_local_task_session(updated)
+        return updated
+
+    async def _run_observation_step_if_enabled(
+        self,
+        session: LocalTaskSession,
+        *,
+        request: CapabilityRequest,
+        result: CapabilityExecutionResult,
+        profile: UserSettingsProfile,
+    ) -> LocalTaskSession:
+        session = self._session_with_observation_governor(
+            session,
+            profile=profile,
+            updated_at=utc_now(),
+        )
+        plan = self._observation_step_plan_for_profile(session.session_id, profile)
+        if plan is None or not self._should_run_observation_step(request, result):
+            await self.storage.save_local_task_session(session)
+            await self._publish_dashboard_local_task_session(session)
+            return session
+
+        gate_reasons = self._observation_step_gate_reasons(plan.tier)
+        if gate_reasons:
+            updated = await self._save_local_task_observation_state(
+                session,
+                tier=plan.tier,
+                status="degraded",
+                summary=(
+                    f"{plan.tier} skipped after '{request.action_name()}' because runtime headroom is low."
+                ),
+                warnings=(*plan.warnings, *gate_reasons),
+            )
+            await self._emit_event(
+                "observation.step_degraded",
+                {
+                    "session_id": updated.session_id,
+                    "tier": plan.tier,
+                    "status": updated.last_observation_status,
+                    "reason": gate_reasons[0],
+                    "reasons": list(gate_reasons),
+                    "trigger_action": request.action_name(),
+                },
+            )
+            return updated
+
+        capture_path = plan.capture_directory / f"step_{stable_hash(request.request_id)[:12]}.png"
+        try:
+            await asyncio.to_thread(
+                self.capability_executor.capture_observation_frame,
+                capture_path,
+                region=plan.region_of_interest,
+                max_width=plan.max_width,
+                max_height=plan.max_height,
+                image_format="Png",
+            )
+            if plan.tier == "ocr_on_step":
+                bounded_text, backend_name, ocr_warnings, _text_length, _truncated = await asyncio.to_thread(
+                    self.capability_executor.extract_bounded_ocr_text,
+                    capture_path,
+                    region="full_image",
+                    languages=(),
+                )
+                updated = await self._save_local_task_observation_state(
+                    session,
+                    tier=plan.tier,
+                    status="succeeded",
+                    summary=f"OCR-on-step captured '{capture_path.name}' after '{request.action_name()}'.",
+                    output_ref=str(capture_path),
+                    text_preview=bounded_text,
+                    backend=backend_name,
+                    warnings=(*plan.warnings, *ocr_warnings),
+                )
+                await self._emit_event(
+                    "observation.step_completed",
+                    {
+                        "session_id": updated.session_id,
+                        "tier": plan.tier,
+                        "status": updated.last_observation_status,
+                        "trigger_action": request.action_name(),
+                        "output_ref": updated.last_observation_output_ref,
+                        "backend": updated.last_observation_backend,
+                        "warnings": list(updated.last_observation_warnings),
+                    },
+                )
+                return updated
+
+            bounded_text, backend_name, ocr_warnings, _text_length, _truncated = await asyncio.to_thread(
+                self.capability_executor.extract_bounded_ocr_text,
+                capture_path,
+                region="full_image",
+                languages=(),
+            )
+            inspection = await self.model_manager.inspect_image(
+                capture_path,
+                request_text="Summarize the visible UI state for the bounded local task step.",
+                extracted_text=bounded_text,
+                role=ModelRole.VISION,
+            )
+            await self._publish_dashboard_model_registry_view()
+            if inspection.status == "inspected":
+                updated = await self._save_local_task_observation_state(
+                    session,
+                    tier=plan.tier,
+                    status="succeeded",
+                    summary=inspection.summary or f"Vision-on-step inspected '{capture_path.name}'.",
+                    output_ref=str(capture_path),
+                    text_preview=inspection.extracted_text or bounded_text,
+                    backend=inspection.inspection_backend,
+                    warnings=(*plan.warnings, *ocr_warnings, *inspection.warnings),
+                )
+                await self._emit_event(
+                    "observation.step_completed",
+                    {
+                        "session_id": updated.session_id,
+                        "tier": plan.tier,
+                        "status": updated.last_observation_status,
+                        "trigger_action": request.action_name(),
+                        "output_ref": updated.last_observation_output_ref,
+                        "backend": updated.last_observation_backend,
+                        "warnings": list(updated.last_observation_warnings),
+                    },
+                )
+                return updated
+            route_reason = inspection.degraded_reason or "vision_route_unavailable"
+            route_warning = f"vision_route_{route_reason}"
+            route_summary = (
+                "Vision-on-step fell back to CPU OCR because the vision route is unavailable "
+                f"({route_reason})."
+            )
+            updated = await self._save_local_task_observation_state(
+                session,
+                tier=plan.tier,
+                status="degraded",
+                summary=route_summary,
+                output_ref=str(capture_path),
+                text_preview=bounded_text,
+                backend=backend_name,
+                warnings=(*plan.warnings, route_warning, *ocr_warnings, *inspection.warnings),
+            )
+            await self._emit_event(
+                "observation.step_degraded",
+                {
+                    "session_id": updated.session_id,
+                    "tier": plan.tier,
+                    "status": updated.last_observation_status,
+                    "trigger_action": request.action_name(),
+                    "output_ref": updated.last_observation_output_ref,
+                    "backend": updated.last_observation_backend,
+                    "warnings": list(updated.last_observation_warnings),
+                },
+            )
+            return updated
+        except Exception as exc:
+            updated = await self._save_local_task_observation_state(
+                session,
+                tier=plan.tier,
+                status="degraded",
+                summary=f"{plan.tier} failed after '{request.action_name()}'.",
+                warnings=(*plan.warnings, "observation_step_failed"),
+            )
+            await self._emit_event(
+                "observation.step_degraded",
+                {
+                    "session_id": updated.session_id,
+                    "tier": plan.tier,
+                    "status": updated.last_observation_status,
+                    "reason": "observation_step_failed",
+                    "detail": str(exc),
+                    "trigger_action": request.action_name(),
+                },
+            )
+            return updated
+
+    async def _stop_continuous_capture_task(
+        self,
+        *,
+        reason: str,
+        session_id: str = "",
+    ) -> None:
+        target_session_id = session_id or self._continuous_capture_session_id
+        active_task = self._continuous_capture_task
+        if active_task is not None:
+            self._continuous_capture_task = None
+            self._continuous_capture_session_id = ""
+            active_task.cancel()
+            try:
+                await active_task
+            except asyncio.CancelledError:
+                pass
+        if not target_session_id:
+            return
+        session = await self.storage.load_local_task_session(target_session_id)
+        if session is None or not session.continuous_capture_active:
+            return
+        updated = replace(
+            session,
+            continuous_capture_active=False,
+            updated_at=utc_now(),
+        )
+        await self.storage.save_local_task_session(updated)
+        await self._publish_dashboard_local_task_session(updated)
+        await self._emit_event(
+            "observation.continuous_capture_stopped",
+            {
+                "session_id": target_session_id,
+                "reason": reason,
+                "captured_frames": updated.continuous_capture_frame_count,
+                "retained_frames": updated.continuous_capture_retained_frame_count,
+            },
+        )
+
+    async def _sync_continuous_capture_for_session(
+        self,
+        session: LocalTaskSession,
+        *,
+        profile: UserSettingsProfile,
+        reason: str,
+    ) -> LocalTaskSession:
+        snapshot = self.model_manager.health_snapshot()
+        session = self._session_with_observation_governor(
+            session,
+            profile=profile,
+            snapshot=snapshot,
+            updated_at=utc_now(),
+        )
+        plan = self._continuous_capture_plan_for_profile(session.session_id, profile)
+        if (
+            self._requested_observation_tier(profile) == "continuous_capture"
+            and session.effective_observation_tier != "continuous_capture"
+        ):
+            await self._stop_continuous_capture_task(
+                reason=f"hardware_governor:{session.observation_degraded_reason or 'degraded'}",
+                session_id=session.session_id,
+            )
+            await self.storage.save_local_task_session(session)
+            await self._publish_dashboard_local_task_session(session)
+            await self._emit_event(
+                "observation.continuous_capture_degraded",
+                {
+                    "session_id": session.session_id,
+                    "requested_tier": session.requested_observation_tier,
+                    "effective_tier": session.effective_observation_tier,
+                    "reason": session.observation_degraded_reason or "hardware_governor_degraded",
+                    "degraded_features": list(session.observation_degraded_features),
+                    "trigger": reason,
+                },
+            )
+            return session
+        if plan is None:
+            await self._stop_continuous_capture_task(reason=reason, session_id=session.session_id)
+            await self.storage.save_local_task_session(session)
+            await self._publish_dashboard_local_task_session(session)
+            return await self.storage.load_local_task_session(session.session_id) or session
+        if self._continuous_capture_task is not None and self._continuous_capture_session_id != session.session_id:
+            await self._stop_continuous_capture_task(reason="continuous_capture_replaced")
+        if self._continuous_capture_task is not None and self._continuous_capture_session_id == session.session_id:
+            if (
+                session.continuous_capture_active
+                and session.continuous_capture_region == plan.region_of_interest
+                and session.continuous_capture_fps == plan.fps
+                and session.continuous_capture_max_width == plan.max_width
+                and session.continuous_capture_max_height == plan.max_height
+                and session.continuous_capture_warnings == plan.warnings
+            ):
+                return session
+            await self._stop_continuous_capture_task(
+                reason="continuous_capture_reconfigured",
+                session_id=session.session_id,
+            )
+        plan.capture_directory.mkdir(parents=True, exist_ok=True)
+        updated = replace(
+            session,
+            continuous_capture_active=True,
+            continuous_capture_directory=str(plan.capture_directory),
+            continuous_capture_region=plan.region_of_interest,
+            continuous_capture_fps=plan.fps,
+            continuous_capture_max_width=plan.max_width,
+            continuous_capture_max_height=plan.max_height,
+            continuous_capture_warnings=plan.warnings,
+            updated_at=utc_now(),
+        )
+        await self.storage.save_local_task_session(updated)
+        await self._publish_dashboard_local_task_session(updated)
+        await self._emit_event(
+            "observation.continuous_capture_started",
+            {
+                "session_id": updated.session_id,
+                "capture_directory": updated.continuous_capture_directory,
+                "fps": updated.continuous_capture_fps,
+                "max_width": updated.continuous_capture_max_width,
+                "max_height": updated.continuous_capture_max_height,
+                "frame_history": plan.frame_history,
+                "diff_threshold": plan.diff_threshold,
+                "region_of_interest": updated.continuous_capture_region,
+                "reason": reason,
+                "warnings": list(updated.continuous_capture_warnings),
+            },
+        )
+        self._continuous_capture_session_id = updated.session_id
+        self._continuous_capture_task = asyncio.create_task(
+            self._continuous_capture_loop(plan),
+            name=f"continuous-capture:{updated.session_id}",
+        )
+        return updated
+
+    async def _continuous_capture_loop(self, plan: _ContinuousCapturePlan) -> None:
+        retained_paths = sorted(plan.capture_directory.glob("frame_*.jpg"))
+        while len(retained_paths) > plan.frame_history:
+            obsolete = retained_paths.pop(0)
+            obsolete.unlink(missing_ok=True)
+        previous_bytes = retained_paths[-1].read_bytes() if retained_paths else None
+        session = await self.storage.load_local_task_session(plan.session_id)
+        frame_index = 0 if session is None else session.continuous_capture_frame_count
+        try:
+            while not self._shutdown_requested:
+                session = await self.storage.load_local_task_session(plan.session_id)
+                if session is None or session.status != LocalTaskSessionState.RUNNING or session.kill_switch_engaged:
+                    break
+                profile = await self.storage.load_user_settings_profile(session.profile_name)
+                if profile is None:
+                    profile = self.dashboard.app_state_snapshot().user_settings
+                session = self._session_with_observation_governor(
+                    session,
+                    profile=profile,
+                    updated_at=utc_now(),
+                )
+                if (
+                    session.requested_observation_tier == "continuous_capture"
+                    and session.effective_observation_tier != "continuous_capture"
+                ):
+                    degraded = replace(
+                        session,
+                        continuous_capture_active=False,
+                        last_control_reason="continuous_capture_degraded",
+                        updated_at=utc_now(),
+                    )
+                    await self.storage.save_local_task_session(degraded)
+                    await self._publish_dashboard_local_task_session(degraded)
+                    await self._emit_event(
+                        "observation.continuous_capture_degraded",
+                        {
+                            "session_id": degraded.session_id,
+                            "requested_tier": degraded.requested_observation_tier,
+                            "effective_tier": degraded.effective_observation_tier,
+                            "reason": degraded.observation_degraded_reason or "hardware_governor_degraded",
+                            "degraded_features": list(degraded.observation_degraded_features),
+                            "captured_frames": degraded.continuous_capture_frame_count,
+                        },
+                    )
+                    break
+                frame_index += 1
+                frame_path = plan.capture_directory / f"frame_{frame_index:04d}.jpg"
+                await asyncio.to_thread(
+                    self.capability_executor.capture_continuous_frame,
+                    frame_path,
+                    region=plan.region_of_interest,
+                    max_width=plan.max_width,
+                    max_height=plan.max_height,
+                )
+                frame_bytes = await asyncio.to_thread(frame_path.read_bytes)
+                diff_ratio = 1.0 if previous_bytes is None else self._byte_diff_ratio(previous_bytes, frame_bytes)
+                previous_bytes = frame_bytes
+                retained = not retained_paths or diff_ratio >= plan.diff_threshold
+                if retained:
+                    retained_paths.append(frame_path)
+                    while len(retained_paths) > plan.frame_history:
+                        obsolete = retained_paths.pop(0)
+                        obsolete.unlink(missing_ok=True)
+                else:
+                    frame_path.unlink(missing_ok=True)
+                updated = replace(
+                    session,
+                    continuous_capture_active=True,
+                    continuous_capture_directory=str(plan.capture_directory),
+                    continuous_capture_frame_count=frame_index,
+                    continuous_capture_retained_frame_count=len(retained_paths),
+                    continuous_capture_last_frame_path=(
+                        str(retained_paths[-1]) if retained_paths else session.continuous_capture_last_frame_path
+                    ),
+                    continuous_capture_region=plan.region_of_interest,
+                    continuous_capture_fps=plan.fps,
+                    continuous_capture_max_width=plan.max_width,
+                    continuous_capture_max_height=plan.max_height,
+                    continuous_capture_last_diff_ratio=diff_ratio,
+                    continuous_capture_warnings=plan.warnings,
+                    continuous_capture_last_capture_at=utc_now(),
+                    updated_at=utc_now(),
+                )
+                await self.storage.save_local_task_session(updated)
+                await self._publish_dashboard_local_task_session(updated)
+                if retained:
+                    await self._emit_event(
+                        "observation.continuous_capture_frame",
+                        {
+                            "session_id": plan.session_id,
+                            "frame_path": str(frame_path),
+                            "captured_frames": frame_index,
+                            "retained_frames": len(retained_paths),
+                            "diff_ratio": diff_ratio,
+                            "diff_threshold": plan.diff_threshold,
+                        },
+                    )
+                await asyncio.sleep(plan.interval_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            session = await self.storage.load_local_task_session(plan.session_id)
+            if session is not None and session.status == LocalTaskSessionState.RUNNING:
+                paused = replace(
+                    session,
+                    status=LocalTaskSessionState.PAUSED,
+                    continuous_capture_active=False,
+                    last_control_reason="continuous_capture_failed",
+                    last_error=str(exc),
+                    updated_at=utc_now(),
+                )
+                self._local_task_emergency_stop.set()
+                await self.storage.save_local_task_session(paused)
+                await self._emit_event(
+                    "local_task_session.paused",
+                    {
+                        "session_id": paused.session_id,
+                        "status": paused.status.value,
+                        "reason": paused.last_control_reason,
+                    },
+                )
+                await self._emit_event(
+                    "observation.continuous_capture_failed",
+                    {
+                        "session_id": paused.session_id,
+                        "error": str(exc),
+                    },
+                )
+                await self._publish_dashboard_local_task_session(paused)
+        finally:
+            if self._continuous_capture_session_id == plan.session_id:
+                self._continuous_capture_session_id = ""
+                self._continuous_capture_task = None
+
+    async def _recover_local_task_session(self) -> None:
+        session = await self.storage.load_active_local_task_session()
+        if session is None:
+            await self._stop_continuous_capture_task(reason="session_not_active")
+            await self._publish_dashboard_local_task_session(None)
+            return
+        if session.status == LocalTaskSessionState.RUNNING:
+            session = replace(
+                session,
+                status=LocalTaskSessionState.PAUSED,
+                continuous_capture_active=False,
+                pause_requested=False,
+                last_control_reason="recovered_after_restart",
+                updated_at=utc_now(),
+            )
+            await self.storage.save_local_task_session(session)
+            await self._emit_event(
+                "local_task_session.recovered",
+                {
+                    "session_id": session.session_id,
+                    "status": session.status.value,
+                    "reason": session.last_control_reason,
+                },
+            )
+        elif session.status in self._terminal_local_task_session_states():
+            await self.storage.save_active_local_task_session_id("")
+        await self._stop_continuous_capture_task(reason="session_recovered", session_id=session.session_id)
+        await self._publish_dashboard_local_task_session(session)
+
+    async def start_local_task_session(
+        self,
+        label: str,
+        *,
+        active_profile: UserSettingsProfile | None = None,
+    ) -> LocalTaskSession:
+        """Start one explicit local task execution session."""
+        normalized_label = label.strip() or "Local task session"
+        profile = active_profile or (
+            self.dashboard.app_state_snapshot().user_settings if self._started else self._default_user_settings_profile()
+        )
+        existing = await self.storage.load_active_local_task_session()
+        if existing is not None and existing.status not in self._terminal_local_task_session_states():
+            raise RuntimeError(
+                f"Local task session '{existing.session_id}' is already {existing.status.value}; stop it before starting a new one."
+            )
+        now = utc_now()
+        session = LocalTaskSession(
+            session_id=self._local_task_session_id(label=normalized_label),
+            label=normalized_label,
+            profile_name=profile.profile_name,
+            status=LocalTaskSessionState.RUNNING,
+            control_mode="local_task",
+            requested_observation_tier=self._requested_observation_tier(profile),
+            effective_observation_tier=self._requested_observation_tier(profile),
+            last_control_reason="started",
+            created_at=now,
+            updated_at=now,
+        )
+        session = self._session_with_observation_governor(session, profile=profile)
+        self._local_task_emergency_stop.clear()
+        await self.storage.save_local_task_session(session)
+        await self.storage.save_active_local_task_session_id(session.session_id)
+        await self._emit_event(
+            "local_task_session.started",
+            {
+                "session_id": session.session_id,
+                "label": session.label,
+                "profile_name": session.profile_name,
+                "status": session.status.value,
+            },
+        )
+        session = await self._sync_continuous_capture_for_session(
+            session,
+            profile=profile,
+            reason="session_started",
+        )
+        await self._publish_dashboard_local_task_session(session)
+        return session
+
+    async def pause_local_task_session(self, session_id: str, *, reason: str) -> bool:
+        """Pause one explicit local task session."""
+        session = await self.storage.load_local_task_session(session_id)
+        if session is None or session.status != LocalTaskSessionState.RUNNING:
+            return False
+        paused = replace(
+            session,
+            status=LocalTaskSessionState.PAUSED,
+            continuous_capture_active=False,
+            pause_requested=False,
+            last_control_reason=reason,
+            updated_at=utc_now(),
+        )
+        self._local_task_emergency_stop.set()
+        await self.storage.save_local_task_session(paused)
+        await self._stop_continuous_capture_task(reason=reason, session_id=session_id)
+        await self._emit_event(
+            "local_task_session.paused",
+            {
+                "session_id": paused.session_id,
+                "status": paused.status.value,
+                "reason": reason,
+            },
+        )
+        await self._publish_dashboard_local_task_session(paused)
+        return True
+
+    async def resume_local_task_session(self, session_id: str, *, reason: str) -> bool:
+        """Resume one paused local task session."""
+        session = await self.storage.load_local_task_session(session_id)
+        if session is None or session.status != LocalTaskSessionState.PAUSED or session.kill_switch_engaged:
+            return False
+        resumed = replace(
+            session,
+            status=LocalTaskSessionState.RUNNING,
+            continuous_capture_active=False,
+            stop_requested=False,
+            last_control_reason=reason,
+            updated_at=utc_now(),
+            ended_at=None,
+        )
+        self._local_task_emergency_stop.clear()
+        await self.storage.save_local_task_session(resumed)
+        await self.storage.save_active_local_task_session_id(resumed.session_id)
+        profile = await self.storage.load_user_settings_profile(resumed.profile_name)
+        if profile is None:
+            profile = self.dashboard.app_state_snapshot().user_settings
+        resumed = self._session_with_observation_governor(resumed, profile=profile)
+        resumed = await self._sync_continuous_capture_for_session(
+            resumed,
+            profile=profile,
+            reason="session_resumed",
+        )
+        await self._emit_event(
+            "local_task_session.resumed",
+            {
+                "session_id": resumed.session_id,
+                "status": resumed.status.value,
+                "reason": reason,
+            },
+        )
+        await self._publish_dashboard_local_task_session(resumed)
+        return True
+
+    async def stop_local_task_session(self, session_id: str, *, reason: str) -> bool:
+        """Stop one local task session and clear it as the active executor boundary."""
+        session = await self.storage.load_local_task_session(session_id)
+        if session is None or session.status in self._terminal_local_task_session_states():
+            return False
+        stopped = replace(
+            session,
+            status=LocalTaskSessionState.STOPPED,
+            continuous_capture_active=False,
+            stop_requested=True,
+            pause_requested=False,
+            last_control_reason=reason,
+            updated_at=utc_now(),
+            ended_at=utc_now(),
+        )
+        self._local_task_emergency_stop.set()
+        await self.storage.save_local_task_session(stopped)
+        await self.storage.save_active_local_task_session_id("")
+        await self._stop_continuous_capture_task(reason=reason, session_id=session_id)
+        await self._emit_event(
+            "local_task_session.stopped",
+            {
+                "session_id": stopped.session_id,
+                "status": stopped.status.value,
+                "reason": reason,
+            },
+        )
+        await self._publish_dashboard_local_task_session(stopped)
+        return True
+
+    async def kill_local_task_session(self, session_id: str, *, reason: str) -> bool:
+        """Trigger the kill-switch for one local task session."""
+        session = await self.storage.load_local_task_session(session_id)
+        if session is None or session.status == LocalTaskSessionState.KILLED:
+            return False
+        killed = replace(
+            session,
+            status=LocalTaskSessionState.KILLED,
+            continuous_capture_active=False,
+            stop_requested=True,
+            pause_requested=False,
+            kill_switch_engaged=True,
+            last_control_reason=reason,
+            updated_at=utc_now(),
+            ended_at=utc_now(),
+        )
+        self._local_task_emergency_stop.set()
+        await self.storage.save_local_task_session(killed)
+        await self.storage.save_active_local_task_session_id("")
+        await self._stop_continuous_capture_task(reason=reason, session_id=session_id)
+        await self._emit_event(
+            "local_task_session.killed",
+            {
+                "session_id": killed.session_id,
+                "status": killed.status.value,
+                "reason": reason,
+            },
+        )
+        await self._publish_dashboard_local_task_session(killed)
+        return True
+
+    async def _pause_active_local_task_session(self, *, reason: str) -> None:
+        session = await self.storage.load_active_local_task_session()
+        if session is None or session.status != LocalTaskSessionState.RUNNING:
+            return
+        await self.pause_local_task_session(session.session_id, reason=reason)
+
     def _save_dashboard_settings_request(self, profile: UserSettingsProfile) -> None:
         if self._loop is None:
             raise RuntimeError("Orchestrator event loop is not available for dashboard settings persistence.")
@@ -2051,6 +3432,7 @@ class Orchestrator:
         await self._apply_runtime_settings_profile(profile)
         await self._publish_dashboard_settings_profiles(active_profile_name=profile.profile_name)
         await self._publish_dashboard_readiness_report(active_profile=profile)
+        await self._publish_dashboard_capability_registry_view(active_profile=profile)
         await self._publish_dashboard_notice(
             f"Saved settings profile '{profile.profile_name}'.",
             severity="info",
@@ -2074,6 +3456,7 @@ class Orchestrator:
                     await self._apply_runtime_settings_profile(profile)
                     await self._publish_dashboard_settings_profiles(active_profile_name=profile.profile_name)
                     await self._publish_dashboard_readiness_report(active_profile=profile)
+                    await self._publish_dashboard_capability_registry_view(active_profile=profile)
                     await self._publish_dashboard_notice(
                         f"Loaded settings profile '{profile.profile_name}'.",
                         severity="info",
@@ -2084,6 +3467,7 @@ class Orchestrator:
                 await self._apply_runtime_settings_profile(profile)
                 await self._publish_dashboard_settings_profiles(active_profile_name=profile.profile_name)
                 await self._publish_dashboard_readiness_report(active_profile=profile)
+                await self._publish_dashboard_capability_registry_view(active_profile=profile)
                 await self._publish_dashboard_notice(
                     f"Imported settings profile '{profile.profile_name}' from '{import_path}'.",
                     severity="info",
@@ -2379,8 +3763,164 @@ class Orchestrator:
                     "Cleared the current code-specialist result.",
                     severity="info",
                 )
+            elif action == "coding.run_task":
+                app_state = self.dashboard.app_state_snapshot()
+                request_payload = {
+                    "task_type": str(payload.get("task_type", "code_review")).strip() or "code_review",
+                    "prompt": str(payload.get("prompt", "")).strip(),
+                    "language": str(
+                        payload.get(
+                            "language",
+                            app_state.user_settings.coding.get("default_language", self.config.coding_mode.default_language),
+                        )
+                    ).strip()
+                    or self.config.coding_mode.default_language,
+                    "framework": str(payload.get("framework", "")).strip(),
+                    "source_scope": str(payload.get("source_scope", "snippet")).strip() or "snippet",
+                    "source_path": str(payload.get("path", "")).strip(),
+                    "source_text": str(payload.get("text", "")),
+                    "tests_text": str(payload.get("tests_text", "")),
+                    "idle_practice": False,
+                    "metadata": {
+                        "source": "dashboard",
+                    },
+                }
+                if not request_payload["prompt"] and not request_payload["source_path"] and not request_payload["source_text"]:
+                    await self._publish_dashboard_notice(
+                        "Provide a coding prompt, source path, or code text before running Coding Mode.",
+                        severity="warning",
+                    )
+                else:
+                    coding_output = await self.coding_mode.run_task(
+                        CodingTaskRequest.from_dict(request_payload),
+                        user_settings=app_state.user_settings,
+                        event_callback=self._emit_event,
+                    )
+                    await self._publish_dashboard_coding_output(coding_output)
+                    await self._publish_dashboard_coding_patterns()
+                    await self._publish_dashboard_recent_coding_activity()
+                    await self._publish_dashboard_notice(
+                        (
+                            "Completed the coding task."
+                            if coding_output.status == "completed"
+                            else f"Coding task returned '{coding_output.status}'."
+                        ),
+                        severity="info" if coding_output.status == "completed" else "warning",
+                    )
+            elif action == "coding.practice_once":
+                app_state = self.dashboard.app_state_snapshot()
+                practice_output = await self.coding_mode.run_idle_practice_cycle(
+                    user_settings=app_state.user_settings,
+                    event_callback=self._emit_event,
+                )
+                await self._publish_dashboard_coding_practice(practice_output)
+                await self._publish_dashboard_coding_output(practice_output.task_result)
+                await self._publish_dashboard_coding_patterns()
+                await self._publish_dashboard_recent_coding_activity()
+                await self._publish_dashboard_notice(
+                    f"Completed Coding Dojo practice session '{practice_output.session_id}'.",
+                    severity="info",
+                )
+            elif action == "coding.clear":
+                self.dashboard.publish_event({"stage": "dashboard.coding_output_cleared"})
+                self.dashboard.publish_event({"stage": "dashboard.coding_practice_cleared"})
+                await self._publish_dashboard_notice(
+                    "Cleared the current Coding Mode results.",
+                    severity="info",
+                )
             elif action == "readiness.refresh":
                 await self._publish_dashboard_readiness_report()
+            elif action == "readiness.export_report":
+                export_path = Path(str(payload.get("path", "")).strip())
+                if not str(export_path).strip():
+                    await self._publish_dashboard_notice(
+                        "Provide an export directory before writing the packaged preflight report.",
+                        severity="warning",
+                    )
+                else:
+                    artifacts = await self.export_packaged_preflight_report(
+                        export_path,
+                        active_profile=self.dashboard.app_state_snapshot().user_settings,
+                    )
+                    await self._publish_dashboard_notice(
+                        f"Exported the packaged preflight report to '{artifacts['report_path']}'.",
+                        severity="info",
+                    )
+            elif action == "local_task_session.start":
+                label = str(payload.get("label", "")).strip() or "Local task session"
+                session = await self.start_local_task_session(label)
+                await self._publish_dashboard_notice(
+                    f"Started local task session '{session.session_id}'.",
+                    severity="info",
+                )
+            elif action == "local_task_session.pause":
+                session_id = str(payload.get("session_id", "")).strip()
+                if not session_id:
+                    await self._publish_dashboard_notice(
+                        "Provide a local task session id before requesting pause.",
+                        severity="warning",
+                    )
+                elif await self.pause_local_task_session(session_id, reason="dashboard_pause_requested"):
+                    await self._publish_dashboard_notice(
+                        f"Paused local task session '{session_id}'.",
+                        severity="info",
+                    )
+                else:
+                    await self._publish_dashboard_notice(
+                        f"Unable to pause local task session '{session_id}'.",
+                        severity="warning",
+                    )
+            elif action == "local_task_session.resume":
+                session_id = str(payload.get("session_id", "")).strip()
+                if not session_id:
+                    await self._publish_dashboard_notice(
+                        "Provide a local task session id before requesting resume.",
+                        severity="warning",
+                    )
+                elif await self.resume_local_task_session(session_id, reason="dashboard_resume_requested"):
+                    await self._publish_dashboard_notice(
+                        f"Resumed local task session '{session_id}'.",
+                        severity="info",
+                    )
+                else:
+                    await self._publish_dashboard_notice(
+                        f"Unable to resume local task session '{session_id}'.",
+                        severity="warning",
+                    )
+            elif action == "local_task_session.stop":
+                session_id = str(payload.get("session_id", "")).strip()
+                if not session_id:
+                    await self._publish_dashboard_notice(
+                        "Provide a local task session id before requesting stop.",
+                        severity="warning",
+                    )
+                elif await self.stop_local_task_session(session_id, reason="dashboard_stop_requested"):
+                    await self._publish_dashboard_notice(
+                        f"Stopped local task session '{session_id}'.",
+                        severity="info",
+                    )
+                else:
+                    await self._publish_dashboard_notice(
+                        f"Unable to stop local task session '{session_id}'.",
+                        severity="warning",
+                    )
+            elif action == "local_task_session.kill":
+                session_id = str(payload.get("session_id", "")).strip()
+                if not session_id:
+                    await self._publish_dashboard_notice(
+                        "Provide a local task session id before engaging the kill-switch.",
+                        severity="warning",
+                    )
+                elif await self.kill_local_task_session(session_id, reason="dashboard_kill_switch_requested"):
+                    await self._publish_dashboard_notice(
+                        f"Kill-switch engaged for local task session '{session_id}'.",
+                        severity="warning",
+                    )
+                else:
+                    await self._publish_dashboard_notice(
+                        f"Unable to engage the kill-switch for local task session '{session_id}'.",
+                        severity="warning",
+                    )
             elif action == "long_horizon.pause":
                 session_id = str(payload.get("session_id", "")).strip()
                 if not session_id:
@@ -2605,8 +4145,36 @@ class Orchestrator:
             }
         )
 
+    async def _publish_dashboard_capability_registry_view(
+        self,
+        *,
+        active_profile: UserSettingsProfile | None = None,
+        recent_decisions: tuple[CapabilityPolicyDecision, ...] | None = None,
+        recent_audits: tuple[CapabilityAuditRecord, ...] | None = None,
+    ) -> None:
+        profile = active_profile or (
+            self.dashboard.app_state_snapshot().user_settings if self._started else self._default_user_settings_profile()
+        )
+        existing_view = await self.storage.load_capability_registry_view()
+        resolved_recent_decisions = tuple(recent_decisions or existing_view.recent_decisions[-6:])
+        resolved_recent_audits = tuple(recent_audits or (await self.storage.list_capability_audits())[-8:])
+        view = self.capability_policy.build_registry_view(
+            profile=profile,
+            snapshot=self.model_manager.health_snapshot(),
+            recent_decisions=resolved_recent_decisions,
+            recent_audits=resolved_recent_audits,
+        )
+        await self.storage.save_capability_registry_view(view)
+        self.dashboard.publish_event(
+            {
+                "stage": "dashboard.capability_registry_loaded",
+                "capability_registry_view": view.to_dict(),
+            }
+        )
+
     async def _publish_dashboard_model_registry_view(self) -> None:
         recent_optimizer_suggestions = (await self.storage.list_optimizer_suggestion_records())[-4:]
+        self.model_manager.apply_governor_advisory_inputs(recent_optimizer_suggestions)
         view = self.model_manager.registry_view(
             advisory_available=True,
             optimizer_subscriptions=("reasoner", "critic", "compressor", "dashboard"),
@@ -2709,6 +4277,39 @@ class Orchestrator:
             }
         )
 
+    async def _publish_dashboard_coding_output(self, coding_output: CodingTaskResult) -> None:
+        self.dashboard.publish_event(
+            {
+                "stage": "dashboard.coding_output_loaded",
+                "coding_output": coding_output.to_dict(),
+            }
+        )
+
+    async def _publish_dashboard_coding_practice(self, practice_output: PracticeSessionResult) -> None:
+        self.dashboard.publish_event(
+            {
+                "stage": "dashboard.coding_practice_loaded",
+                "coding_practice": practice_output.to_dict(),
+            }
+        )
+
+    async def _publish_dashboard_coding_patterns(self) -> None:
+        patterns = await self.storage.list_coding_patterns(limit=8)
+        self.dashboard.publish_event(
+            {
+                "stage": "dashboard.coding_patterns_loaded",
+                "coding_patterns": [pattern.to_dict() for pattern in patterns],
+            }
+        )
+
+    async def _publish_dashboard_recent_coding_activity(self) -> None:
+        recent_results = await self.storage.list_coding_task_results(limit=1)
+        recent_practice = await self.storage.list_coding_practice_sessions(limit=1)
+        if recent_results:
+            await self._publish_dashboard_coding_output(recent_results[0])
+        if recent_practice:
+            await self._publish_dashboard_coding_practice(recent_practice[0])
+
     async def _publish_dashboard_audio_transcript_import(
         self,
         audio_input: AudioTranscriptionResult,
@@ -2726,7 +4327,500 @@ class Orchestrator:
         """Apply one settings profile across runtime routing and the dashboard shell."""
         self.model_manager.apply_user_settings_profile(profile)
         self.dashboard.apply_user_settings(profile)
+        active_session = None
+        if hasattr(self.storage, "load_active_local_task_session"):
+            active_session = await self.storage.load_active_local_task_session()
+        if active_session is not None and active_session.profile_name == profile.profile_name:
+            active_session = self._session_with_observation_governor(
+                active_session,
+                profile=profile,
+                updated_at=utc_now(),
+            )
+            await self.storage.save_local_task_session(active_session)
+            await self._sync_continuous_capture_for_session(
+                active_session,
+                profile=profile,
+                reason="settings_updated",
+            )
+        await self._publish_dashboard_capability_registry_view(active_profile=profile)
         await self._publish_dashboard_model_registry_view()
+
+    async def evaluate_capability_request(
+        self,
+        request: CapabilityRequest | dict[str, Any],
+        *,
+        active_profile: UserSettingsProfile | None = None,
+    ) -> CapabilityPolicyDecision:
+        """Evaluate one typed capability request against the current policy state."""
+        capability_request = (
+            request if isinstance(request, CapabilityRequest) else CapabilityRequest.from_dict(request)
+        )
+        profile = active_profile or (
+            self.dashboard.app_state_snapshot().user_settings if self._started else self._default_user_settings_profile()
+        )
+        snapshot = self.model_manager.health_snapshot()
+        return self.capability_policy.evaluate(capability_request, profile=profile, snapshot=snapshot)
+
+    @staticmethod
+    def _local_task_session_gate_decision(
+        request: CapabilityRequest,
+        *,
+        reason_code: str,
+        detail: str,
+    ) -> CapabilityPolicyDecision:
+        return CapabilityPolicyDecision(
+            request_id=request.request_id,
+            capability_type=request.capability_type,
+            action_name=request.action_name(),
+            outcome=CapabilityPolicyOutcome.DENIED,
+            availability=CapabilityAvailabilityStatus.AVAILABLE,
+            requires_approval=False,
+            reason_codes=(reason_code,),
+            detail=detail,
+            warnings=(),
+            decided_at=utc_now(),
+        )
+
+    @staticmethod
+    def _local_task_control_mode(request: CapabilityRequest) -> str:
+        if request.capability_type == CapabilityType.SHELL_COMMAND:
+            return "shell_task"
+        if request.capability_type == CapabilityType.BROWSER_ACTION:
+            return "browser_task"
+        if request.capability_type in {
+            CapabilityType.APP_WINDOW_FOCUS,
+            CapabilityType.SCREENSHOT,
+            CapabilityType.OCR_REQUEST,
+            CapabilityType.DESKTOP_INPUT,
+        }:
+            return "desktop_control"
+        return "local_task"
+
+    @staticmethod
+    def _bind_request_to_local_task_session(
+        session: LocalTaskSession,
+        request: CapabilityRequest,
+    ) -> LocalTaskSession:
+        return replace(
+            session,
+            control_mode=Orchestrator._local_task_control_mode(request),
+            current_target=request.target_summary(),
+            last_request_id=request.request_id,
+            updated_at=utc_now(),
+        )
+
+    @staticmethod
+    def _queue_pending_approval(
+        session: LocalTaskSession,
+        request: CapabilityRequest,
+    ) -> LocalTaskSession:
+        pending_approvals = [
+            item
+            for item in session.pending_approvals
+            if item.request_id != request.request_id
+        ]
+        pending_approvals.append(
+            LocalTaskPendingApproval(
+                request_id=request.request_id,
+                capability_type=request.capability_type,
+                action_name=request.action_name(),
+                summary=request.summary or f"Approval required for {request.action_name()}.",
+                target=request.target_summary(),
+                requested_at=request.requested_at,
+            )
+        )
+        return replace(
+            session,
+            pending_approvals=tuple(pending_approvals),
+            updated_at=utc_now(),
+        )
+
+    @staticmethod
+    def _clear_pending_approval(
+        session: LocalTaskSession,
+        request_id: str,
+    ) -> LocalTaskSession:
+        return replace(
+            session,
+            pending_approvals=tuple(
+                item for item in session.pending_approvals if item.request_id != request_id
+            ),
+            updated_at=utc_now(),
+        )
+
+    @staticmethod
+    def _finalize_local_task_session_after_request(
+        session: LocalTaskSession,
+        request: CapabilityRequest,
+        result: CapabilityExecutionResult,
+    ) -> LocalTaskSession:
+        return replace(
+            Orchestrator._clear_pending_approval(session, request.request_id),
+            control_mode=Orchestrator._local_task_control_mode(request),
+            current_target=request.target_summary(),
+            last_action_summary=result.summary,
+            last_request_id=request.request_id,
+            last_error=result.detail if result.status == CapabilityExecutionStatus.FAILED else "",
+            updated_at=utc_now(),
+        )
+
+    @staticmethod
+    def _local_task_request_fingerprint(request: CapabilityRequest) -> str:
+        payload: dict[str, Any] = {
+            "capability_type": request.capability_type.value,
+            "action_name": request.action_name(),
+            "target": request.target_summary(),
+            "destructive": request.destructive,
+            "cross_app": request.cross_app,
+            "metadata": dict(request.metadata),
+        }
+        if request.file_operation is not None:
+            payload["file_operation"] = request.file_operation.to_dict()
+        if request.shell_command is not None:
+            payload["shell_command"] = request.shell_command.to_dict()
+        if request.browser_action is not None:
+            payload["browser_action"] = request.browser_action.to_dict()
+        if request.app_focus is not None:
+            payload["app_focus"] = request.app_focus.to_dict()
+        if request.clipboard_action is not None:
+            payload["clipboard_action"] = request.clipboard_action.to_dict()
+        if request.screenshot is not None:
+            payload["screenshot"] = request.screenshot.to_dict()
+        if request.ocr_request is not None:
+            payload["ocr_request"] = request.ocr_request.to_dict()
+        if request.desktop_input is not None:
+            payload["desktop_input"] = request.desktop_input.to_dict()
+        return json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+
+    @classmethod
+    def _track_local_task_request_state(
+        cls,
+        session: LocalTaskSession,
+        request: CapabilityRequest,
+    ) -> tuple[LocalTaskSession, bool]:
+        fingerprint = cls._local_task_request_fingerprint(request)
+        repeated_count = (
+            session.repeated_request_count + 1
+            if fingerprint == session.last_request_fingerprint
+            else 1
+        )
+        next_session = replace(
+            session,
+            last_request_fingerprint=fingerprint,
+            repeated_request_count=repeated_count,
+            updated_at=utc_now(),
+        )
+        return next_session, repeated_count > cls.LOCAL_TASK_MAX_REPEATED_REQUESTS
+
+    def _local_task_abort_reason(self) -> str | None:
+        return "emergency_stop_requested" if self._local_task_emergency_stop.is_set() else None
+
+    async def _pause_local_task_session_for_recovery(
+        self,
+        session: LocalTaskSession,
+        *,
+        reason: str,
+        error: str,
+    ) -> LocalTaskSession:
+        paused = replace(
+            session,
+            status=LocalTaskSessionState.PAUSED,
+            pause_requested=False,
+            last_control_reason=reason,
+            last_error=error,
+            updated_at=utc_now(),
+        )
+        self._local_task_emergency_stop.set()
+        await self.storage.save_local_task_session(paused)
+        await self._emit_event(
+            "local_task_session.paused",
+            {
+                "session_id": paused.session_id,
+                "status": paused.status.value,
+                "reason": reason,
+                "detail": error,
+            },
+        )
+        await self._publish_dashboard_local_task_session(paused)
+        return paused
+
+    async def _apply_local_task_safety_recovery(
+        self,
+        session: LocalTaskSession,
+        request: CapabilityRequest,
+        result: CapabilityExecutionResult,
+    ) -> LocalTaskSession:
+        warning_set = {str(item) for item in result.warnings}
+        if "loop_guard_triggered" in warning_set:
+            return await self._pause_local_task_session_for_recovery(
+                session,
+                reason="loop_guard_triggered",
+                error=result.detail,
+            )
+        if warning_set & {"emergency_stop_requested"}:
+            return await self._pause_local_task_session_for_recovery(
+                session,
+                reason="emergency_stop_requested",
+                error=result.detail,
+            )
+        if warning_set & {"foreground_target_mismatch", "target_window_not_found"}:
+            return await self._pause_local_task_session_for_recovery(
+                session,
+                reason="target_validation_failed",
+                error=result.detail,
+            )
+        if result.status == CapabilityExecutionStatus.FAILED and "shell_timeout" in warning_set:
+            return await self._pause_local_task_session_for_recovery(
+                session,
+                reason="timeout_recovery",
+                error=result.detail,
+            )
+        return session
+
+    async def run_capability_request(
+        self,
+        request: CapabilityRequest | dict[str, Any],
+        *,
+        approval_granted: bool | None = None,
+        active_profile: UserSettingsProfile | None = None,
+    ) -> CapabilityExecutionResult:
+        """Run one typed capability request through session, policy, audit, and execution layers."""
+        capability_request = (
+            request if isinstance(request, CapabilityRequest) else CapabilityRequest.from_dict(request)
+        )
+        profile = active_profile or (
+            self.dashboard.app_state_snapshot().user_settings if self._started else self._default_user_settings_profile()
+        )
+        session = await self.storage.load_active_local_task_session()
+        if session is None:
+            decision = self._local_task_session_gate_decision(
+                capability_request,
+                reason_code="session_not_active",
+                detail="Start an explicit local task session before running capability requests.",
+            )
+        elif session.kill_switch_engaged or session.status == LocalTaskSessionState.KILLED:
+            await self.storage.save_active_local_task_session_id("")
+            decision = self._local_task_session_gate_decision(
+                capability_request,
+                reason_code="kill_switch_engaged",
+                detail="The kill-switch is engaged for this local task session. Start a new session before retrying.",
+            )
+        elif session.status == LocalTaskSessionState.PAUSED:
+            decision = self._local_task_session_gate_decision(
+                capability_request,
+                reason_code="session_paused",
+                detail="Resume the active local task session before running capability requests.",
+            )
+        elif session.status in self._terminal_local_task_session_states():
+            await self.storage.save_active_local_task_session_id("")
+            decision = self._local_task_session_gate_decision(
+                capability_request,
+                reason_code="session_not_running",
+                detail=(
+                    f"Local task session '{session.session_id}' is {session.status.value}. "
+                    "Start a new session before running capability requests."
+                ),
+            )
+        else:
+            session = self._bind_request_to_local_task_session(session, capability_request)
+            session, loop_detected = self._track_local_task_request_state(session, capability_request)
+            if loop_detected:
+                loop_detail = (
+                    "loop_guard_triggered: repeated identical capability requests exceeded the local safety threshold; "
+                    "the session was paused for recovery."
+                )
+                session = await self._pause_local_task_session_for_recovery(
+                    session,
+                    reason="loop_guard_triggered",
+                    error=loop_detail,
+                )
+                decision = self._local_task_session_gate_decision(
+                    capability_request,
+                    reason_code="loop_guard_triggered",
+                    detail=loop_detail,
+                )
+            else:
+                self._local_task_emergency_stop.clear()
+                await self.storage.save_local_task_session(session)
+                await self._publish_dashboard_local_task_session(session)
+                decision = await self.evaluate_capability_request(capability_request, active_profile=profile)
+        audit_records: list[CapabilityAuditRecord] = [
+            self._capability_audit_record(
+                request=capability_request,
+                event_type=CapabilityAuditEventType.REQUESTED,
+                summary=capability_request.summary or f"Requested {capability_request.capability_type.value}.",
+                detail=capability_request.target_summary() or "",
+                session_id=session.session_id if session is not None else "",
+            ),
+            self._capability_audit_record(
+                request=capability_request,
+                event_type=CapabilityAuditEventType.POLICY_DECISION,
+                summary=f"Policy decided {decision.outcome.value} for {decision.action_name}.",
+                detail=decision.detail,
+                policy_outcome=decision.outcome.value,
+                reason_codes=decision.reason_codes,
+                session_id=session.session_id if session is not None else "",
+            ),
+        ]
+        effective_decision = decision
+        if decision.outcome == CapabilityPolicyOutcome.REQUIRES_APPROVAL and approval_granted is None and session is not None:
+            session = self._queue_pending_approval(session, capability_request)
+            await self.storage.save_local_task_session(session)
+            await self._publish_dashboard_local_task_session(session)
+            audit_records.append(
+                self._capability_audit_record(
+                    request=capability_request,
+                    event_type=CapabilityAuditEventType.WARNING,
+                    summary=f"Approval is pending for {decision.action_name}.",
+                    detail=decision.detail,
+                    policy_outcome=decision.outcome.value,
+                    reason_codes=decision.reason_codes,
+                    session_id=session.session_id,
+                )
+            )
+            result = CapabilityExecutionResult(
+                request_id=capability_request.request_id,
+                capability_type=capability_request.capability_type,
+                action_name=capability_request.action_name(),
+                status=CapabilityExecutionStatus.BLOCKED,
+                summary=f"Approval pending for {capability_request.action_name()}.",
+                detail=decision.detail,
+                executor_kind="session_gate",
+                output_ref=capability_request.target_summary(),
+                warnings=(*decision.warnings, "approval_pending"),
+                metadata={
+                    "reason_codes": list(decision.reason_codes),
+                    "session_id": session.session_id,
+                },
+                completed_at=utc_now(),
+            )
+            audit_records.append(
+                self._capability_audit_record(
+                    request=capability_request,
+                    event_type=CapabilityAuditEventType.EXECUTOR_RESULT,
+                    summary=result.summary,
+                    detail=result.detail,
+                    policy_outcome=effective_decision.outcome.value,
+                    reason_codes=effective_decision.reason_codes,
+                    session_id=session.session_id,
+                )
+            )
+            await self.storage.record_capability_audits(audit_records)
+            existing_view = await self.storage.load_capability_registry_view()
+            await self._publish_dashboard_capability_registry_view(
+                active_profile=profile,
+                recent_decisions=(*existing_view.recent_decisions[-5:], decision),
+                recent_audits=(*existing_view.recent_audits[-4:], *tuple(audit_records)[-4:]),
+            )
+            return result
+        if decision.outcome == CapabilityPolicyOutcome.REQUIRES_APPROVAL:
+            if session is not None:
+                session = self._clear_pending_approval(session, capability_request.request_id)
+            approval_record_type = (
+                CapabilityAuditEventType.APPROVAL_GRANTED
+                if approval_granted
+                else CapabilityAuditEventType.APPROVAL_DENIED
+            )
+            audit_records.append(
+                self._capability_audit_record(
+                    request=capability_request,
+                    event_type=approval_record_type,
+                    summary=(
+                        f"Approval granted for {decision.action_name}."
+                        if approval_granted
+                        else f"Approval denied for {decision.action_name}."
+                    ),
+                    detail=decision.detail,
+                    policy_outcome=decision.outcome.value,
+                    reason_codes=decision.reason_codes,
+                    session_id=session.session_id if session is not None else "",
+                )
+            )
+            if approval_granted:
+                effective_decision = replace(
+                    decision,
+                    outcome=CapabilityPolicyOutcome.ALLOWED,
+                    availability=CapabilityAvailabilityStatus.AVAILABLE,
+                    requires_approval=False,
+                    detail=f"{decision.detail} Approval granted for bounded execution.",
+                )
+        if decision.outcome in {CapabilityPolicyOutcome.DENIED, CapabilityPolicyOutcome.DEGRADED}:
+            audit_records.append(
+                self._capability_audit_record(
+                    request=capability_request,
+                    event_type=CapabilityAuditEventType.WARNING,
+                    summary=f"Capability request surfaced {decision.outcome.value}.",
+                    detail=decision.detail,
+                    policy_outcome=decision.outcome.value,
+                    reason_codes=decision.reason_codes,
+                    session_id=session.session_id if session is not None else "",
+                )
+            )
+        result = await self.capability_executor.execute(
+            capability_request,
+            decision=effective_decision,
+            profile=profile,
+            should_abort=self._local_task_abort_reason,
+        )
+        if session is not None and session.status == LocalTaskSessionState.RUNNING:
+            session = self._finalize_local_task_session_after_request(session, capability_request, result)
+            session = await self._apply_local_task_safety_recovery(session, capability_request, result)
+            if session.status == LocalTaskSessionState.RUNNING:
+                session = await self._run_observation_step_if_enabled(
+                    session,
+                    request=capability_request,
+                    result=result,
+                    profile=profile,
+                )
+        audit_records.append(
+            self._capability_audit_record(
+                request=capability_request,
+                event_type=CapabilityAuditEventType.EXECUTOR_RESULT,
+                summary=result.summary,
+                detail=result.detail,
+                policy_outcome=effective_decision.outcome.value,
+                reason_codes=effective_decision.reason_codes,
+                session_id=session.session_id if session is not None else "",
+            )
+        )
+        await self.storage.record_capability_audits(audit_records)
+        existing_view = await self.storage.load_capability_registry_view()
+        await self._publish_dashboard_capability_registry_view(
+            active_profile=profile,
+            recent_decisions=(*existing_view.recent_decisions[-5:], decision),
+            recent_audits=(*existing_view.recent_audits[-4:], *tuple(audit_records)[-4:]),
+        )
+        return result
+
+    @staticmethod
+    def _capability_audit_record(
+        *,
+        request: CapabilityRequest,
+        event_type: CapabilityAuditEventType,
+        summary: str,
+        detail: str = "",
+        policy_outcome: str = "",
+        reason_codes: tuple[str, ...] = (),
+        session_id: str = "",
+    ) -> CapabilityAuditRecord:
+        audit_id = f"{request.request_id}:{event_type.value}"
+        return CapabilityAuditRecord(
+            audit_id=audit_id,
+            request_id=request.request_id,
+            capability_type=request.capability_type,
+            action_name=request.action_name(),
+            event_type=event_type,
+            summary=summary,
+            detail=detail,
+            policy_outcome=policy_outcome,
+            reason_codes=reason_codes,
+            metadata={
+                "target": request.target_summary(),
+                "summary": request.summary,
+                "session_id": session_id,
+            },
+            created_at=utc_now(),
+        )
 
     async def _run_dashboard_model_action(self, *, action: str, payload: dict[str, Any]) -> None:
         role = self._resolve_dashboard_model_role(str(payload.get("role", "")).strip())
@@ -2993,12 +5087,15 @@ class Orchestrator:
         self,
         *,
         active_profile: UserSettingsProfile | None = None,
+        first_run: bool = False,
     ) -> PackagedLaunchReport:
         """Return the packaged-app launch decision before or after startup.
 
         Input:
         - `active_profile`: optional settings profile to evaluate instead of the
           live dashboard state.
+        - `first_run`: whether the packaged app is planning its first startup
+          without a previously saved default settings profile.
 
         Output:
         - A typed `PackagedLaunchReport` describing stub or real mode readiness.
@@ -3009,7 +5106,7 @@ class Orchestrator:
         """
         state = self._collect_readiness_state(active_profile=active_profile)
         readiness = self._build_dashboard_readiness_report_from_state(state)
-        requested_mode = "stub" if self.config.preflight.flags.stub_mode else "real"
+        requested_mode = "stub" if state.requested_stub_mode else "real"
         prelaunch_real_ready = state.primary_generation_ready and state.primary_embedding_ready
         used_stub_fallback = requested_mode == "real" and not prelaunch_real_ready
         effective_mode = "stub" if requested_mode == "stub" or used_stub_fallback else "real"
@@ -3017,7 +5114,11 @@ class Orchestrator:
         blocking_reason = ""
         blocking_detail = ""
         if requested_mode == "stub":
-            summary = "Packaged launch will start in stub mode for first-run local validation."
+            summary = (
+                "Packaged launch will start in stub mode for first-run local validation."
+                if first_run
+                else "Packaged launch will stay in stub mode until you explicitly re-enable real-mode prerequisites."
+            )
         elif used_stub_fallback:
             blocking_reason, blocking_detail = self._packaged_launch_blocker(state)
             summary = (
@@ -3037,12 +5138,421 @@ class Orchestrator:
             readiness_report=readiness,
         )
 
+    def build_packaged_startup_plan(
+        self,
+        *,
+        startup_profile: UserSettingsProfile | None = None,
+    ) -> _PackagedStartupPlan:
+        """Plan packaged startup while preserving requested vs effective runtime mode.
+
+        Input:
+        - `startup_profile`: persisted default profile if one already exists.
+
+        Output:
+        - An internal packaged-startup plan carrying the requested profile,
+          effective startup profile, launch report, and runtime config.
+
+        Failure behavior:
+        - The method does not raise for missing optional runtime dependencies;
+          those remain encoded in the contained packaged launch report.
+        """
+        first_run = startup_profile is None
+        if first_run:
+            default_profile = self._default_user_settings_profile()
+            requested_profile = replace(
+                default_profile,
+                runtime={
+                    **default_profile.runtime,
+                    "stub_mode": True,
+                },
+            )
+            effective_profile = requested_profile
+            persist_effective_profile = True
+        else:
+            requested_profile = startup_profile
+            effective_profile = requested_profile
+            persist_effective_profile = False
+        launch_report = self.build_packaged_launch_report(
+            active_profile=requested_profile,
+            first_run=first_run,
+        )
+        if launch_report.used_stub_fallback:
+            effective_profile = replace(
+                requested_profile,
+                runtime={
+                    **requested_profile.runtime,
+                    "stub_mode": True,
+                },
+            )
+        runtime_config = self._config_for_user_settings_profile(effective_profile)
+        if first_run:
+            startup_notice = (
+                "Packaged startup is beginning in stub mode for first-run validation. "
+                "Review readiness guidance before enabling real mode."
+            )
+            startup_notice_severity = "info"
+        elif launch_report.used_stub_fallback:
+            startup_notice = f"{launch_report.summary} {launch_report.blocking_detail}".strip()
+            startup_notice_severity = "warning"
+        elif launch_report.effective_mode == "real":
+            startup_notice = "Packaged startup is ready for real mode."
+            startup_notice_severity = "info"
+        else:
+            startup_notice = (
+                "Packaged startup is using stub mode because the saved profile still requests a lightweight local path."
+            )
+            startup_notice_severity = "info"
+        return _PackagedStartupPlan(
+            requested_profile=requested_profile,
+            effective_profile=effective_profile,
+            launch_report=launch_report,
+            runtime_config=runtime_config,
+            first_run=first_run,
+            persist_effective_profile=persist_effective_profile,
+            startup_notice=startup_notice,
+            startup_notice_severity=startup_notice_severity,
+        )
+
+    def _packaged_default_model_bundle(self) -> dict[str, str]:
+        """Return the pinned default local model bundle used by readiness and onboarding surfaces."""
+        backends = self.config.preflight.backends
+        return {
+            "generation": f"{backends.generation_backend}:{backends.generation_model}",
+            "generation_fallback": f"{backends.generation_fallback_backend}:{backends.generation_fallback_model}",
+            "embedding": f"{backends.embedding_backend}:{backends.embedding_model}",
+            "embedding_fallback": f"{backends.embedding_fallback_backend}:{backends.embedding_fallback_model}",
+        }
+
+    def _packaged_data_paths(self) -> dict[str, str]:
+        """Return the local paths that packaged onboarding and diagnostics should point to."""
+        return {
+            "sqlite_path": str(self.config.storage.sqlite_path),
+            "logs_dir": str(self.config.storage.logs_dir),
+            "models_dir": str(self.config.backend_runtime.models_dir),
+        }
+
+    def _packaged_onboarding_lines(
+        self,
+        *,
+        launch_report: PackagedLaunchReport,
+    ) -> tuple[str, ...]:
+        """Return first-run onboarding guidance for packaged startup and reopened preflight reports."""
+        hardware = self.config.preflight.hardware
+        bundle = self._packaged_default_model_bundle()
+        data_paths = self._packaged_data_paths()
+        guide_path = str(_LOCAL_MODEL_SETUP_GUIDE)
+        return (
+            (
+                "Stub mode is the default packaged first-run path so the app can validate storage, UI, "
+                "history, knowledge management, and local task controls without heavy model dependencies."
+            ),
+            (
+                "Real mode stays opt-in and only becomes the effective packaged mode when both the pinned "
+                "generation and embedding backends are locally ready."
+            ),
+            (
+                f"Default local model bundle: generation={bundle['generation']}, "
+                f"generation_fallback={bundle['generation_fallback']}, embedding={bundle['embedding']}, "
+                f"embedding_fallback={bundle['embedding_fallback']}."
+            ),
+            f"Hardware target: {hardware.max_vram_gb:.0f}GB VRAM / {hardware.max_ram_gb:.0f}GB RAM.",
+            (
+                "Privacy boundary: the base runtime stays local-first; optional cloud helpers remain auxiliary-only "
+                "and can offload approved content only after the matching capability is explicitly enabled."
+            ),
+            (
+                f"User data stays on this machine by default in '{data_paths['sqlite_path']}' plus "
+                f"'{data_paths['logs_dir']}', while local model files live under '{data_paths['models_dir']}'."
+            ),
+            (
+                f"Current packaged launch decision: requested={launch_report.requested_mode}, "
+                f"effective={launch_report.effective_mode}, fallback={'yes' if launch_report.used_stub_fallback else 'no'}."
+            ),
+            f"Exact local backend and model setup steps are documented in '{guide_path}'.",
+        )
+
+    def _packaged_setup_steps(self) -> tuple[str, ...]:
+        """Return actionable setup steps aligned to the pinned default local model bundle."""
+        bundle = self._packaged_default_model_bundle()
+        models_dir = self._packaged_data_paths()["models_dir"]
+        return (
+            "Create a Python 3.11+ environment and install the repo with only the extras you need.",
+            "Install the primary embedding dependency with `python -m pip install -e .[embeddings]`.",
+            "Install the persistent vector dependency with `python -m pip install -e .[vector]` if you want the default Chroma store.",
+            "Install the fallback generation dependency with `python -m pip install -e .[llama-cpp]` if you want local GGUF fallback.",
+            (
+                f"Install Ollama and pull the primary generation model `{bundle['generation']}` plus the "
+                f"embedding fallback model `{bundle['embedding_fallback']}` if you plan to use the Ollama embedding path."
+            ),
+            (
+                f"Place the GGUF fallback model `{bundle['generation_fallback'].split(':', 1)[1]}` under "
+                f"`{models_dir}` or update the configured path."
+            ),
+            "Refresh the Readiness tab or export a packaged preflight report after setup changes so the effective launch mode is recalculated from the same shared checks.",
+        )
+
+    def _packaged_preflight_payload(
+        self,
+        *,
+        profile: UserSettingsProfile,
+        launch_report: PackagedLaunchReport,
+    ) -> dict[str, Any]:
+        """Build a reopenable packaged preflight report payload."""
+        cloud_mode = str(profile.cloud.get("mode", CloudOffloadMode.AUXILIARY_ONLY.value))
+        return {
+            "generated_at": utc_now().isoformat(),
+            "launch_report": launch_report.to_dict(),
+            "default_model_bundle": self._packaged_default_model_bundle(),
+            "hardware_budget": {
+                "max_vram_gb": self.config.preflight.hardware.max_vram_gb,
+                "max_ram_gb": self.config.preflight.hardware.max_ram_gb,
+            },
+            "data_paths": self._packaged_data_paths(),
+            "heavy_slot_policy": {
+                "default_active_pair": ("generation", "embedding"),
+                "max_active_heavy_backends": 2,
+                "sidecars_do_not_consume_heavy_slots": True,
+            },
+            "privacy": {
+                "cloud_mode": cloud_mode,
+                "allow_cloud_content": bool(profile.privacy.get("allow_cloud_content", False)),
+                "summary": (
+                    "Local-first by default; optional cloud helpers remain auxiliary-only and only handle approved "
+                    "content after explicit enablement."
+                ),
+            },
+            "onboarding_guidance": self._packaged_onboarding_lines(launch_report=launch_report),
+            "setup_steps": self._packaged_setup_steps(),
+            "setup_guide_path": str(_LOCAL_MODEL_SETUP_GUIDE),
+        }
+
+    async def export_packaged_preflight_report(
+        self,
+        export_dir: Path,
+        *,
+        active_profile: UserSettingsProfile | None = None,
+        launch_report: PackagedLaunchReport | None = None,
+    ) -> dict[str, str]:
+        """Export a reopenable packaged preflight report plus onboarding/setup artifacts."""
+        report_dir = Path(export_dir)
+        report_dir.mkdir(parents=True, exist_ok=True)
+        profile = active_profile
+        if profile is None:
+            if self._started:
+                profile = self.dashboard.app_state_snapshot().user_settings
+            else:
+                profile = self._default_user_settings_profile()
+        launch = launch_report or self.build_packaged_launch_report(active_profile=profile)
+        payload = self._packaged_preflight_payload(profile=profile, launch_report=launch)
+
+        report_path = report_dir / "packaged_preflight_report.json"
+        onboarding_path = report_dir / "packaged_onboarding.txt"
+        setup_path = report_dir / _LOCAL_MODEL_SETUP_GUIDE.name
+
+        report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        onboarding_path.write_text(
+            "\n".join(
+                (
+                    "Quester.AI Packaged Onboarding",
+                    "",
+                    *(f"- {line}" for line in payload["onboarding_guidance"]),
+                    "",
+                    "Setup Steps:",
+                    *(f"{index}. {line}" for index, line in enumerate(payload["setup_steps"], start=1)),
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        if _LOCAL_MODEL_SETUP_GUIDE.exists():
+            shutil.copy2(_LOCAL_MODEL_SETUP_GUIDE, setup_path)
+        else:
+            setup_path.write_text("\n".join(payload["setup_steps"]) + "\n", encoding="utf-8")
+        return {
+            "report_path": str(report_path),
+            "onboarding_path": str(onboarding_path),
+            "setup_path": str(setup_path),
+        }
+
+    def _write_packaged_startup_diagnostics(
+        self,
+        error: BaseException,
+        *,
+        export_dir: Path | None = None,
+        launch_report: PackagedLaunchReport | None = None,
+    ) -> Path:
+        """Persist startup diagnostics so packaged failures are exportable and actionable."""
+        diagnostics_dir = Path(export_dir) if export_dir is not None else self.config.storage.logs_dir
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        diagnostics_path = diagnostics_dir / "packaged_startup_diagnostics.json"
+        diagnostics_payload = {
+            "generated_at": utc_now().isoformat(),
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "traceback": traceback.format_exc(),
+            "launch_report": None if launch_report is None else launch_report.to_dict(),
+            "safe_recovery": {
+                "recommended_mode": "stub",
+                "summary": "Retry packaged startup in stub mode, inspect readiness, then re-enable real mode only after the reported blockers are resolved.",
+            },
+            "data_paths": self._packaged_data_paths(),
+            "setup_guide_path": str(_LOCAL_MODEL_SETUP_GUIDE),
+        }
+        diagnostics_path.write_text(json.dumps(diagnostics_payload, indent=2), encoding="utf-8")
+        return diagnostics_path
+
+    def _build_runtime_recovery_launch_report(
+        self,
+        *,
+        launch_report: PackagedLaunchReport,
+        error: BaseException,
+        diagnostics_path: Path,
+    ) -> PackagedLaunchReport:
+        """Translate an unexpected real-mode startup failure into a readable stub-recovery launch report."""
+        guidance = tuple(
+            dict.fromkeys(
+                (
+                    *launch_report.guidance,
+                    f"Startup diagnostics were written to '{diagnostics_path}'.",
+                    "The packaged app recovered into stub mode after a real-mode startup failure.",
+                )
+            )
+        )
+        return replace(
+            launch_report,
+            effective_mode="stub",
+            launch_ready=True,
+            used_stub_fallback=True,
+            summary="Packaged startup hit a real-mode exception and recovered in stub mode.",
+            blocking_reason="startup_exception",
+            blocking_detail=f"{type(error).__name__}: {error}",
+            guidance=guidance,
+        )
+
+    async def dispatch_auxiliary_cloud_job(
+        self,
+        *,
+        capability: CloudOffloadCapability,
+        payload: dict[str, Any],
+        active_profile: UserSettingsProfile | None = None,
+        local_fallback: Callable[[], Awaitable[Any] | Any] | None = None,
+        job_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> CloudOffloadRecord:
+        """Dispatch one auxiliary cloud helper job without making cloud mandatory.
+
+        Input:
+        - `capability`: the helper category to evaluate.
+        - `payload`: bounded provider-agnostic request payload.
+        - `active_profile`: optional settings profile override.
+        - `local_fallback`: optional local callable to run if the helper is blocked or fails.
+        - `job_id`: optional stable ID override for persistence and audit lookup.
+        - `metadata`: optional audit metadata merged into the persisted record.
+
+        Output:
+        - A typed `CloudOffloadRecord` describing the final cloud or local-fallback outcome.
+
+        Failure behavior:
+        - The method does not raise for cloud-policy, provider-availability, or provider-dispatch failures.
+          Those conditions are returned and persisted as typed outcomes instead.
+        """
+        profile = active_profile or (
+            self.dashboard.app_state_snapshot().user_settings if self._started else self._default_user_settings_profile()
+        )
+        title, payload_class, privacy_class, requires_content_approval = _CLOUD_OFFLOAD_CAPABILITY_DETAILS[capability]
+        provider_name = self._cloud_provider_name(profile)
+        provider_family = self._cloud_provider_family(profile)
+        fallback_behavior = self._cloud_fallback_behavior(profile)
+        resolved_job_id = str(job_id or f"{capability.value}:{stable_hash(json.dumps(payload, sort_keys=True, default=str))[:12]}")
+        payload_bytes = len(json.dumps(payload, sort_keys=True, default=str).encode("utf-8"))
+        dispatch_metadata = dict(metadata or {})
+        dispatch_metadata.setdefault("title", title)
+
+        async def _blocked_record(reason: str, detail: str) -> CloudOffloadRecord:
+            fallback_used = False
+            outcome = CloudOffloadOutcome.BLOCKED
+            summary = "Auxiliary cloud helper was blocked before dispatch."
+            if local_fallback is not None:
+                maybe_result = local_fallback()
+                if inspect.isawaitable(maybe_result):
+                    await maybe_result
+                fallback_used = True
+                outcome = CloudOffloadOutcome.LOCAL_FALLBACK
+                summary = "Auxiliary cloud helper was skipped and local fallback ran."
+            return CloudOffloadRecord(
+                dispatch_id=f"cloud_{stable_hash(f'{resolved_job_id}:{reason}:{utc_now().isoformat()}')[:16]}",
+                job_id=resolved_job_id,
+                capability=capability,
+                provider_name=provider_name,
+                provider_family=provider_family,
+                payload_class=payload_class,
+                privacy_class=privacy_class,
+                outcome=outcome,
+                summary=summary,
+                detail=detail,
+                fallback_behavior=fallback_behavior,
+                bytes_sent=payload_bytes,
+                local_fallback_used=fallback_used,
+                fallback_reason=reason,
+                metadata=dispatch_metadata,
+            )
+
+        cloud_mode = CloudOffloadMode(str(profile.cloud.get("mode", CloudOffloadMode.AUXILIARY_ONLY.value)).strip())
+        if cloud_mode == CloudOffloadMode.DISABLED:
+            record = await _blocked_record(
+                "cloud_mode_disabled",
+                f"{title} stays local-only because global cloud mode is disabled.",
+            )
+        elif self._cloud_capability_modes(profile)[capability] == CloudOffloadMode.DISABLED:
+            record = await _blocked_record(
+                "cloud_capability_disabled",
+                f"{title} stays local-only because this helper category is disabled.",
+            )
+        elif requires_content_approval and not bool(profile.privacy.get("allow_cloud_content", False)):
+            record = await _blocked_record(
+                "cloud_content_not_approved",
+                f"{title} requires approved-content offload, but Allow cloud content is off.",
+            )
+        else:
+            contract = self._cloud_job_contract_for_capability(profile=profile, capability=capability)
+            if contract is None:
+                record = await _blocked_record(
+                    "cloud_contract_unavailable",
+                    f"{title} has no valid cloud contract, so the helper remains local-only.",
+                )
+            else:
+                record = await self.cloud_offload.dispatch(
+                    provider_name=provider_name,
+                    contract=replace(contract, job_id=resolved_job_id),
+                    payload=payload,
+                    local_fallback=local_fallback,
+                    metadata=dispatch_metadata,
+                )
+        await self.storage.record_cloud_offload_record(record)
+        await self._emit_event(
+            "cloud.offload_recorded",
+            {
+                "dispatch_id": record.dispatch_id,
+                "job_id": record.job_id,
+                "capability": record.capability.value,
+                "provider_name": record.provider_name,
+                "provider_family": record.provider_family,
+                "outcome": record.outcome.value,
+                "fallback_reason": record.fallback_reason,
+                "local_fallback_used": record.local_fallback_used,
+                "bytes_sent": record.bytes_sent,
+                "latency_ms": record.latency_ms,
+            },
+        )
+        return record
+
     async def export_packaged_support_bundle(
         self,
         export_dir: Path,
         *,
         active_profile: UserSettingsProfile | None = None,
         launch_report: PackagedLaunchReport | None = None,
+        diagnostics_path: Path | None = None,
     ) -> PackagedSupportBundle:
         """Export a small support bundle for packaged-launch smoke and troubleshooting.
 
@@ -3050,6 +5560,7 @@ class Orchestrator:
         - `export_dir`: destination directory for the bundle files.
         - `active_profile`: optional settings profile override.
         - `launch_report`: optional precomputed packaged-launch report.
+        - `diagnostics_path`: optional packaged startup diagnostics file to include.
 
         Output:
         - A typed `PackagedSupportBundle` containing the generated file paths.
@@ -3069,6 +5580,11 @@ class Orchestrator:
                 profile = self._default_user_settings_profile()
         launch = launch_report or self.build_packaged_launch_report(active_profile=profile)
         app_state = self.dashboard.app_state_snapshot()
+        preflight_artifacts = await self.export_packaged_preflight_report(
+            bundle_dir,
+            active_profile=profile,
+            launch_report=launch,
+        )
 
         launch_report_path = bundle_dir / "launch_report.json"
         readiness_report_path = bundle_dir / "readiness_report.json"
@@ -3076,6 +5592,7 @@ class Orchestrator:
         app_state_path = bundle_dir / "app_state.json"
         support_readme_path = bundle_dir / "support_bundle.txt"
         manifest_path = bundle_dir / "support_bundle_manifest.json"
+        diagnostics_copy_path = bundle_dir / "packaged_startup_diagnostics.json"
 
         launch_report_path.write_text(json.dumps(launch.to_dict(), indent=2), encoding="utf-8")
         readiness_report_path.write_text(
@@ -3100,6 +5617,12 @@ class Orchestrator:
                         else "Blocking reason: none"
                     ),
                     "",
+                    "Onboarding:",
+                    *(f"- {item}" for item in self._packaged_onboarding_lines(launch_report=launch)),
+                    "",
+                    "Setup Steps:",
+                    *(f"{index}. {item}" for index, item in enumerate(self._packaged_setup_steps(), start=1)),
+                    "",
                     "Guidance:",
                     *(f"- {item}" for item in launch.guidance),
                 )
@@ -3108,9 +5631,46 @@ class Orchestrator:
             encoding="utf-8",
         )
 
+        diagnostics_output = ""
+        if diagnostics_path is not None and diagnostics_path.exists():
+            if diagnostics_path.resolve() != diagnostics_copy_path.resolve():
+                shutil.copy2(diagnostics_path, diagnostics_copy_path)
+            diagnostics_output = str(diagnostics_copy_path)
+        elif diagnostics_copy_path.exists():
+            diagnostics_output = str(diagnostics_copy_path)
+
+        if (
+            CloudOffloadMode(str(profile.cloud.get("mode", CloudOffloadMode.AUXILIARY_ONLY.value)).strip())
+            != CloudOffloadMode.DISABLED
+            and self._cloud_capability_modes(profile)[CloudOffloadCapability.EXPORT] == CloudOffloadMode.AUXILIARY_ONLY
+        ):
+            await self.dispatch_auxiliary_cloud_job(
+                capability=CloudOffloadCapability.EXPORT,
+                payload={
+                    "bundle_dir": str(bundle_dir),
+                    "manifest_path": str(manifest_path),
+                    "launch_ready": launch.launch_ready,
+                    "used_stub_fallback": launch.used_stub_fallback,
+                    "copied_log_names": (
+                        self.config.storage.events_log_name,
+                        self.config.storage.cloud_offload_log_name,
+                        self.config.storage.trace_log_name,
+                        self.config.storage.web_log_name,
+                        self.config.storage.status_log_name,
+                    ),
+                },
+                active_profile=profile,
+                job_id=f"support_bundle:{bundle_dir.name}",
+                metadata={
+                    "bundle_dir": str(bundle_dir),
+                    "manifest_path": str(manifest_path),
+                },
+            )
+
         copied_artifact_paths: list[str] = []
         for artifact_name in (
             self.config.storage.events_log_name,
+            self.config.storage.cloud_offload_log_name,
             self.config.storage.trace_log_name,
             self.config.storage.web_log_name,
             self.config.storage.status_log_name,
@@ -3128,9 +5688,13 @@ class Orchestrator:
             manifest_path=str(manifest_path),
             launch_report_path=str(launch_report_path),
             readiness_report_path=str(readiness_report_path),
+            preflight_report_path=str(preflight_artifacts["report_path"]),
+            onboarding_guide_path=str(preflight_artifacts["onboarding_path"]),
+            setup_guide_path=str(preflight_artifacts["setup_path"]),
             user_settings_path=str(user_settings_path),
             app_state_path=str(app_state_path),
             support_readme_path=str(support_readme_path),
+            diagnostics_path=diagnostics_output,
             copied_artifact_paths=tuple(copied_artifact_paths),
         )
         manifest_path.write_text(json.dumps(bundle.to_dict(), indent=2), encoding="utf-8")
@@ -3150,7 +5714,7 @@ class Orchestrator:
         state: _ReadinessState,
     ) -> DashboardReadinessReport:
         real_mode_ready = (
-            not self.config.preflight.flags.stub_mode
+            not state.requested_stub_mode
             and state.snapshot.started
             and state.snapshot.generation_backend not in {"stub_generation"}
             and state.snapshot.embedding_backend not in {"stub_embedding"}
@@ -3161,15 +5725,15 @@ class Orchestrator:
             DashboardReadinessCheck(
                 check_id="stub_mode",
                 title="Stub Mode",
-                status="ready" if self.config.preflight.flags.stub_mode else "disabled",
+                status="ready" if state.requested_stub_mode else "disabled",
                 detail=(
                     "Stub mode is enabled and the local lightweight pipeline can run without heavy model dependencies."
-                    if self.config.preflight.flags.stub_mode
+                    if state.requested_stub_mode
                     else "Stub mode is disabled; real backends are expected."
                 ),
                 recovery_actions=(
                     ("Enable stub mode for first-run local validation.",)
-                    if not self.config.preflight.flags.stub_mode
+                    if not state.requested_stub_mode
                     else ()
                 ),
             ),
@@ -3196,7 +5760,7 @@ class Orchestrator:
                     ("Start the local Ollama service before enabling real-mode Ollama backends.",)
                     if (
                         state.any_uses_ollama
-                        and not self.config.preflight.flags.stub_mode
+                        and not state.requested_stub_mode
                         and not state.ollama_service_ready
                     )
                     else ()
@@ -3260,47 +5824,25 @@ class Orchestrator:
             ),
             self._build_specialist_role_readiness_check(state.profile),
         )
+        capability_registry = self.capability_policy.build_registry_view(profile=state.profile, snapshot=state.snapshot)
         capabilities = (
-            DashboardCapabilityAvailability(
-                capability_name="desktop_control",
-                status="blocked_by_policy" if state.profile.desktop.get("enabled") else "visible_not_enabled",
-                reason="phase_20_21_not_implemented",
-                detail=(
-                    "Desktop-control settings are configuration placeholders only; no local task-session executor "
-                    "or approval-gated control runtime is active yet."
-                ),
-                recovery_actions=("Keep the toggle off until the typed desktop capability phases land.",),
+            self._build_desktop_control_summary_capability(capability_registry, state.profile),
+            *(
+                self._build_dashboard_capability_from_registration(item)
+                for item in capability_registry.registrations
             ),
-            DashboardCapabilityAvailability(
-                capability_name="observation_tiers",
-                status=(
-                    "blocked_by_policy"
-                    if str(state.profile.observation.get("tier", "screenshot_on_demand")) != "screenshot_on_demand"
-                    else "visible_not_enabled"
-                ),
-                reason="phase_22_not_implemented",
-                detail=(
-                    "Continuous capture, OCR-on-step, and vision-on-step remain visible for forward-compatible "
-                    "settings only; the runtime still stays on screenshot-on-demand."
-                ),
-                recovery_actions=("Keep observation tier at screenshot_on_demand until the observation phases land.",),
-            ),
-            DashboardCapabilityAvailability(
-                capability_name="cloud_offload",
-                status="blocked_by_policy" if state.profile.cloud.get("mode") != "disabled" else "visible_not_enabled",
-                reason="phase_23_not_implemented",
-                detail=(
-                    "Auxiliary cloud-offload settings are visible for future compatibility, but no provider adapter "
-                    "or fallback routing path is active yet."
-                ),
-                recovery_actions=("Leave cloud mode disabled until auxiliary cloud adapters exist.",),
+            self._build_observation_tier_summary_capability(state.profile, snapshot=state.snapshot),
+            self._build_cloud_offload_summary_capability(state.profile),
+            *(
+                self._build_cloud_offload_capability(state.profile, capability)
+                for capability in CloudOffloadCapability
             ),
             DashboardCapabilityAvailability(
                 capability_name="real_mode",
                 status="ready" if real_mode_ready else "degraded",
                 reason=(
                     "stub_mode_enabled"
-                    if self.config.preflight.flags.stub_mode
+                    if state.requested_stub_mode
                     else (
                         "fallback_active"
                         if state.snapshot.fallback_active
@@ -3314,7 +5856,7 @@ class Orchestrator:
                 detail="Real mode requires local dependencies plus non-stub generation and embedding backends to be available.",
                 recovery_actions=(
                     ("Disable stub mode only after real dependencies and local services are installed.",)
-                    if self.config.preflight.flags.stub_mode
+                    if state.requested_stub_mode
                     else ("Install missing real-mode dependencies or local services.",)
                 ),
             ),
@@ -3322,8 +5864,29 @@ class Orchestrator:
         guidance = (
             "The local app shell is complete enough for stub-mode runs, profile management, history inspection, and knowledge management.",
             "Use readiness warnings to decide whether to stay in lightweight stub mode or finish real-backend setup.",
+            (
+                "Pinned default model bundle: "
+                f"{self.config.preflight.backends.generation_backend}:{self.config.preflight.backends.generation_model} "
+                "for generation, "
+                f"{self.config.preflight.backends.generation_fallback_backend}:{self.config.preflight.backends.generation_fallback_model} "
+                "for generation fallback, "
+                f"{self.config.preflight.backends.embedding_backend}:{self.config.preflight.backends.embedding_model} "
+                "for embeddings, and "
+                f"{self.config.preflight.backends.embedding_fallback_backend}:{self.config.preflight.backends.embedding_fallback_model} "
+                "for embedding fallback."
+            ),
+            (
+                f"Hardware target remains {self.config.preflight.hardware.max_vram_gb:.0f}GB VRAM / "
+                f"{self.config.preflight.hardware.max_ram_gb:.0f}GB RAM, and user data stays local under "
+                f"'{self.config.storage.sqlite_path}' plus '{self.config.storage.logs_dir}'."
+            ),
+            (
+                "Stub mode is the first-run packaged path; real mode stays opt-in, while cloud helpers remain "
+                "auxiliary-only and can offload approved content only after explicit enablement."
+            ),
+            f"Step-by-step local backend and model setup lives in '{_LOCAL_MODEL_SETUP_GUIDE}'.",
             "Optional specialist roles can be enabled individually in Settings without replacing the base generation and embedding runtime.",
-            "Desktop control, advanced observation tiers, and cloud offload remain visible but capability-gated future phases.",
+            "The live control tier now covers bounded file, shell, browser, app/window, screenshot, OCR, approval-gated desktop input, and auxiliary cloud helpers that always preserve local fallback.",
         )
         return DashboardReadinessReport(
             stub_mode_ready=True,
@@ -3331,6 +5894,439 @@ class Orchestrator:
             checks=checks,
             capabilities=capabilities,
             guidance=guidance,
+        )
+
+    @staticmethod
+    def _dashboard_capability_status(registration: CapabilityRegistration) -> str:
+        if registration.enabled and registration.status == CapabilityAvailabilityStatus.AVAILABLE:
+            return "ready"
+        if registration.status == CapabilityAvailabilityStatus.REQUIRES_APPROVAL:
+            return "requires_approval"
+        if registration.status == CapabilityAvailabilityStatus.DEGRADED:
+            return "degraded"
+        if registration.status == CapabilityAvailabilityStatus.DENIED_BY_POLICY:
+            return "blocked_by_policy"
+        if registration.enabled:
+            return "degraded"
+        return "visible_not_enabled"
+
+    def _build_dashboard_capability_from_registration(
+        self,
+        registration: CapabilityRegistration,
+    ) -> DashboardCapabilityAvailability:
+        return DashboardCapabilityAvailability(
+            capability_name=registration.capability_type.value,
+            status=self._dashboard_capability_status(registration),
+            reason=registration.reason,
+            detail=registration.detail,
+            recovery_actions=(
+                ("Enable the capability in Settings before requesting it.",)
+                if registration.reason == "capability_not_enabled"
+                else (
+                    ("Adjust allowlists or disable risky request flags.",)
+                    if "allowlist" in registration.reason or "blocked" in registration.reason
+                    else (
+                        ("Wait for resource pressure to clear before retrying.",)
+                        if registration.reason == "resource_pressure"
+                        else ()
+                    )
+                )
+            ),
+        )
+
+    def _build_desktop_control_summary_capability(
+        self,
+        registry_view: CapabilityRegistryView,
+        profile: UserSettingsProfile,
+    ) -> DashboardCapabilityAvailability:
+        desktop_enabled = bool(profile.desktop.get("enabled"))
+        any_enabled = any(item.enabled for item in registry_view.registrations)
+        live_ready = tuple(
+            item.capability_type.value
+            for item in registry_view.registrations
+            if item.executor_kind == "live" and item.enabled
+        )
+        ready_status = "visible_not_enabled"
+        ready_reason = "desktop_mode_disabled"
+        if desktop_enabled and not any_enabled:
+            ready_reason = "desktop_capabilities_not_enabled"
+        elif desktop_enabled and live_ready:
+            ready_status = "ready"
+            ready_reason = "live_control_tier_available"
+        return DashboardCapabilityAvailability(
+            capability_name="desktop_control",
+            status=ready_status,
+            reason=ready_reason,
+            detail=(
+                "The typed capability, policy, and session boundaries are in place. Bounded live execution now exists for "
+                f"{', '.join(live_ready) if live_ready else 'the currently enabled local task families'}, while "
+                "heavier observation tiers remain separate and desktop input stays approval-gated."
+            ),
+            recovery_actions=(
+                ("Enable desktop mode and specific capabilities only when you are validating a bounded local task.",)
+                if not desktop_enabled or not any_enabled
+                else (
+                    "Keep tasks inside allowlists and use heavier observation tiers only when screenshot-on-demand or OCR are insufficient.",
+                )
+            ),
+        )
+
+    def _build_observation_tier_summary_capability(
+        self,
+        profile: UserSettingsProfile,
+        snapshot: ModelHealthSnapshot | None = None,
+    ) -> DashboardCapabilityAvailability:
+        snapshot = snapshot or self.model_manager.health_snapshot()
+        observation_tier = self._requested_observation_tier(profile)
+        effective_tier = self._effective_observation_tier(observation_tier, snapshot)
+        enabled_roles = {
+            str(item).strip()
+            for item in profile.models.get("enabled_roles", ())
+            if str(item).strip()
+        }
+        vision_role_ready = any(
+            registration.enabled
+            and registration.backend != "unconfigured"
+            and registration.model_identifier != "placeholder"
+            and not bool(registration.metadata.get("placeholder"))
+            and not registration.missing_dependencies
+            for registration in self.model_manager.list_registered_models(role=ModelRole.VISION)
+        ) and ModelRole.VISION.value in enabled_roles
+        if effective_tier != observation_tier:
+            pressure_detail = (
+                ", ".join(snapshot.governor_pressure_reasons)
+                if snapshot.governor_pressure_reasons
+                else "hardware governor pressure"
+            )
+            return DashboardCapabilityAvailability(
+                capability_name="observation_tiers",
+                status="degraded",
+                reason=f"hardware_governor_{observation_tier}_degraded",
+                detail=(
+                    f"Requested {observation_tier} is temporarily degraded to {effective_tier} because "
+                    f"{pressure_detail}."
+                ),
+                recovery_actions=("Wait for pressure to clear before retrying heavier observation tiers.",),
+            )
+        if observation_tier == "screenshot_on_demand":
+            return DashboardCapabilityAvailability(
+                capability_name="observation_tiers",
+                status="ready",
+                reason="screenshot_on_demand_live",
+                detail=(
+                    "Screenshot-on-demand is live as the lightest observation tier. OCR-on-step and continuous capture "
+                    "are separate opt-in live tiers, while vision-on-step currently degrades through CPU OCR until a "
+                    "routed vision backend lands."
+                ),
+                recovery_actions=("Keep heavier observation tiers disabled unless the current task actually needs them.",),
+            )
+        if observation_tier == "ocr_on_step":
+            return DashboardCapabilityAvailability(
+                capability_name="observation_tiers",
+                status="ready",
+                reason="ocr_on_step_live",
+                detail=(
+                    "Screenshot-on-demand and per-step CPU-first OCR are active. Vision-on-step and continuous capture "
+                    "remain separate, gated observation tiers."
+                ),
+                recovery_actions=("Use OCR-on-step for bounded text extraction from screenshots or selected regions.",),
+            )
+        if observation_tier == "vision_on_step":
+            if vision_role_ready:
+                return DashboardCapabilityAvailability(
+                    capability_name="observation_tiers",
+                    status="ready",
+                    reason="vision_on_step_routed",
+                    detail=(
+                        "Vision-on-step is active with an optional routed vision role. CPU OCR still runs first as a "
+                        "bounded seed, and the heavier visual role swaps in only on demand."
+                    ),
+                    recovery_actions=(
+                        "Keep the vision role enabled only for steps that genuinely need UI interpretation beyond CPU OCR.",
+                    ),
+                )
+            return DashboardCapabilityAvailability(
+                capability_name="observation_tiers",
+                status="degraded",
+                reason="vision_on_step_cpu_fallback",
+                detail=(
+                    "Vision-on-step is now an explicit opt-in per-step mode, but until the routed vision executor lands "
+                    "it captures bounded screenshots and falls back to CPU OCR with visible route and degrade reasons."
+                ),
+                recovery_actions=(
+                    "Enable a concrete vision role when you need routed visual inspection; use ocr_on_step for lighter text-first tasks.",
+                ),
+            )
+        if observation_tier == "continuous_capture":
+            return DashboardCapabilityAvailability(
+                capability_name="observation_tiers",
+                status="ready",
+                reason="continuous_capture_live",
+                detail=(
+                    "Continuous capture is active behind low-FPS, downscaled, diff-based, and region-aware caps. "
+                    "OCR-on-step and vision-on-step remain separate observation tiers."
+                ),
+                recovery_actions=("Keep continuous capture task-scoped and rely on the strict capture caps for bounded sampling.",),
+            )
+        return DashboardCapabilityAvailability(
+            capability_name="observation_tiers",
+            status="blocked_by_policy",
+            reason="phase_22_partial_live_execution",
+            detail=(
+                "The active observation tier still depends on later Phase 22 work. Screenshot-on-demand, CPU-first OCR, "
+                "and bounded continuous capture are available today, but vision-on-step is not."
+            ),
+            recovery_actions=("Keep observation tier at screenshot_on_demand, ocr_on_step, or continuous_capture until later observation phases land.",),
+        )
+
+    def _cloud_capability_modes(self, profile: UserSettingsProfile) -> dict[CloudOffloadCapability, CloudOffloadMode]:
+        raw_modes = dict(profile.cloud.get("capability_modes", {}))
+        resolved: dict[CloudOffloadCapability, CloudOffloadMode] = {}
+        for capability in CloudOffloadCapability:
+            raw_mode = str(raw_modes.get(capability.value, CloudOffloadMode.DISABLED.value)).strip()
+            try:
+                resolved[capability] = CloudOffloadMode(raw_mode)
+            except ValueError:
+                resolved[capability] = CloudOffloadMode.DISABLED
+        return resolved
+
+    def _cloud_provider_name(self, profile: UserSettingsProfile) -> str:
+        return str(profile.cloud.get("provider", "stub_cloud")).strip() or "stub_cloud"
+
+    def _cloud_provider_family(self, profile: UserSettingsProfile) -> str:
+        configured_family = str(profile.cloud.get("provider_family", "provider_agnostic")).strip() or "provider_agnostic"
+        return self.cloud_offload.provider_family(self._cloud_provider_name(profile), fallback=configured_family)
+
+    def _cloud_fallback_behavior(self, profile: UserSettingsProfile) -> CloudFallbackBehavior:
+        return CloudFallbackBehavior(
+            str(profile.cloud.get("fallback_behavior", CloudFallbackBehavior.RETRY_THEN_LOCAL.value)).strip()
+        )
+
+    def _cloud_job_contract_for_capability(
+        self,
+        *,
+        profile: UserSettingsProfile,
+        capability: CloudOffloadCapability,
+    ) -> CloudJobContract | None:
+        cloud_mode = CloudOffloadMode(str(profile.cloud.get("mode", CloudOffloadMode.AUXILIARY_ONLY.value)).strip())
+        if cloud_mode == CloudOffloadMode.DISABLED:
+            return None
+        capability_mode = self._cloud_capability_modes(profile)[capability]
+        if capability_mode == CloudOffloadMode.DISABLED:
+            return None
+        _title, payload_class, privacy_class, requires_content_approval = _CLOUD_OFFLOAD_CAPABILITY_DETAILS[capability]
+        allow_cloud_content = bool(profile.privacy.get("allow_cloud_content", False))
+        if requires_content_approval and not allow_cloud_content:
+            return None
+        return CloudJobContract(
+            job_id=f"readiness:{capability.value}",
+            capability=capability,
+            payload_class=payload_class,
+            privacy_class=privacy_class,
+            max_payload_bytes=int(profile.cloud.get("max_payload_bytes", 1024 * 256) or 1024 * 256),
+            max_retries=int(profile.cloud.get("max_retries", 1) or 0),
+            fallback_behavior=self._cloud_fallback_behavior(profile),
+            dispatch_mode=capability_mode,
+            provider_family=self._cloud_provider_family(profile),
+            content_approved=privacy_class == CloudJobPrivacyClass.APPROVED_CONTENT and allow_cloud_content,
+        )
+
+    def _build_cloud_offload_record(
+        self,
+        *,
+        profile: UserSettingsProfile,
+        contract: CloudJobContract,
+        outcome: CloudOffloadOutcome,
+        summary: str,
+        detail: str,
+        fallback_reason: str = "",
+        local_fallback_used: bool = False,
+        response_ref: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> CloudOffloadRecord:
+        return CloudOffloadRecord(
+            dispatch_id=f"cloud_{stable_hash(f'{contract.job_id}:{outcome.value}:{utc_now().isoformat()}')[:16]}",
+            job_id=contract.job_id,
+            capability=contract.capability,
+            provider_name=self._cloud_provider_name(profile),
+            provider_family=self._cloud_provider_family(profile),
+            payload_class=contract.payload_class,
+            privacy_class=contract.privacy_class,
+            outcome=outcome,
+            summary=summary,
+            detail=detail,
+            fallback_behavior=contract.fallback_behavior,
+            local_fallback_used=local_fallback_used,
+            fallback_reason=fallback_reason,
+            response_ref=response_ref,
+            metadata=dict(metadata or {}),
+        )
+
+    def _build_cloud_offload_summary_capability(
+        self,
+        profile: UserSettingsProfile,
+    ) -> DashboardCapabilityAvailability:
+        cloud_mode = CloudOffloadMode(str(profile.cloud.get("mode", CloudOffloadMode.AUXILIARY_ONLY.value)).strip())
+        capability_modes = self._cloud_capability_modes(profile)
+        enabled_capabilities = [
+            capability
+            for capability, mode in capability_modes.items()
+            if mode == CloudOffloadMode.AUXILIARY_ONLY
+        ]
+        provider_name = self._cloud_provider_name(profile)
+        provider_family = self._cloud_provider_family(profile)
+        fallback_behavior = str(
+            profile.cloud.get("fallback_behavior", CloudFallbackBehavior.RETRY_THEN_LOCAL.value)
+        ).strip()
+        if cloud_mode == CloudOffloadMode.DISABLED:
+            return DashboardCapabilityAvailability(
+                capability_name="cloud_offload",
+                status="visible_not_enabled",
+                reason="cloud_mode_disabled",
+                detail=(
+                    "Cloud offload is globally disabled. Per-capability cloud selections remain stored, but the "
+                    "runtime stays fully local-first until you explicitly re-enable auxiliary mode."
+                ),
+                recovery_actions=(
+                    "Switch cloud mode to auxiliary_only only for specific helper categories you actually want to test.",
+                ),
+            )
+        if not enabled_capabilities:
+            return DashboardCapabilityAvailability(
+                capability_name="cloud_offload",
+                status="visible_not_enabled",
+                reason="cloud_capabilities_not_enabled",
+                detail=(
+                    "Cloud offload remains auxiliary-only and provider-agnostic, but no individual capability is "
+                    "enabled yet. The baseline local pipeline remains the only active path."
+                ),
+                recovery_actions=("Enable only the cloud helper categories you explicitly want to evaluate.",),
+            )
+        enabled_labels = [
+            _CLOUD_OFFLOAD_CAPABILITY_DETAILS[capability][0]
+            for capability in enabled_capabilities
+        ]
+        eligible_capabilities = [
+            capability
+            for capability in enabled_capabilities
+            if self._cloud_job_contract_for_capability(profile=profile, capability=capability) is not None
+        ]
+        if not eligible_capabilities:
+            return DashboardCapabilityAvailability(
+                capability_name="cloud_offload",
+                status="blocked_by_policy",
+                reason="cloud_content_not_approved",
+                detail=(
+                    "Cloud helper categories are selected, but each enabled category still requires approved content "
+                    "and Allow cloud content is off. Local fallback remains the only active path."
+                ),
+                recovery_actions=(
+                    "Leave content approval off unless you explicitly want approved task data to become eligible for auxiliary offload.",
+                ),
+            )
+        if not any(
+            self.cloud_offload.provider_available(provider_name, capability=capability)
+            for capability in eligible_capabilities
+        ):
+            return DashboardCapabilityAvailability(
+                capability_name="cloud_offload",
+                status="degraded",
+                reason="cloud_provider_unavailable",
+                detail=(
+                    "Auxiliary cloud helpers are enabled for "
+                    f"{', '.join(enabled_labels)} with provider={provider_name}, provider_family={provider_family}, "
+                    f"and fallback={fallback_behavior}, but the configured provider is unavailable so local execution "
+                    "remains authoritative."
+                ),
+                recovery_actions=(
+                    "Switch to an available provider or disable helper categories you are not actively evaluating.",
+                ),
+            )
+        return DashboardCapabilityAvailability(
+            capability_name="cloud_offload",
+            status="ready",
+            reason="cloud_auxiliary_available",
+            detail=(
+                "Auxiliary cloud helpers are available for "
+                f"{', '.join(enabled_labels)} with provider={provider_name}, provider_family={provider_family}, "
+                f"and fallback={fallback_behavior}. Local execution remains authoritative if the helper fails."
+            ),
+            recovery_actions=(
+                "Keep cloud helpers auxiliary-only and enable only the categories you explicitly want to test.",
+            ),
+        )
+
+    def _build_cloud_offload_capability(
+        self,
+        profile: UserSettingsProfile,
+        capability: CloudOffloadCapability,
+    ) -> DashboardCapabilityAvailability:
+        title, payload_class, privacy_class, requires_content_approval = _CLOUD_OFFLOAD_CAPABILITY_DETAILS[capability]
+        capability_name = f"cloud_{capability.value}"
+        cloud_mode = CloudOffloadMode(str(profile.cloud.get("mode", CloudOffloadMode.AUXILIARY_ONLY.value)).strip())
+        if cloud_mode == CloudOffloadMode.DISABLED:
+            return DashboardCapabilityAvailability(
+                capability_name=capability_name,
+                status="visible_not_enabled",
+                reason="cloud_mode_disabled",
+                detail=f"{title} is forced local-only while global cloud mode is disabled.",
+                recovery_actions=("Keep the global cloud mode disabled unless you need an auxiliary helper category.",),
+            )
+        capability_mode = self._cloud_capability_modes(profile)[capability]
+        if capability_mode == CloudOffloadMode.DISABLED:
+            return DashboardCapabilityAvailability(
+                capability_name=capability_name,
+                status="visible_not_enabled",
+                reason="cloud_capability_disabled",
+                detail=f"{title} is disabled independently, so enabling another cloud helper will not enable this one.",
+                recovery_actions=(f"Enable {title} only if you want this specific helper category to become eligible later.",),
+            )
+        if requires_content_approval and not bool(profile.privacy.get("allow_cloud_content", False)):
+            return DashboardCapabilityAvailability(
+                capability_name=capability_name,
+                status="blocked_by_policy",
+                reason="cloud_content_not_approved",
+                detail=(
+                    f"{title} is configured as auxiliary_only, but its payload={payload_class.value} and "
+                    f"privacy={privacy_class.value} require explicit content approval before any future dispatch."
+                ),
+                recovery_actions=("Turn on Allow cloud content only if you explicitly accept approved-content offload.",),
+            )
+        contract = self._cloud_job_contract_for_capability(profile=profile, capability=capability)
+        if contract is None:
+            return DashboardCapabilityAvailability(
+                capability_name=capability_name,
+                status="blocked_by_policy",
+                reason="cloud_contract_unavailable",
+                detail=f"{title} has no valid cloud contract yet, so it stays local-only.",
+                recovery_actions=("Review cloud settings and keep the capability disabled until you need it.",),
+            )
+        provider_name = self._cloud_provider_name(profile)
+        provider_family = self._cloud_provider_family(profile)
+        if not self.cloud_offload.provider_available(provider_name, capability=capability):
+            return DashboardCapabilityAvailability(
+                capability_name=capability_name,
+                status="degraded",
+                reason="cloud_provider_unavailable",
+                detail=(
+                    f"{title} is configured with payload={contract.payload_class.value}, "
+                    f"privacy={contract.privacy_class.value}, provider={provider_name}, "
+                    f"provider_family={provider_family}, and fallback={contract.fallback_behavior.value}, "
+                    "but the configured provider is unavailable so local fallback remains authoritative."
+                ),
+                recovery_actions=("Switch to an available provider or disable this helper category.",),
+            )
+        return DashboardCapabilityAvailability(
+            capability_name=capability_name,
+            status="ready",
+            reason="cloud_auxiliary_ready",
+            detail=(
+                f"{title} is staged with payload={contract.payload_class.value}, privacy={contract.privacy_class.value}, "
+                f"bytes<={contract.max_payload_bytes}, retries={contract.max_retries}, "
+                f"fallback={contract.fallback_behavior.value}, provider={provider_name}, "
+                f"provider_family={provider_family}. Local fallback remains authoritative if the helper fails."
+            ),
+            recovery_actions=("Keep this helper auxiliary-only and disable it when you do not need it.",),
         )
 
     def _collect_readiness_state(
@@ -3341,11 +6337,12 @@ class Orchestrator:
         profile = active_profile or (
             self.dashboard.app_state_snapshot().user_settings if self._started else self._default_user_settings_profile()
         )
+        runtime_config = self._config_for_user_settings_profile(profile)
         snapshot = self.model_manager.health_snapshot()
         chromadb_available = self._dependency_available("chromadb")
         sentence_transformers_available = self._dependency_available("sentence_transformers")
         llama_cpp_available = self._dependency_available("llama_cpp")
-        backends = self.config.preflight.backends
+        backends = runtime_config.preflight.backends
         primary_generation_backend = backends.generation_backend
         primary_embedding_backend = backends.embedding_backend
         primary_uses_ollama = primary_generation_backend == "ollama" or primary_embedding_backend == "ollama_embeddings"
@@ -3354,7 +6351,7 @@ class Orchestrator:
             or backends.generation_fallback_backend == "ollama"
             or backends.embedding_fallback_backend == "ollama_embeddings"
         )
-        if self.config.preflight.flags.stub_mode:
+        if runtime_config.preflight.flags.stub_mode:
             ollama_service_ready = False
             ollama_status = "disabled" if any_uses_ollama else "not_required"
             ollama_detail = (
@@ -3363,7 +6360,7 @@ class Orchestrator:
                 else "No configured backend requires Ollama service access."
             )
         elif any_uses_ollama:
-            ollama_service_ready, ollama_detail = self._probe_ollama_service()
+            ollama_service_ready, ollama_detail = self._probe_ollama_service(config=runtime_config)
             if ollama_service_ready:
                 ollama_status = "ready"
             else:
@@ -3374,7 +6371,7 @@ class Orchestrator:
             ollama_detail = "No configured backend requires Ollama service access."
 
         llama_cpp_model_ready, llama_cpp_model_detail, llama_cpp_model_required, llama_cpp_model_blocking = (
-            self._check_llama_cpp_model_files()
+            self._check_llama_cpp_model_files(config=runtime_config)
         )
         if not llama_cpp_model_required:
             llama_cpp_model_status = "not_required"
@@ -3393,6 +6390,7 @@ class Orchestrator:
         )
         return _ReadinessState(
             profile=profile,
+            requested_stub_mode=runtime_config.preflight.flags.stub_mode,
             snapshot=snapshot,
             sentence_transformers_available=sentence_transformers_available,
             chromadb_available=chromadb_available,
@@ -3533,18 +6531,20 @@ class Orchestrator:
         self,
         launch_report: PackagedLaunchReport,
     ) -> AppConfig:
-        if launch_report.effective_mode == "real" or self.config.preflight.flags.stub_mode:
+        desired_stub_mode = launch_report.effective_mode != "real"
+        if self.config.preflight.flags.stub_mode == desired_stub_mode:
             return self.config
-        stub_flags = replace(self.config.preflight.flags, stub_mode=True)
-        return replace(self.config, preflight=replace(self.config.preflight, flags=stub_flags))
+        next_flags = replace(self.config.preflight.flags, stub_mode=desired_stub_mode)
+        return replace(self.config, preflight=replace(self.config.preflight, flags=next_flags))
 
     def _dependency_available(self, module_name: str) -> bool:
         return importlib.util.find_spec(module_name) is not None
 
-    def _probe_ollama_service(self) -> tuple[bool, str]:
-        base_url = self.config.backend_runtime.ollama_base_url.rstrip("/")
+    def _probe_ollama_service(self, *, config: AppConfig | None = None) -> tuple[bool, str]:
+        runtime_config = config or self.config
+        base_url = runtime_config.backend_runtime.ollama_base_url.rstrip("/")
         request_url = f"{base_url}/api/tags"
-        timeout_s = min(2.0, max(0.25, float(self.config.backend_runtime.request_timeout_s)))
+        timeout_s = min(2.0, max(0.25, float(runtime_config.backend_runtime.request_timeout_s)))
         request = urllib_request.Request(request_url, headers={"User-Agent": "QuesterAI/0.1"})
         try:
             with urllib_request.urlopen(request, timeout=timeout_s) as response:
@@ -3555,16 +6555,24 @@ class Orchestrator:
         except (urllib_error.URLError, TimeoutError, ValueError) as exc:
             return False, f"Ollama service probe failed at {request_url}: {exc}"
 
-    def _check_llama_cpp_model_files(self) -> tuple[bool, str, bool, bool]:
-        backends = self.config.preflight.backends
+    def _check_llama_cpp_model_files(
+        self,
+        *,
+        config: AppConfig | None = None,
+    ) -> tuple[bool, str, bool, bool]:
+        runtime_config = config or self.config
+        backends = runtime_config.preflight.backends
         configured_models: list[tuple[str, Path]] = []
         if backends.generation_backend == "llama_cpp":
             configured_models.append(
-                ("primary_generation", self._resolve_llama_cpp_model_path(backends.generation_model))
+                ("primary_generation", self._resolve_llama_cpp_model_path(backends.generation_model, config=runtime_config))
             )
         if backends.generation_fallback_backend == "llama_cpp":
             configured_models.append(
-                ("fallback_generation", self._resolve_llama_cpp_model_path(backends.generation_fallback_model))
+                (
+                    "fallback_generation",
+                    self._resolve_llama_cpp_model_path(backends.generation_fallback_model, config=runtime_config),
+                )
             )
         if not configured_models:
             return True, "No configured backend requires a llama.cpp model file.", False, False
@@ -3579,11 +6587,12 @@ class Orchestrator:
         blocking = any(role == "primary_generation" for role, _ in missing)
         return False, detail, True, blocking
 
-    def _resolve_llama_cpp_model_path(self, model_name: str) -> Path:
+    def _resolve_llama_cpp_model_path(self, model_name: str, *, config: AppConfig | None = None) -> Path:
+        runtime_config = config or self.config
         model_path = Path(model_name)
         if model_path.is_absolute():
             return model_path
-        return self.config.backend_runtime.models_dir / model_path
+        return runtime_config.backend_runtime.models_dir / model_path
 
     def _submit_dashboard_coroutine(self, coroutine: Any) -> None:
         if self._loop is None:
@@ -3829,6 +6838,8 @@ class Orchestrator:
             "embedding_backend": snapshot.embedding_backend,
             "active_generation_jobs": snapshot.active_generation_jobs,
             "active_embedding_jobs": snapshot.active_embedding_jobs,
+            "active_heavy_roles": list(snapshot.active_heavy_roles),
+            "heavy_slot_limit": snapshot.heavy_slot_limit,
             "last_used_at": snapshot.last_used_at,
             "fallback_active": snapshot.fallback_active,
             "fallback_reason": snapshot.fallback_reason or "",
@@ -3836,6 +6847,17 @@ class Orchestrator:
             "total_ram_gb": snapshot.total_ram_gb,
             "generation_backend_vram_gb": snapshot.generation_backend_vram_gb,
             "embedding_backend_vram_gb": snapshot.embedding_backend_vram_gb,
+            "governor_active": snapshot.governor_active,
+            "governor_pressure_reasons": list(snapshot.governor_pressure_reasons),
+            "governor_degraded_features": list(snapshot.governor_degraded_features),
+            "queue_pressure": snapshot.queue_pressure,
+            "backend_health_degraded": snapshot.backend_health_degraded,
+            "allow_continuous_capture": snapshot.allow_continuous_capture,
+            "allow_ocr_on_step": snapshot.allow_ocr_on_step,
+            "allow_vision_on_step": snapshot.allow_vision_on_step,
+            "allow_optional_heavy_residency": snapshot.allow_optional_heavy_residency,
+            "allow_background_work": snapshot.allow_background_work,
+            "governor_summary": snapshot.governor_summary,
             "telemetry_enabled": snapshot.telemetry_enabled,
             "last_error": snapshot.last_error or "",
         }
@@ -3901,7 +6923,16 @@ class Orchestrator:
             },
             cloud={
                 "enabled": False,
-                "mode": "auxiliary_only",
+                "mode": CloudOffloadMode.AUXILIARY_ONLY.value,
+                "provider": "stub_cloud",
+                "provider_family": "provider_agnostic",
+                "max_payload_bytes": 1024 * 256,
+                "max_retries": 1,
+                "fallback_behavior": CloudFallbackBehavior.RETRY_THEN_LOCAL.value,
+                "capability_modes": {
+                    capability.value: CloudOffloadMode.DISABLED.value
+                    for capability in CloudOffloadCapability
+                },
             },
             privacy={
                 "log_runtime_events": True,
@@ -4673,36 +7704,149 @@ async def run_once(
         return await app.run_task(question, thinking_minutes)
 
 
+async def _run_dashboard_session(
+    app: Orchestrator,
+    *,
+    support_bundle_dir: Path | None = None,
+    launch_report: PackagedLaunchReport | None = None,
+    diagnostics_path: Path | None = None,
+    startup_notice: str = "",
+    startup_notice_severity: str = "info",
+) -> TaskResult | None:
+    """Start an app session, optionally publish startup context, and always stop cleanly."""
+    await app.start()
+    try:
+        if startup_notice:
+            await app._publish_dashboard_notice(startup_notice, severity=startup_notice_severity)
+        if not app.config.dashboard.enable_ui:
+            result = await app.run_task("What should I build first?", thinking_minutes=1)
+            if support_bundle_dir is not None:
+                await app.export_packaged_support_bundle(
+                    support_bundle_dir,
+                    launch_report=launch_report,
+                    diagnostics_path=diagnostics_path,
+                )
+            return result
+        if support_bundle_dir is not None:
+            await app.export_packaged_support_bundle(
+                support_bundle_dir,
+                launch_report=launch_report,
+                diagnostics_path=diagnostics_path,
+            )
+        while app.dashboard.ui_running:
+            await asyncio.sleep(0.1)
+        return None
+    finally:
+        await app.stop()
+
+
 async def run_dashboard_app(
     config: AppConfig = APP_CONFIG,
     *,
     support_bundle_dir: Path | None = None,
 ) -> TaskResult | None:
-    """Launch the local app shell and keep it alive while the dashboard window is open."""
+    """Launch the developer/source app shell without packaged startup indirection."""
+    app = Orchestrator(config=config)
+    return await _run_dashboard_session(app, support_bundle_dir=support_bundle_dir)
+
+
+async def run_packaged_dashboard_app(
+    config: AppConfig = APP_CONFIG,
+    *,
+    support_bundle_dir: Path | None = None,
+) -> TaskResult | None:
+    """Launch the packaged app shell using the shared readiness/preflight contract."""
+    startup_profile = await _load_startup_settings_profile(config)
     planning_app = Orchestrator(config=config)
-    launch_report = planning_app.build_packaged_launch_report()
-    runtime_config = planning_app._packaged_runtime_config(launch_report)
-    async with Orchestrator(config=runtime_config) as app:
-        if launch_report.used_stub_fallback:
-            await app._publish_dashboard_notice(
-                f"{launch_report.summary} {launch_report.blocking_detail}".strip(),
-                severity="warning",
-            )
-        if not runtime_config.dashboard.enable_ui:
-            result = await app.run_task("What should I build first?", thinking_minutes=1)
-            if support_bundle_dir is not None:
-                await app.export_packaged_support_bundle(support_bundle_dir, launch_report=launch_report)
-            return result
-        if support_bundle_dir is not None:
-            await app.export_packaged_support_bundle(support_bundle_dir, launch_report=launch_report)
-        while app.dashboard.ui_running:
-            await asyncio.sleep(0.1)
-        return None
+    packaged_plan = planning_app.build_packaged_startup_plan(startup_profile=startup_profile)
+    packaged_app = Orchestrator(
+        config=packaged_plan.runtime_config,
+        startup_profile_override=packaged_plan.effective_profile,
+        persist_startup_profile_override=packaged_plan.persist_effective_profile,
+    )
+    try:
+        return await _run_dashboard_session(
+            packaged_app,
+            support_bundle_dir=support_bundle_dir,
+            launch_report=packaged_plan.launch_report,
+            startup_notice=packaged_plan.startup_notice,
+            startup_notice_severity=packaged_plan.startup_notice_severity,
+        )
+    except Exception as exc:
+        diagnostics_path = planning_app._write_packaged_startup_diagnostics(
+            exc,
+            export_dir=support_bundle_dir,
+            launch_report=packaged_plan.launch_report,
+        )
+        if packaged_plan.launch_report.effective_mode != "real":
+            raise
+
+        recovery_profile = replace(
+            packaged_plan.effective_profile,
+            runtime={
+                **packaged_plan.effective_profile.runtime,
+                "stub_mode": True,
+            },
+        )
+        recovery_launch_report = planning_app._build_runtime_recovery_launch_report(
+            launch_report=packaged_plan.launch_report,
+            error=exc,
+            diagnostics_path=diagnostics_path,
+        )
+        recovery_app = Orchestrator(
+            config=planning_app._config_for_user_settings_profile(recovery_profile),
+            startup_profile_override=recovery_profile,
+            persist_startup_profile_override=True,
+        )
+        recovery_notice = (
+            f"{recovery_launch_report.summary} Review '{diagnostics_path}' before re-enabling real mode."
+        )
+        return await _run_dashboard_session(
+            recovery_app,
+            support_bundle_dir=support_bundle_dir,
+            launch_report=recovery_launch_report,
+            diagnostics_path=diagnostics_path,
+            startup_notice=recovery_notice,
+            startup_notice_severity="warning",
+        )
+
+
+async def _load_startup_settings_profile(config: AppConfig) -> UserSettingsProfile | None:
+    """Load the persisted default settings profile before packaged startup planning."""
+    startup_config = replace(
+        config,
+        preflight=replace(
+            config.preflight,
+            backends=replace(
+                config.preflight.backends,
+                vector_store_backend="simple_inmemory",
+                vector_store_fallback_backend="simple_inmemory",
+            ),
+        ),
+    )
+    storage = StorageManager(config=startup_config)
+    await storage.start()
+    try:
+        return await storage.load_user_settings_profile("default")
+    finally:
+        await storage.stop()
 
 
 def main() -> None:
-    """CLI entrypoint for the local app shell or one-shot headless smoke runs."""
+    """CLI entrypoint for the developer/source app shell or one-shot headless smoke runs."""
     result = asyncio.run(run_dashboard_app())
+    if result is not None:
+        print(
+            "Pipeline completed for task",
+            result.task_id,
+            "with validity",
+            result.critique.is_valid,
+        )
+
+
+def packaged_main() -> None:
+    """Packaged-app entrypoint that honors the packaged startup plan and stub fallback contract."""
+    result = asyncio.run(run_packaged_dashboard_app())
     if result is not None:
         print(
             "Pipeline completed for task",

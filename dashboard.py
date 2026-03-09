@@ -5,18 +5,28 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from datetime import timedelta
 from dataclasses import replace
 from typing import Any, Callable
 
 from config import APP_CONFIG, AppConfig
 from data_structures import (
+    ActivityChip,
     AgentStatus,
     AudioSynthesisResult,
     AudioTranscriptionResult,
+    CapabilityRegistryView,
+    CloudOffloadCapability,
+    CloudOffloadMode,
     CodeSpecialistResult,
+    CodingPattern,
+    CodingTaskType,
+    CodingTaskResult,
+    ConversationItem,
     DashboardAppState,
     DashboardCapabilityAvailability,
     DashboardKnowledgeSource,
+    DashboardLocalTaskSessionState,
     ModelRole,
     ModelRoleActionReport,
     ModelRegistryView,
@@ -25,21 +35,31 @@ from data_structures import (
     DashboardTaskInspector,
     DashboardRuntimeHealth,
     DemoPackStatus,
+    OrbEffectState,
+    PracticeSessionResult,
     RuntimeCondition,
     SampleTaskDefinition,
+    ShellNotification,
+    ShellState,
     TextTranslationResult,
+    TimelineEntry,
     UserSettingsProfile,
     coerce_agent_status,
     coerce_audio_synthesis_result,
     coerce_audio_transcription_result,
+    coerce_capability_registry_view,
     coerce_code_specialist_result,
+    coerce_coding_pattern,
+    coerce_coding_task_result,
     coerce_dashboard_capability_availability,
     coerce_dashboard_knowledge_source,
+    coerce_dashboard_local_task_session_state,
     coerce_dashboard_readiness_report,
     coerce_dashboard_task_history_entry,
     coerce_dashboard_task_inspector,
     coerce_model_registry_view,
     coerce_model_role_action_report,
+    coerce_practice_session_result,
     coerce_demo_pack_status,
     coerce_sample_task_definition,
     coerce_text_translation_result,
@@ -56,8 +76,19 @@ except Exception:  # pragma: no cover - environment-specific
     ttk = None
 
 
+_CLOUD_CAPABILITY_CONTROL_LABELS: tuple[tuple[CloudOffloadCapability, str], ...] = (
+    (CloudOffloadCapability.OFFLINE_REPLAY, "Cloud offline replay"),
+    (CloudOffloadCapability.EXPORT, "Cloud export jobs"),
+    (CloudOffloadCapability.BROWSER_HELPER, "Cloud browser helper"),
+    (CloudOffloadCapability.OCR_HELPER, "Cloud OCR helper"),
+    (CloudOffloadCapability.VISION_HELPER, "Cloud vision helper"),
+    (CloudOffloadCapability.EMBEDDING_HELPER, "Cloud embedding helper"),
+    (CloudOffloadCapability.BACKGROUND_MAINTENANCE, "Cloud maintenance helper"),
+)
+
+
 class DashboardService:
-    """Consumes typed events and optionally renders them in a local Tkinter window."""
+    """Consumes typed events and optionally renders them in a local desktop shell."""
 
     TIME_CONTROL_PRESETS: tuple[tuple[str, int], ...] = (
         ("Quick 1m", 1),
@@ -81,10 +112,16 @@ class DashboardService:
         self._started = False
         self._headless = not config.dashboard.enable_ui
         self._ui_thread: threading.Thread | None = None
+        self._pyside_host: Any | None = None
         self._root: tk.Tk | None = None
         self._stop_flag = threading.Event()
         self._dropped_events = 0
         self._app_state = DashboardAppState()
+        self._shell_timeline_entries: list[TimelineEntry] = []
+        self._shell_notifications: list[ShellNotification] = []
+        self._shell_conversation_items: list[ConversationItem] = []
+        self._shell_effect_deadlines: dict[str, Any] = {}
+        self._shell_serial = 0
         self._submit_task_callback: Callable[[str, int], None] | None = None
         self._save_settings_callback: Callable[[UserSettingsProfile], None] | None = None
         self._perform_action_callback: Callable[[str, dict[str, Any]], None] | None = None
@@ -120,10 +157,12 @@ class DashboardService:
         self._desktop_approval_policy_var: tk.StringVar | None = None
         self._observation_tier_var: tk.StringVar | None = None
         self._cloud_mode_var: tk.StringVar | None = None
+        self._cloud_capability_vars: dict[str, tk.BooleanVar] = {}
         self._log_runtime_events_var: tk.BooleanVar | None = None
         self._allow_cloud_content_var: tk.BooleanVar | None = None
         self._log_level_var: tk.StringVar | None = None
         self._settings_path_var: tk.StringVar | None = None
+        self._readiness_export_path_var: tk.StringVar | None = None
         self._history_task_id_var: tk.StringVar | None = None
         self._history_export_path_var: tk.StringVar | None = None
         self._knowledge_source_ref_var: tk.StringVar | None = None
@@ -143,6 +182,9 @@ class DashboardService:
         self._code_source_path_var: tk.StringVar | None = None
         self._code_request_var: tk.StringVar | None = None
         self._code_status_var: tk.StringVar | None = None
+        self._coding_task_type_var: tk.StringVar | None = None
+        self._coding_language_var: tk.StringVar | None = None
+        self._coding_framework_var: tk.StringVar | None = None
         self._model_role_var: tk.StringVar | None = None
         self._model_role_status_var: tk.StringVar | None = None
 
@@ -182,18 +224,20 @@ class DashboardService:
 
     @property
     def ui_running(self) -> bool:
-        """Report whether the Tkinter UI thread is currently live."""
-        return bool(
-            self._started
-            and not self._headless
-            and self._ui_thread is not None
-            and self._ui_thread.is_alive()
-            and not self._stop_flag.is_set()
-        )
+        """Report whether the active local UI shell is currently live."""
+        if not self._started or self._headless or self._stop_flag.is_set():
+            return False
+        if self._requested_app_shell() == "pyside6" and self._pyside_host is not None:
+            return bool(getattr(self._pyside_host, "is_running", False))
+        return bool(self._ui_thread is not None and self._ui_thread.is_alive())
 
     def app_state_snapshot(self) -> DashboardAppState:
         """Return the latest typed app-state projection."""
         return self._app_state
+
+    def shell_state_snapshot(self) -> ShellState:
+        """Return the latest typed shell-state projection for premium UI layers."""
+        return self._build_shell_state(self._app_state)
 
     def attach_controller(
         self,
@@ -246,7 +290,33 @@ class DashboardService:
         if self._started:
             return
         self._started = True
-        if self._headless or tk is None:
+        if self._headless:
+            self.logger.info("Dashboard running in headless mode.")
+            return
+        requested_shell = self._requested_app_shell()
+        if requested_shell == "pyside6":
+            try:
+                from pyside_shell import PySideShellHost, PySideShellUnavailableError
+            except Exception as exc:  # pragma: no cover - import failure path
+                raise RuntimeError(
+                    "PySide6 shell requested, but the desktop shell dependency is unavailable."
+                ) from exc
+            try:
+                self._pyside_host = PySideShellHost(
+                    shell_state_provider=self.shell_state_snapshot,
+                    app_state_provider=self.app_state_snapshot,
+                    submit_task=self.request_task_submission,
+                    request_action=self.request_action,
+                    startup_timeout_s=float(self.config.preflight.flags.startup_timeout_s),
+                )
+                self._pyside_host.start()
+                self.logger.info("Dashboard PySide6 shell started.")
+                return
+            except PySideShellUnavailableError as exc:
+                raise RuntimeError(
+                    "PySide6 shell requested, but PySide6 is not installed. Install the desktop extra first."
+                ) from exc
+        if tk is None:
             self.logger.info("Dashboard running in headless mode.")
             return
         self._ui_thread = threading.Thread(target=self._run_ui, name="dashboard-ui", daemon=True)
@@ -259,6 +329,11 @@ class DashboardService:
             return
         self._started = False
         self._stop_flag.set()
+        if self._pyside_host is not None:
+            try:
+                self._pyside_host.stop(timeout_s=self.config.preflight.flags.shutdown_timeout_s)
+            finally:
+                self._pyside_host = None
         if self._root is not None:
             try:
                 self._root.after(0, self._root.quit)
@@ -347,7 +422,7 @@ class DashboardService:
         )
         self._long_horizon_text = self._make_readonly_text(
             right_column,
-            "Time Control and Long-Horizon Progress",
+            "Time Control and Sessions",
             height=10,
         )
         self._conditions_text = self._make_readonly_text(right_column, "Runtime Conditions", height=7)
@@ -402,34 +477,58 @@ class DashboardService:
 
         action_row = tk.Frame(frame)
         action_row.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(6, 0))
-        tk.Button(action_row, text="Pause Session", command=self._on_pause_long_horizon_clicked, width=16).pack(
+        tk.Button(action_row, text="Pause Long Run", command=self._on_pause_long_horizon_clicked, width=16).pack(
             side="left"
         )
-        tk.Button(action_row, text="Resume Session", command=self._on_resume_long_horizon_clicked, width=16).pack(
+        tk.Button(action_row, text="Resume Long Run", command=self._on_resume_long_horizon_clicked, width=16).pack(
             side="left",
             padx=(8, 0),
         )
-        tk.Button(action_row, text="Cancel Session", command=self._on_cancel_long_horizon_clicked, width=16).pack(
+        tk.Button(action_row, text="Cancel Long Run", command=self._on_cancel_long_horizon_clicked, width=16).pack(
+            side="left",
+            padx=(8, 0),
+        )
+        session_row = tk.Frame(frame)
+        session_row.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        tk.Button(
+            session_row,
+            text="Start Local Session",
+            command=self._on_start_local_task_session_clicked,
+            width=18,
+        ).pack(side="left")
+        tk.Button(session_row, text="Pause Local", command=self._on_pause_local_task_session_clicked, width=12).pack(
+            side="left",
+            padx=(8, 0),
+        )
+        tk.Button(session_row, text="Resume Local", command=self._on_resume_local_task_session_clicked, width=12).pack(
+            side="left",
+            padx=(8, 0),
+        )
+        tk.Button(session_row, text="Stop Local", command=self._on_stop_local_task_session_clicked, width=12).pack(
+            side="left",
+            padx=(8, 0),
+        )
+        tk.Button(session_row, text="Kill Switch", command=self._on_kill_local_task_session_clicked, width=12).pack(
             side="left",
             padx=(8, 0),
         )
 
         tk.Label(frame, textvariable=self._time_summary_var, anchor="w").grid(
-            row=6,
+            row=7,
             column=0,
             columnspan=4,
             sticky="ew",
             pady=(6, 0),
         )
         tk.Label(frame, textvariable=self._run_status_var, anchor="w").grid(
-            row=7,
+            row=8,
             column=0,
             columnspan=4,
             sticky="ew",
             pady=(4, 0),
         )
         tk.Label(frame, textvariable=self._app_notice_var, anchor="w").grid(
-            row=8,
+            row=9,
             column=0,
             columnspan=4,
             sticky="ew",
@@ -440,60 +539,88 @@ class DashboardService:
         entry.focus_set()
 
     def _build_model_role_controls(self, parent: tk.Misc) -> None:
-        frame = tk.LabelFrame(parent, text="Local AI Role Actions")
-        frame.pack(fill=tk.X, pady=(8, 0))
+        frame = tk.LabelFrame(parent, text="Unified Local AI Roles Panel")
+        frame.pack(fill=tk.BOTH, pady=(8, 0), expand=True)
 
-        self._model_role_var = tk.StringVar(value=ModelRole.GENERATION.value)
-        self._model_role_status_var = tk.StringVar(value="Select a role to inspect or manage.")
+        # Table header
+        header = tk.Frame(frame)
+        header.pack(fill=tk.X)
+        tk.Label(header, text="Role", width=16, anchor="w", font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        tk.Label(header, text="Status", width=16, anchor="w", font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        tk.Label(header, text="Degrade/Fallback", width=24, anchor="w", font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        tk.Label(header, text="Quick Actions", width=48, anchor="w", font=("TkDefaultFont", 10, "bold")).pack(side="left")
 
-        tk.Label(frame, text="Role").grid(row=0, column=0, sticky="w")
-        tk.OptionMenu(frame, self._model_role_var, *[role.value for role in ModelRole]).grid(
-            row=0,
-            column=1,
-            sticky="ew",
-            padx=(8, 0),
-        )
+        # Per-role rows with optimizer advice
+        for role in ModelRole:
+            row = tk.Frame(frame)
+            row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text=role.value, width=16, anchor="w").pack(side="left")
+            # Status: enabled/disabled, active, preferred
+            enabled = self._app_state.model_registry_view.preferred_models.get(role.value, "")
+            active = role.value in self._app_state.model_registry_view.active_heavy_roles
+            status = []
+            if active:
+                status.append("active")
+            reg = next((r for r in self._app_state.model_registry_view.registrations if r.role == role and r.enabled), None)
+            if reg:
+                status.append("enabled")
+            else:
+                status.append("disabled")
+            if enabled:
+                status.append("preferred")
+            tk.Label(row, text=", ".join(status), width=16, anchor="w").pack(side="left")
+            # Degrade/fallback reason
+            fallback = self._app_state.model_registry_view.fallback_reasons.get(role.value, "")
+            degrade = self._app_state.runtime_health.last_error or ""
+            degrade_fallback = fallback
+            if degrade and role.value in degrade:
+                degrade_fallback = degrade
+            tk.Label(row, text=degrade_fallback or fallback or "(none)", width=24, anchor="w", fg="red" if degrade_fallback else "black").pack(side="left")
+            # Quick actions
+            actions = tk.Frame(row)
+            actions.pack(side="left", fill=tk.X, expand=True)
+            tk.Button(actions, text="Enable", width=8, command=lambda r=role: self._on_enable_model_role_clicked_for(r)).pack(side="left")
+            tk.Button(actions, text="Disable", width=8, command=lambda r=role: self._on_disable_model_role_clicked_for(r)).pack(side="left")
+            tk.Button(actions, text="Warm", width=8, command=lambda r=role: self._on_warm_model_role_clicked_for(r)).pack(side="left")
+            tk.Button(actions, text="Unload", width=8, command=lambda r=role: self._on_unload_model_role_clicked_for(r)).pack(side="left")
+            tk.Button(actions, text="Test Ping", width=8, command=lambda r=role: self._on_test_model_role_clicked_for(r)).pack(side="left")
+            tk.Button(actions, text="Install Help", width=10, command=lambda r=role: self._on_model_install_guidance_clicked_for(r)).pack(side="left")
 
-        action_row = tk.Frame(frame)
-        action_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        tk.Button(action_row, text="Install Help", command=self._on_model_install_guidance_clicked, width=12).pack(
-            side="left"
-        )
-        tk.Button(action_row, text="Enable", command=self._on_enable_model_role_clicked, width=10).pack(
-            side="left",
-            padx=(6, 0),
-        )
-        tk.Button(action_row, text="Disable", command=self._on_disable_model_role_clicked, width=10).pack(
-            side="left",
-            padx=(6, 0),
-        )
-        tk.Button(action_row, text="Warm", command=self._on_warm_model_role_clicked, width=10).pack(
-            side="left",
-            padx=(6, 0),
-        )
+            # Optimizer advice/suggestions for this role
+            suggestions = [
+                record for record in getattr(self._app_state.model_registry_view, "recent_optimizer_suggestions", [])
+                if hasattr(record, "target_components") and role.value in getattr(record, "target_components", [])
+            ]
+            if suggestions:
+                advice_text = "; ".join(f"{record.kind.value}: {record.summary}" for record in suggestions[:2])
+                tk.Label(row, text=f"Advice: {advice_text}", width=48, anchor="w", fg="blue").pack(side="left")
+            else:
+                tk.Label(row, text="Advice: (none)", width=48, anchor="w", fg="gray").pack(side="left")
 
-        extra_row = tk.Frame(frame)
-        extra_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        tk.Button(extra_row, text="Unload", command=self._on_unload_model_role_clicked, width=10).pack(
-            side="left"
-        )
-        tk.Button(extra_row, text="Test Ping", command=self._on_test_model_role_clicked, width=10).pack(
-            side="left",
-            padx=(6, 0),
-        )
-        tk.Button(extra_row, text="Fallback", command=self._on_inspect_model_fallback_clicked, width=10).pack(
-            side="left",
-            padx=(6, 0),
-        )
+    # Add per-role quick action handlers
+    def _on_enable_model_role_clicked_for(self, role):
+        self._model_role_var.set(role.value)
+        self._on_enable_model_role_clicked()
 
-        tk.Label(frame, textvariable=self._model_role_status_var, anchor="w").grid(
-            row=3,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=(6, 0),
-        )
-        frame.grid_columnconfigure(1, weight=1)
+    def _on_disable_model_role_clicked_for(self, role):
+        self._model_role_var.set(role.value)
+        self._on_disable_model_role_clicked()
+
+    def _on_warm_model_role_clicked_for(self, role):
+        self._model_role_var.set(role.value)
+        self._on_warm_model_role_clicked()
+
+    def _on_unload_model_role_clicked_for(self, role):
+        self._model_role_var.set(role.value)
+        self._on_unload_model_role_clicked()
+
+    def _on_test_model_role_clicked_for(self, role):
+        self._model_role_var.set(role.value)
+        self._on_test_model_role_clicked()
+
+    def _on_model_install_guidance_clicked_for(self, role):
+        self._model_role_var.set(role.value)
+        self._on_model_install_guidance_clicked()
 
     def _build_settings_panel(self, parent: tk.Misc) -> None:
         frame = tk.LabelFrame(parent, text="Settings")
@@ -524,6 +651,10 @@ class DashboardService:
         self._desktop_approval_policy_var = tk.StringVar(value="approve_risky_only")
         self._observation_tier_var = tk.StringVar(value="screenshot_on_demand")
         self._cloud_mode_var = tk.StringVar(value="auxiliary_only")
+        self._cloud_capability_vars = {
+            capability.value: tk.BooleanVar(value=False)
+            for capability, _label in _CLOUD_CAPABILITY_CONTROL_LABELS
+        }
         self._log_runtime_events_var = tk.BooleanVar(value=True)
         self._allow_cloud_content_var = tk.BooleanVar(value=False)
         self._log_level_var = tk.StringVar(value="INFO")
@@ -678,13 +809,22 @@ class DashboardService:
             row=26, column=0, columnspan=2, sticky="w"
         )
 
-        tk.Label(frame, text="Profile import/export path").grid(row=27, column=0, sticky="w", pady=(6, 0))
+        cloud_capabilities = tk.LabelFrame(frame, text="Cloud Capabilities")
+        cloud_capabilities.grid(row=27, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        for index, (capability, label) in enumerate(_CLOUD_CAPABILITY_CONTROL_LABELS):
+            tk.Checkbutton(
+                cloud_capabilities,
+                text=label,
+                variable=self._cloud_capability_vars[capability.value],
+            ).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 12))
+
+        tk.Label(frame, text="Profile import/export path").grid(row=28, column=0, sticky="w", pady=(6, 0))
         tk.Entry(frame, textvariable=self._settings_path_var, width=24).grid(
-            row=27, column=1, sticky="ew", padx=(8, 0), pady=(6, 0)
+            row=28, column=1, sticky="ew", padx=(8, 0), pady=(6, 0)
         )
 
         button_row = tk.Frame(frame)
-        button_row.grid(row=28, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        button_row.grid(row=29, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         tk.Button(button_row, text="Save Profile", command=self._on_save_settings_clicked, width=16).pack(
             side="left"
         )
@@ -698,7 +838,7 @@ class DashboardService:
         )
 
         extra_row = tk.Frame(frame)
-        extra_row.grid(row=29, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        extra_row.grid(row=30, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         tk.Button(extra_row, text="Refresh Profiles", command=self._on_refresh_settings_profiles_clicked, width=16).pack(
             side="left"
         )
@@ -909,8 +1049,19 @@ class DashboardService:
     def _build_readiness_tab(self, parent: tk.Misc) -> None:
         controls = tk.LabelFrame(parent, text="Readiness")
         controls.pack(fill=tk.X, pady=(0, 8))
+        self._readiness_export_path_var = tk.StringVar(value="logs/packaged_preflight_report")
         tk.Button(controls, text="Refresh Readiness", command=self._on_refresh_readiness_clicked, width=18).pack(
             side="left"
+        )
+        tk.Entry(controls, textvariable=self._readiness_export_path_var, width=36).pack(
+            side="left",
+            padx=(8, 0),
+            fill=tk.X,
+            expand=True,
+        )
+        tk.Button(controls, text="Export Preflight", command=self._on_export_readiness_clicked, width=18).pack(
+            side="left",
+            padx=(8, 0),
         )
         self._readiness_checks_text = self._make_readonly_text(parent, "Preflight Checks", height=10)
         self._capability_text = self._make_readonly_text(parent, "Capability Gates", height=10)
@@ -1041,6 +1192,9 @@ class DashboardService:
         self._code_source_path_var = tk.StringVar(value="orchestrator.py")
         self._code_request_var = tk.StringVar(value=self.config.code_specialist.default_request)
         self._code_status_var = tk.StringVar(value="Code specialist ready.")
+        self._coding_task_type_var = tk.StringVar(value="code_review")
+        self._coding_language_var = tk.StringVar(value=self.config.coding_mode.default_language)
+        self._coding_framework_var = tk.StringVar(value="")
         tk.Label(controls, text="Source path").grid(row=0, column=0, sticky="w")
         tk.Entry(controls, textvariable=self._code_source_path_var, width=56).grid(
             row=0, column=1, sticky="ew", padx=(8, 0)
@@ -1049,12 +1203,43 @@ class DashboardService:
         tk.Entry(controls, textvariable=self._code_request_var, width=72).grid(
             row=1, column=1, sticky="ew", padx=(8, 0), pady=(6, 0)
         )
+        mode_row = tk.Frame(controls)
+        mode_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        tk.Label(mode_row, text="Coding task").pack(side="left")
+        ttk.Combobox(
+            mode_row,
+            textvariable=self._coding_task_type_var,
+            values=(
+                "code_review",
+                "feature_generation",
+                "bug_fixing",
+                "refactoring",
+                "test_generation",
+                "explanation",
+                "project_scaffolding",
+                "architecture_planning",
+            ),
+            width=22,
+            state="readonly",
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(mode_row, text="Language").pack(side="left", padx=(12, 0))
+        tk.Entry(mode_row, textvariable=self._coding_language_var, width=12).pack(side="left", padx=(8, 0))
+        tk.Label(mode_row, text="Framework").pack(side="left", padx=(12, 0))
+        tk.Entry(mode_row, textvariable=self._coding_framework_var, width=16).pack(side="left", padx=(8, 0))
         button_row = tk.Frame(controls)
-        button_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        button_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         tk.Button(button_row, text="Analyze File", command=self._on_analyze_code_file_clicked, width=16).pack(
             side="left"
         )
         tk.Button(button_row, text="Analyze Snippet", command=self._on_analyze_code_snippet_clicked, width=16).pack(
+            side="left",
+            padx=(8, 0),
+        )
+        tk.Button(button_row, text="Run Coding Task", command=self._on_run_coding_task_clicked, width=16).pack(
+            side="left",
+            padx=(8, 0),
+        )
+        tk.Button(button_row, text="Practice Once", command=self._on_run_coding_practice_clicked, width=16).pack(
             side="left",
             padx=(8, 0),
         )
@@ -1063,7 +1248,7 @@ class DashboardService:
             padx=(8, 0),
         )
         tk.Label(controls, textvariable=self._code_status_var, anchor="w").grid(
-            row=3,
+            row=4,
             column=0,
             columnspan=2,
             sticky="ew",
@@ -1113,6 +1298,8 @@ class DashboardService:
         selected_task = state.selected_task
         knowledge_sources = state.knowledge_sources
         readiness_report = state.readiness_report
+        capability_registry_view = state.capability_registry_view
+        local_task_session = state.local_task_session
         model_registry_view = state.model_registry_view
         model_role_action = state.model_role_action
         demo_pack_status = state.demo_pack_status
@@ -1122,6 +1309,9 @@ class DashboardService:
         audio_output = state.audio_output
         translation_output = state.translation_output
         code_output = state.code_output
+        coding_output = state.coding_output
+        coding_practice = state.coding_practice
+        coding_patterns = state.coding_patterns
         last_notice = state.last_notice
         last_notice_severity = state.last_notice_severity
 
@@ -1435,6 +1625,10 @@ class DashboardService:
             )
         elif stage == "dashboard.readiness_loaded":
             readiness_report = coerce_dashboard_readiness_report(event.get("report", {}))
+        elif stage == "dashboard.capability_registry_loaded":
+            capability_registry_view = coerce_capability_registry_view(event.get("capability_registry_view", {}))
+        elif stage == "dashboard.local_task_session_loaded":
+            local_task_session = coerce_dashboard_local_task_session_state(event.get("local_task_session", {}))
         elif stage == "dashboard.model_registry_loaded":
             model_registry_view = coerce_model_registry_view(event.get("model_registry_view", {}))
         elif stage == "dashboard.model_role_action_reported":
@@ -1472,6 +1666,18 @@ class DashboardService:
             code_output = coerce_code_specialist_result(event.get("code_output", {}))
         elif stage == "dashboard.code_output_cleared":
             code_output = CodeSpecialistResult()
+        elif stage == "dashboard.coding_output_loaded":
+            coding_output = coerce_coding_task_result(event.get("coding_output", {}))
+        elif stage == "dashboard.coding_output_cleared":
+            coding_output = CodingTaskResult()
+        elif stage == "dashboard.coding_practice_loaded":
+            coding_practice = coerce_practice_session_result(event.get("coding_practice", {}))
+        elif stage == "dashboard.coding_practice_cleared":
+            coding_practice = PracticeSessionResult()
+        elif stage == "dashboard.coding_patterns_loaded":
+            coding_patterns = tuple(
+                coerce_coding_pattern(item) for item in event.get("coding_patterns", ())
+            )
         elif stage == "dashboard.notice":
             last_notice = str(event.get("message", ""))
             last_notice_severity = str(event.get("severity", "info"))
@@ -1497,6 +1703,7 @@ class DashboardService:
             event_count=state.event_count + 1,
             dropped_events=dropped_events,
             active_task=active_task,
+            local_task_session=local_task_session,
             runtime_health=runtime_health,
             statuses=statuses,
             recent_conditions=tuple(recent_conditions),
@@ -1505,6 +1712,7 @@ class DashboardService:
             selected_task=selected_task,
             knowledge_sources=knowledge_sources,
             readiness_report=readiness_report,
+            capability_registry_view=capability_registry_view,
             model_registry_view=model_registry_view,
             model_role_action=model_role_action,
             demo_pack_status=demo_pack_status,
@@ -1514,10 +1722,736 @@ class DashboardService:
             audio_output=audio_output,
             translation_output=translation_output,
             code_output=code_output,
+            coding_output=coding_output,
+            coding_practice=coding_practice,
+            coding_patterns=coding_patterns,
             last_notice=last_notice,
             last_notice_severity=last_notice_severity,
             updated_at=utc_now(),
         )
+        self._record_shell_projection_event(self._app_state, event)
+
+    def _requested_app_shell(self) -> str:
+        raw_value = str(self._app_state.user_settings.ui.get("app_shell", "tkinter")).strip().lower()
+        return raw_value or "tkinter"
+
+    def _next_shell_item_id(self, prefix: str) -> str:
+        self._shell_serial += 1
+        return f"{prefix}-{self._shell_serial:06d}"
+
+    def _append_bounded(self, values: list[Any], item: Any, *, limit: int) -> None:
+        values.append(item)
+        overflow = len(values) - limit
+        if overflow > 0:
+            del values[:overflow]
+
+    def _record_shell_projection_event(self, state: DashboardAppState, event: dict[str, Any]) -> None:
+        stage = str(event.get("stage", "")).strip()
+        if not stage:
+            return
+
+        timeline_label = self._timeline_label_for_stage(stage)
+        if timeline_label:
+            detail = self._timeline_detail_for_event(stage, event, state)
+            self._append_bounded(
+                self._shell_timeline_entries,
+                TimelineEntry(
+                    entry_id=self._next_shell_item_id("timeline"),
+                    label=timeline_label,
+                    stage=stage,
+                    detail=detail,
+                    severity=str(event.get("severity", state.last_notice_severity or "info")),
+                ),
+                limit=48,
+            )
+
+        if stage == "pipeline.received":
+            question = str(event.get("question", state.active_task.question)).strip()
+            if question:
+                self._append_bounded(
+                    self._shell_conversation_items,
+                    ConversationItem(
+                        item_id=self._next_shell_item_id("conv"),
+                        role="user",
+                        title="Task Submitted",
+                        body=question,
+                        status="submitted",
+                        task_id=str(event.get("task_id", state.active_task.task_id)),
+                    ),
+                    limit=40,
+                )
+        elif stage == "pipeline.completed":
+            answer_text = str(event.get("answer_text", state.active_task.answer_text)).strip()
+            if answer_text:
+                critique_result = str(event.get("critique_result", state.active_task.critique_result)).strip()
+                chips = [
+                    "Verified" if critique_result else "Completed",
+                    f"Citations {len(tuple(event.get('citation_refs', state.active_task.citation_refs)))}",
+                ]
+                if state.active_task.warning_count:
+                    chips.append(f"Warnings {state.active_task.warning_count}")
+                self._append_bounded(
+                    self._shell_conversation_items,
+                    ConversationItem(
+                        item_id=self._next_shell_item_id("conv"),
+                        role="assistant",
+                        title="Final Answer",
+                        body=answer_text,
+                        status=critique_result or "completed",
+                        chips=tuple(chips),
+                        task_id=str(event.get("task_id", state.active_task.task_id)),
+                    ),
+                    limit=40,
+                )
+        elif stage in {"pipeline.failed", "pipeline.cancelled"}:
+            body = (
+                str(event.get("reason", "")).strip()
+                or str(event.get("message", "")).strip()
+                or str(state.active_task.degraded_reason).strip()
+                or "Task ended without a final verified answer."
+            )
+            self._append_bounded(
+                self._shell_conversation_items,
+                ConversationItem(
+                    item_id=self._next_shell_item_id("conv"),
+                    role="system",
+                    title="Task Update",
+                    body=body,
+                    status=stage.removeprefix("pipeline."),
+                    task_id=str(event.get("task_id", state.active_task.task_id)),
+                ),
+                limit=40,
+            )
+        elif stage == "coding.completed":
+            request_id = str(event.get("request_id", "")).strip()
+            coding_output = state.coding_output
+            body = coding_output.summary or str(event.get("summary", "")).strip() or "Coding task complete."
+            chips = [
+                f"Quality {coding_output.quality_report.quality_score:.2f}",
+                f"Verified {len(coding_output.verified_patterns)}",
+            ]
+            self._append_bounded(
+                self._shell_conversation_items,
+                ConversationItem(
+                    item_id=self._next_shell_item_id("conv"),
+                    role="assistant",
+                    title="Coding Task",
+                    body=body,
+                    status=coding_output.status or "completed",
+                    chips=tuple(chips),
+                    task_id=request_id,
+                ),
+                limit=40,
+            )
+        elif stage == "coding.practice_completed":
+            practice = state.coding_practice
+            body = practice.summary or str(event.get("summary", "")).strip() or "Completed one bounded coding practice cycle."
+            self._append_bounded(
+                self._shell_conversation_items,
+                ConversationItem(
+                    item_id=self._next_shell_item_id("conv"),
+                    role="system",
+                    title="Coding Dojo",
+                    body=body,
+                    status=practice.status or "completed",
+                    chips=(
+                        f"Score {practice.quality_score:.2f}",
+                        f"Patterns {len(practice.validated_patterns)}",
+                    ),
+                    task_id=practice.session_id,
+                ),
+                limit=40,
+            )
+
+        if stage == "dashboard.notice":
+            message = str(event.get("message", "")).strip()
+            if message:
+                self._append_bounded(
+                    self._shell_notifications,
+                    ShellNotification(
+                        notification_id=self._next_shell_item_id("note"),
+                        message=message,
+                        severity=str(event.get("severity", "info")),
+                    ),
+                    limit=24,
+                )
+
+        self._register_shell_effects(stage, event, state)
+
+    def _timeline_label_for_stage(self, stage: str) -> str:
+        labels = {
+            "pipeline.received": "Task received",
+            "pipeline.planner_started": "Planner started",
+            "pipeline.researcher_done": "Local retrieval complete",
+            "researcher.web_lookup": "Web fallback triggered",
+            "pipeline.reasoner_started": "Reasoner started",
+            "pipeline.reasoner_done": "Candidate batch built",
+            "pipeline.critic_started": "Critic verification started",
+            "pipeline.critic_done": "Critic verification complete",
+            "pipeline.critic_repair_started": "Critic repair started",
+            "pipeline.critic_repair_done": "Critic repair complete",
+            "pipeline.compressor_started": "Compression review started",
+            "pipeline.completed": "Answer rendered",
+            "pipeline.failed": "Task failed",
+            "pipeline.long_horizon_started": "Long-horizon session started",
+            "pipeline.long_horizon_cycle_completed": "Checkpoint saved",
+            "pipeline.long_horizon_completed": "Long-horizon session completed",
+            "pipeline.long_horizon_early_stopped": "Long-horizon session stopped early",
+            "coding.planning": "Code planning started",
+            "coding.generating": "Code generation started",
+            "coding.testing": "Code tests running",
+            "coding.debugging": "Debug pass started",
+            "coding.reviewing": "Code review started",
+            "coding.indexing": "Coding memory updated",
+            "coding.practicing": "Coding Dojo started",
+            "coding.practice_completed": "Coding Dojo complete",
+            "coding.completed": "Coding task complete",
+            "coding.regression_detected": "Regression detected",
+            "dashboard.local_task_session_loaded": "Capability session updated",
+            "dashboard.model_registry_loaded": "Model routing view refreshed",
+            "dashboard.readiness_loaded": "Readiness refreshed",
+        }
+        return labels.get(stage, "")
+
+    def _timeline_detail_for_event(
+        self,
+        stage: str,
+        event: dict[str, Any],
+        state: DashboardAppState,
+    ) -> str:
+        if stage == "pipeline.received":
+            return str(event.get("question", state.active_task.question)).strip()
+        if stage == "researcher.web_lookup":
+            return str(event.get("query", state.active_task.web_query)).strip()
+        if stage == "pipeline.reasoner_done":
+            return (
+                f"{int(event.get('candidate_trace_count', state.active_task.candidate_trace_count))} candidates | "
+                f"score {float(event.get('candidate_score', state.active_task.candidate_score) or 0.0):.2f}"
+            )
+        if stage in {"pipeline.critic_done", "pipeline.critic_repair_done"}:
+            return str(event.get("critique_result", state.active_task.critique_result)).strip()
+        if stage == "pipeline.long_horizon_cycle_completed":
+            return (
+                f"Cycle {int(event.get('cycle_index', state.active_task.long_horizon_completed_cycles))}/"
+                f"{int(event.get('total_cycles', state.active_task.long_horizon_total_cycles))}"
+            )
+        if stage.startswith("coding."):
+            quality_score = float(event.get("quality_score", 0.0) or 0.0)
+            task_type = str(event.get("task_type", "")).replace("_", " ").strip()
+            if quality_score > 0.0:
+                return f"{task_type or 'coding'} | score {quality_score:.2f}"
+            return task_type
+        if stage == "dashboard.local_task_session_loaded":
+            return str(state.local_task_session.last_action_summary or state.local_task_session.last_control_reason)
+        return str(event.get("message", "")).strip()
+
+    def _register_shell_effects(
+        self,
+        stage: str,
+        event: dict[str, Any],
+        state: DashboardAppState,
+    ) -> None:
+        now = utc_now()
+        if stage == "pipeline.completed":
+            self._shell_effect_deadlines["insight_flash"] = now + timedelta(seconds=1.6)
+            critique_result = str(event.get("critique_result", state.active_task.critique_result)).lower()
+            candidate_score = float(event.get("candidate_score", state.active_task.candidate_score) or 0.0)
+            if critique_result and critique_result not in {"invalid", "failed", "rejected"} and candidate_score >= 0.75:
+                self._shell_effect_deadlines["verification_lock"] = now + timedelta(seconds=2.2)
+        if stage == "pipeline.reasoner_done" and int(
+            event.get("candidate_trace_count", state.active_task.candidate_trace_count)
+        ) > 1:
+            self._shell_effect_deadlines["consensus_shimmer"] = now + timedelta(seconds=1.4)
+        if stage == "pipeline.long_horizon_cycle_completed":
+            self._shell_effect_deadlines["checkpoint_pulse"] = now + timedelta(seconds=1.2)
+        if stage == "coding.completed":
+            self._shell_effect_deadlines["insight_flash"] = now + timedelta(seconds=1.0)
+            if float(event.get("quality_score", 0.0) or 0.0) >= 0.85:
+                self._shell_effect_deadlines["verification_lock"] = now + timedelta(seconds=1.6)
+        if stage == "coding.practice_completed":
+            self._shell_effect_deadlines["consensus_shimmer"] = now + timedelta(seconds=1.2)
+        if stage in {"dashboard.audio_output_loaded"}:
+            self._shell_effect_deadlines["speaking_halo"] = now + timedelta(seconds=2.0)
+        if stage in {"dashboard.audio_input_loaded", "dashboard.audio_transcript_imported"}:
+            self._shell_effect_deadlines["listening_ripple"] = now + timedelta(seconds=1.8)
+
+    def _active_shell_effects(self) -> tuple[str, ...]:
+        now = utc_now()
+        expired = [
+            effect_name
+            for effect_name, deadline in self._shell_effect_deadlines.items()
+            if deadline <= now
+        ]
+        for effect_name in expired:
+            self._shell_effect_deadlines.pop(effect_name, None)
+        return tuple(self._shell_effect_deadlines.keys())
+
+    def _build_shell_state(self, state: DashboardAppState) -> ShellState:
+        task = state.active_task
+        session = state.local_task_session
+        health = state.runtime_health
+        stage = task.running_stage or state.last_stage
+        coding_output = state.coding_output
+        coding_practice = state.coding_practice
+        active_effects = self._active_shell_effects()
+        approval_pending = bool(session.pending_approval_summaries)
+        deep_mode = bool(
+            task.execution_mode == "long_horizon"
+            or str(state.user_settings.reasoning.get("mode", "auto")) == "deep"
+            or task.requested_thinking_minutes > 120
+            or stage.startswith("pipeline.long_horizon")
+        )
+        active_tools: list[str] = []
+        if task.local_result_count > 0:
+            active_tools.append("memory")
+        if task.web_query or task.used_web_fallback or task.web_result_count > 0:
+            active_tools.extend(["search", "web"])
+        if state.audio_input.status:
+            active_tools.append("voice")
+        if state.translation_output.status:
+            active_tools.append("translation")
+        if state.code_output.status:
+            active_tools.append("code")
+        if coding_output.status and coding_output.status != "idle":
+            active_tools.extend(["coding", "sandbox"])
+        if coding_practice.status and coding_practice.status != "idle":
+            active_tools.append("practice")
+        if session.session_id:
+            active_tools.append("desktop")
+        if (
+            session.effective_observation_tier
+            and session.effective_observation_tier != "screenshot_on_demand"
+        ) or session.last_observation_output_ref:
+            active_tools.append("observation")
+        active_tools = list(dict.fromkeys(tool for tool in active_tools if tool))
+
+        active_roles = list(dict.fromkeys(
+            [
+                *tuple(task.specialist_roles_used),
+                *tuple(health.active_heavy_roles),
+                *(role for role in coding_output.role_assignments if role),
+            ]
+        ))
+
+        fallback_reason = str(task.degraded_reason or health.fallback_reason).strip()
+        degraded_reason = str(
+            session.observation_degraded_reason
+            or task.degraded_reason
+            or health.governor_summary
+        ).strip()
+        has_error = bool(
+            health.last_error
+            or stage == "pipeline.failed"
+            or state.last_notice_severity == "error"
+            or session.last_error
+        )
+        if not health.started and not state.event_count:
+            orb_mode = "offline"
+        elif has_error:
+            orb_mode = "error"
+        elif "speaking_halo" in active_effects:
+            orb_mode = "speaking"
+        elif stage.startswith("coding."):
+            orb_mode = self._coding_orb_mode_for_stage(stage=stage, coding_output=coding_output)
+        elif stage.startswith("pipeline.planner"):
+            orb_mode = "planner"
+        elif stage == "researcher.web_lookup":
+            orb_mode = "researcher_web"
+        elif stage.startswith("pipeline.researcher") or stage == "researcher.local_lookup":
+            orb_mode = "researcher_local"
+        elif stage.startswith("pipeline.critic"):
+            orb_mode = "critic"
+        elif stage.startswith("pipeline.compressor"):
+            orb_mode = "compressor"
+        elif stage.startswith("pipeline.reasoner") or stage.startswith("pipeline.long_horizon"):
+            orb_mode = "reasoner_deep" if deep_mode else "reasoner_fast"
+        elif "listening_ripple" in active_effects:
+            orb_mode = "listening"
+        elif stage == "pipeline.completed" or task.answer_text:
+            orb_mode = "responding"
+        elif health.started:
+            orb_mode = "idle"
+        else:
+            orb_mode = "offline"
+
+        palette_by_mode = {
+            "offline": "slate_blue",
+            "error": "warning_red",
+            "speaking": "vivid_blue",
+            "code_planning": "cyan_blue",
+            "code_generating": "focused_yellow",
+            "code_refactoring": "cyan_white",
+            "code_testing": "green_blue",
+            "code_debugging": "warning_red",
+            "code_reviewing": "violet_magenta",
+            "code_indexing": "blue_gold",
+            "code_practicing": "indigo_gold",
+            "code_learning": "white_gold",
+            "code_regression": "warning_red",
+            "planner": "cyan_blue",
+            "researcher_web": "amber_gold",
+            "researcher_local": "blue_gold",
+            "critic": "violet_magenta",
+            "compressor": "white_gold",
+            "reasoner_fast": "focused_yellow",
+            "reasoner_deep": "deep_red",
+            "listening": "vivid_blue",
+            "responding": "cyan_white",
+            "idle": "calm_blue",
+        }
+        intensity_by_mode = {
+            "offline": 0.12,
+            "error": 1.00,
+            "speaking": 0.76,
+            "code_planning": 0.58,
+            "code_generating": 0.72,
+            "code_refactoring": 0.60,
+            "code_testing": 0.70,
+            "code_debugging": 0.90,
+            "code_reviewing": 0.66,
+            "code_indexing": 0.62,
+            "code_practicing": 0.68,
+            "code_learning": 0.76,
+            "code_regression": 1.00,
+            "planner": 0.56,
+            "researcher_web": 0.72,
+            "researcher_local": 0.60,
+            "critic": 0.74,
+            "compressor": 0.68,
+            "reasoner_fast": 0.64,
+            "reasoner_deep": 0.92,
+            "listening": 0.55,
+            "responding": 0.58,
+            "idle": 0.32,
+        }
+        status_by_mode = {
+            "offline": "Offline",
+            "error": "Attention Required",
+            "speaking": "Speaking",
+            "code_planning": "Code Planning",
+            "code_generating": "Generating",
+            "code_refactoring": "Refactoring",
+            "code_testing": "Testing",
+            "code_debugging": "Debugging",
+            "code_reviewing": "Reviewing",
+            "code_indexing": "Indexing",
+            "code_practicing": "Practicing",
+            "code_learning": "Learning Pattern",
+            "code_regression": "Regression Detected",
+            "planner": "Planning",
+            "researcher_web": "Searching",
+            "researcher_local": "Exploring",
+            "critic": "Verifying",
+            "compressor": "Refining",
+            "reasoner_fast": "Thinking",
+            "reasoner_deep": "Deep Thought",
+            "listening": "Listening",
+            "responding": "Responding",
+            "idle": "Ready",
+        }
+        stage_substatus = {
+            "pipeline.received": "Parsing request",
+            "pipeline.planner_started": "Structuring the task",
+            "pipeline.researcher_done": "Collecting local evidence",
+            "researcher.web_lookup": "Searching web evidence",
+            "pipeline.reasoner_started": "Ranking options",
+            "pipeline.reasoner_done": "Candidate set prepared",
+            "pipeline.critic_started": "Verifying answer",
+            "pipeline.critic_done": "Verifier complete",
+            "pipeline.critic_repair_started": "Repairing candidate",
+            "pipeline.critic_repair_done": "Repair pass complete",
+            "pipeline.compressor_started": "Reviewing reusable motifs",
+            "pipeline.completed": "Finalizing output",
+            "pipeline.long_horizon_cycle_completed": "Checkpoint saved",
+            "coding.planning": "Assigning local coding roles",
+            "coding.generating": "Preparing bounded code output",
+            "coding.testing": "Running sandbox checks",
+            "coding.debugging": "Investigating failing checks",
+            "coding.reviewing": "Reviewing maintainability",
+            "coding.indexing": "Updating coding memory",
+            "coding.practicing": "Running Coding Dojo",
+            "coding.practice_completed": "Practice cycle complete",
+            "coding.completed": "Coding output finalized",
+            "coding.regression_detected": "Failing regression checks",
+        }
+
+        confidence_value = float(task.candidate_score or 0.0)
+        if confidence_value <= 0.0:
+            confidence_value = 0.65 if orb_mode not in {"offline", "error"} else 0.35
+        if fallback_reason:
+            confidence_value -= 0.10
+        if task.warning_count:
+            confidence_value -= 0.10
+        if health.fallback_active:
+            confidence_value -= 0.10
+        confidence_value = max(0.10, min(1.0, confidence_value))
+        if confidence_value >= 0.80:
+            confidence_band = "high"
+        elif confidence_value >= 0.55:
+            confidence_band = "medium"
+        else:
+            confidence_band = "low"
+
+        critique_result = str(task.critique_result).strip().lower()
+        if stage.startswith("pipeline.critic"):
+            verifier_state = "running"
+        elif critique_result and critique_result not in {"invalid", "failed", "rejected"}:
+            verifier_state = "verified"
+        elif critique_result:
+            verifier_state = "degraded"
+        elif stage in {"coding.testing", "coding.reviewing"}:
+            verifier_state = "running"
+        elif coding_output.quality_report.overall_passed:
+            verifier_state = "verified"
+        else:
+            verifier_state = "idle"
+
+        if stage == "coding.indexing":
+            retrieval_state = "coding_memory"
+        elif task.web_query or task.used_web_fallback or task.web_result_count > 0:
+            retrieval_state = "web_assisted" if task.local_result_count > 0 else "web_only"
+        elif task.local_result_count > 0:
+            retrieval_state = "local"
+        else:
+            retrieval_state = "idle"
+
+        if stage == "coding.indexing":
+            compression_state = "pattern_index"
+        elif stage.startswith("pipeline.compressor"):
+            compression_state = "active"
+        elif "compression" in " ".join(task.advisor_summaries).lower():
+            compression_state = "advised"
+        elif stage == "pipeline.completed":
+            compression_state = "completed"
+        else:
+            compression_state = "idle"
+
+        optimizer_state = (
+            "advising"
+            if task.advisor_summaries or state.model_registry_view.recent_optimizer_suggestions
+            else "idle"
+        )
+        coding_state = (
+            stage.removeprefix("coding.")
+            if stage.startswith("coding.")
+            else coding_practice.status
+            if coding_practice.status not in {"", "idle"}
+            else coding_output.active_phase
+            if coding_output.active_phase not in {"", "idle"}
+            else "idle"
+        )
+
+        if health.governor_active and (health.queue_pressure or health.backend_health_degraded):
+            resource_pressure_level = "high"
+        elif health.governor_active or health.queue_pressure or health.backend_health_degraded:
+            resource_pressure_level = "elevated"
+        else:
+            resource_pressure_level = "nominal"
+
+        cloud_mode = str(state.user_settings.cloud.get("mode", "auxiliary_only")).strip()
+        cloud_helper_state = "disabled" if cloud_mode == "disabled" else "available"
+
+        activity_chips: list[ActivityChip] = []
+        def add_chip(label: str, tone: str, detail: str = "") -> None:
+            if len(activity_chips) >= 8:
+                return
+            activity_chips.append(
+                ActivityChip(
+                    chip_id=self._next_shell_item_id("chip"),
+                    label=label,
+                    tone=tone,
+                    detail=detail,
+                )
+            )
+
+        if task.local_result_count > 0:
+            add_chip("Local Retrieval", "info", f"{task.local_result_count} local results")
+        if task.web_query:
+            add_chip("Web Query", "warning", task.web_query)
+        if verifier_state in {"running", "verified"}:
+            add_chip("Verifying", "accent", task.selected_verifier or "critic")
+        if coding_state != "idle":
+            add_chip("Coding Mode", "accent", coding_state.replace("_", " "))
+        if stage == "coding.testing":
+            add_chip("Sandbox Tests", "accent", f"score {coding_output.quality_report.quality_score:.2f}")
+        if stage == "coding.indexing":
+            add_chip("Pattern Index", "info", f"{len(state.coding_patterns)} stored")
+        if stage == "coding.practicing":
+            add_chip("Coding Dojo", "accent", coding_practice.prompt or "practice task")
+        if stage == "coding.regression_detected":
+            add_chip("Regression Detected", "danger", "Tests or checks failed")
+        if deep_mode:
+            add_chip("Deep Candidate Pass", "danger", f"{task.candidate_trace_count} candidates")
+        if compression_state != "idle":
+            add_chip("Compression Review", "accent", compression_state)
+        if optimizer_state != "idle":
+            add_chip("Optimizer Advisory", "accent", ", ".join(task.advisor_summaries[:2]))
+        if fallback_reason:
+            add_chip("Fallback Active", "warning", fallback_reason)
+        if approval_pending:
+            add_chip("Approval Needed", "warning", "Action requires explicit approval")
+        if session.session_id:
+            add_chip("Capability Session", "info", session.status)
+        if session.effective_observation_tier and session.effective_observation_tier != "screenshot_on_demand":
+            add_chip("Observation Tier Active", "accent", session.effective_observation_tier)
+        if "checkpoint_pulse" in active_effects:
+            add_chip("Checkpoint Saved", "info", task.long_horizon_status)
+        if resource_pressure_level != "nominal":
+            add_chip("Resource Pressure", "warning", health.governor_summary or "Governor active")
+
+        active_overlay = "approval_hold" if approval_pending else ""
+        if not active_overlay and has_error:
+            active_overlay = "error_pulse"
+        elif not active_overlay and "verification_lock" in active_effects:
+            active_overlay = "verification_lock"
+
+        observation_tier = (
+            session.effective_observation_tier
+            or session.requested_observation_tier
+            or str(state.user_settings.observation.get("tier", "screenshot_on_demand"))
+        )
+
+        if stage.startswith("coding."):
+            current_task_summary = (
+                f"{coding_output.prompt or coding_practice.prompt or '(coding task)'} | "
+                f"stage {stage} | score {coding_output.quality_report.quality_score:.2f}"
+            )
+        else:
+            current_task_summary = (
+                f"{task.question or '(no question)'} | stage {stage or 'idle'} | "
+                f"{task.local_result_count} local / {task.web_result_count} web"
+            )
+
+        return ShellState(
+            orb_mode=orb_mode,
+            orb_palette=palette_by_mode.get(orb_mode, "calm_blue"),
+            orb_intensity=float(intensity_by_mode.get(orb_mode, 0.32)),
+            ring_mode=(
+                "hold"
+                if approval_pending
+                else "voice"
+                if orb_mode == "speaking"
+                else "scan"
+                if orb_mode in {"researcher_web", "critic"}
+                else "focus"
+                if orb_mode in {"reasoner_fast", "reasoner_deep", "planner"}
+                else "steady"
+            ),
+            particle_mode=(
+                "dense_orbit"
+                if orb_mode == "reasoner_deep"
+                else "inward"
+                if orb_mode.startswith("researcher")
+                else "spark"
+                if orb_mode in {"critic", "compressor"}
+                else "sparse"
+            ),
+            ambient_mode=(
+                "alert"
+                if has_error
+                else "deep"
+                if deep_mode
+                else "steady"
+                if health.started
+                else "dormant"
+            ),
+            status_text=status_by_mode.get(orb_mode, "Ready"),
+            sub_status_text=stage_substatus.get(stage, fallback_reason or degraded_reason or state.last_notice or ""),
+            active_agent=self._active_agent_from_stage(stage, session),
+            secondary_agents=tuple(self._secondary_agents(state, stage)),
+            active_tools=tuple(active_tools),
+            active_roles=tuple(active_roles),
+            confidence_band=confidence_band,
+            verifier_state=verifier_state,
+            retrieval_state=retrieval_state,
+            compression_state=compression_state,
+            optimizer_state=optimizer_state,
+            coding_state=coding_state,
+            long_horizon_state=str(task.long_horizon_status or ""),
+            checkpoint_count=int(task.long_horizon_completed_cycles),
+            degraded_reason=degraded_reason,
+            fallback_reason=fallback_reason,
+            resource_pressure_level=resource_pressure_level,
+            speaking_state="active" if "speaking_halo" in active_effects else "idle",
+            approval_pending=approval_pending,
+            capability_session_state=str(session.status or "inactive"),
+            observation_tier=observation_tier,
+            cloud_helper_state=cloud_helper_state,
+            activity_chips=tuple(activity_chips),
+            timeline_entries=tuple(self._shell_timeline_entries),
+            shell_notifications=tuple(self._shell_notifications),
+            conversation_items=tuple(self._shell_conversation_items),
+            orb_effects=OrbEffectState(
+                transient_effects=active_effects,
+                active_overlay=active_overlay,
+                insight_flash_pending="insight_flash" in active_effects,
+                consensus_shimmer_pending="consensus_shimmer" in active_effects,
+                verification_lock_pending="verification_lock" in active_effects,
+                checkpoint_pulse_pending="checkpoint_pulse" in active_effects,
+                approval_hold=approval_pending,
+                degraded_undertone=bool(degraded_reason or fallback_reason or resource_pressure_level != "nominal"),
+            ),
+            current_task_summary=current_task_summary,
+        )
+
+    def _active_agent_from_stage(
+        self,
+        stage: str,
+        session: DashboardLocalTaskSessionState,
+    ) -> str:
+        if stage.startswith("coding."):
+            return "coding_mode"
+        if stage.startswith("pipeline.planner"):
+            return "planner"
+        if stage.startswith("pipeline.researcher") or stage == "researcher.web_lookup":
+            return "researcher"
+        if stage.startswith("pipeline.reasoner") or stage.startswith("pipeline.long_horizon"):
+            return "reasoner"
+        if stage.startswith("pipeline.critic"):
+            return "critic"
+        if stage.startswith("pipeline.compressor"):
+            return "compressor"
+        if session.session_id and session.status not in {"", "inactive"}:
+            return "capability_session"
+        return "orchestrator" if stage else ""
+
+    def _secondary_agents(self, state: DashboardAppState, stage: str) -> list[str]:
+        names = {
+            component
+            for component in state.statuses
+            if component and component != self._active_agent_from_stage(stage, state.local_task_session)
+        }
+        if state.active_task.advisor_summaries:
+            names.add("self_optimizer")
+        return sorted(names)[:4]
+
+    def _coding_orb_mode_for_stage(
+        self,
+        *,
+        stage: str,
+        coding_output: CodingTaskResult,
+    ) -> str:
+        if stage == "coding.planning":
+            return "code_planning"
+        if stage == "coding.generating":
+            if coding_output.task_type == CodingTaskType.REFACTORING:
+                return "code_refactoring"
+            return "code_generating"
+        if stage == "coding.testing":
+            return "code_testing"
+        if stage == "coding.debugging":
+            return "code_debugging"
+        if stage == "coding.reviewing":
+            return "code_reviewing"
+        if stage == "coding.indexing":
+            return "code_indexing"
+        if stage == "coding.practicing":
+            return "code_practicing"
+        if stage == "coding.regression_detected":
+            return "code_regression"
+        if stage in {"coding.completed", "coding.practice_completed"}:
+            return "code_learning" if coding_output.quality_report.overall_passed else "responding"
+        return "code_generating"
 
     def _render_panels(self) -> None:
         state = self._app_state
@@ -1620,10 +2554,22 @@ class DashboardService:
                     f"Embedding backend: {health.embedding_backend or '(unknown)'}",
                     f"Generation jobs: {health.active_generation_jobs}",
                     f"Embedding jobs: {health.active_embedding_jobs}",
+                    f"Heavy slots: {len(health.active_heavy_roles)}/{health.heavy_slot_limit}",
+                    "Active heavy roles: "
+                    + (", ".join(health.active_heavy_roles) if health.active_heavy_roles else "(none)"),
                     f"Fallback active: {'yes' if health.fallback_active else 'no'}",
                     f"Fallback reason: {health.fallback_reason or '(none)'}",
                     f"RAM available/total: {self._format_gb(health.available_ram_gb)} / {self._format_gb(health.total_ram_gb)}",
                     f"VRAM gen/embed: {self._format_gb(health.generation_backend_vram_gb)} / {self._format_gb(health.embedding_backend_vram_gb)}",
+                    f"Governor active: {'yes' if health.governor_active else 'no'}",
+                    "Governor reasons: "
+                    + (", ".join(health.governor_pressure_reasons) if health.governor_pressure_reasons else "(none)"),
+                    "Governor degraded features: "
+                    + (
+                        ", ".join(health.governor_degraded_features)
+                        if health.governor_degraded_features
+                        else "(none)"
+                    ),
                     f"Last model error: {health.last_error or '(none)'}",
                 )
             ),
@@ -1644,7 +2590,12 @@ class DashboardService:
             self._model_role_status_var.set(state.model_role_action.summary or "Role action completed.")
         self._set_text(
             self._long_horizon_text,
-            self._format_long_horizon_progress(task),
+            "\n\n".join(
+                (
+                    self._format_local_task_session_progress(state.local_task_session),
+                    self._format_long_horizon_progress(task),
+                )
+            ),
         )
         self._set_text(
             self._conditions_text,
@@ -1816,6 +2767,8 @@ class DashboardService:
         audio_output = state.audio_output
         translation_output = state.translation_output
         code_output = state.code_output
+        coding_output = state.coding_output
+        coding_practice = state.coding_practice
         audio_lines = [
             "Voice input:",
             f"Status: {audio_input.status}",
@@ -1892,6 +2845,7 @@ class DashboardService:
             else "No translation result loaded yet.",
         )
         code_lines = [
+            "Code Specialist:",
             f"Status: {code_output.status}",
             f"Scope/path: {code_output.source_scope or '(none)'} / {code_output.source_path or '(none)'}",
             (
@@ -1911,12 +2865,81 @@ class DashboardService:
                 "Warnings: "
                 + (", ".join(code_output.warnings) if code_output.warnings else "(none)")
             ),
+            "",
+            "Coding Mode:",
+            f"Status/phase: {coding_output.status} / {coding_output.active_phase}",
+            f"Task type: {coding_output.task_type.value if hasattr(coding_output.task_type, 'value') else coding_output.task_type}",
+            f"Language/framework: {coding_output.language or '(none)'} / {coding_output.framework or '(none)'}",
+            (
+                "Role assignments: "
+                + (
+                    ", ".join(f"{key}={value}" for key, value in coding_output.role_assignments.items())
+                    if coding_output.role_assignments
+                    else "(none)"
+                )
+            ),
+            (
+                "Route summary: "
+                + (", ".join(coding_output.route_summary) if coding_output.route_summary else "(none)")
+            ),
+            f"Summary: {coding_output.summary or '(none)'}",
+            (
+                "Quality gates: "
+                f"tests={'yes' if coding_output.quality_report.tests_passed else 'no'} "
+                f"lint={'yes' if coding_output.quality_report.lint_passed else 'no'} "
+                f"complexity={'yes' if coding_output.quality_report.complexity_passed else 'no'} "
+                f"security={'yes' if coding_output.quality_report.security_passed else 'no'} "
+                f"critique={'yes' if coding_output.quality_report.critique_passed else 'no'} "
+                f"regression={'yes' if coding_output.quality_report.regression_passed else 'no'}"
+            ),
+            f"Quality score: {coding_output.quality_report.quality_score:.2f}",
+            (
+                "Pattern tiers: "
+                f"verified={len(coding_output.verified_patterns)} "
+                f"candidate={len(coding_output.candidate_patterns)} "
+                f"rejected={len(coding_output.rejected_patterns)}"
+            ),
+            (
+                "Practice session: "
+                f"{coding_output.practice_session_id or '(none)'}"
+            ),
+            (
+                "Warnings: "
+                + (", ".join(coding_output.warnings) if coding_output.warnings else "(none)")
+            ),
+            "",
+            "Coding Dojo:",
+            f"Status: {coding_practice.status}",
+            f"Prompt: {coding_practice.prompt or '(none)'}",
+            f"Score: {coding_practice.quality_score:.2f}",
+            (
+                "Validated/rejected: "
+                f"{len(coding_practice.validated_patterns)} / {len(coding_practice.rejected_patterns)}"
+            ),
+            (
+                "Learned patterns: "
+                + (
+                    ", ".join(
+                        f"{pattern.tier.value}:{pattern.title}"
+                        for pattern in state.coding_patterns[:6]
+                    )
+                    if state.coding_patterns
+                    else "(none)"
+                )
+            ),
         ]
         self._set_text(
             self._code_output_text,
             "\n".join(code_lines)
-            if code_output.summary or code_output.source_path or code_output.request_text
-            else "No code-specialist result loaded yet.",
+            if (
+                code_output.summary
+                or code_output.source_path
+                or code_output.request_text
+                or coding_output.summary
+                or coding_practice.prompt
+                or state.coding_patterns
+            )
+            else "No code-specialist or Coding Mode result loaded yet.",
         )
         readiness = state.readiness_report
         check_lines: list[str] = [
@@ -1955,7 +2978,7 @@ class DashboardService:
             )
         self._set_text(
             self._capability_text,
-            "\n".join(capability_lines) if capability_lines else "No capability-gating data yet.",
+            self._format_capability_registry_view(state.capability_registry_view, capability_lines),
         )
         self._set_debug_pane_visibility(bool(state.user_settings.ui.get("show_debug_pane", True)))
         if self._app_notice_var is not None:
@@ -1987,7 +3010,11 @@ class DashboardService:
             else:
                 self._translation_status_var.set("Translation role ready.")
         if self._code_status_var is not None:
-            if code_output.summary or code_output.source_path:
+            if coding_output.summary or coding_practice.prompt:
+                self._code_status_var.set(
+                    f"Coding Mode {coding_output.status}: {coding_output.task_type.value if hasattr(coding_output.task_type, 'value') else coding_output.task_type}"
+                )
+            elif code_output.summary or code_output.source_path:
                 self._code_status_var.set(
                     f"Code specialist {code_output.status}: {code_output.source_path or code_output.source_scope}"
                 )
@@ -2043,11 +3070,26 @@ class DashboardService:
     def _active_long_horizon_session_id(self) -> str:
         return self._app_state.active_task.long_horizon_session_id.strip()
 
+    def _active_local_task_session_id(self) -> str:
+        return self._app_state.local_task_session.session_id.strip()
+
     def _refresh_time_control_summary(self) -> None:
         if self._time_summary_var is None:
             return
         task = self._app_state.active_task
-        if task.execution_mode == "long_horizon" and task.long_horizon_session_id:
+        local_task_session = self._app_state.local_task_session
+        if (
+            local_task_session.session_id
+            and local_task_session.status not in {"inactive", "stopped", "killed", "completed", "failed"}
+        ):
+            summary = (
+                "Active local session:"
+                f" {local_task_session.status}"
+                f" | mode {local_task_session.control_mode}"
+                f" | target {local_task_session.current_target or '(none)'}"
+                f" | approvals {len(local_task_session.pending_approval_summaries)}"
+            )
+        elif task.execution_mode == "long_horizon" and task.long_horizon_session_id:
             summary = (
                 "Active mode: Long-horizon"
                 f" | Wall clock {task.requested_thinking_minutes or task.thinking_minutes} min"
@@ -2069,6 +3111,71 @@ class DashboardService:
             else:
                 summary = f"Planned mode: Interactive | {planned_minutes} minute budget."
         self._time_summary_var.set(summary)
+
+    def _format_local_task_session_progress(self, session: DashboardLocalTaskSessionState) -> str:
+        if not session.session_id:
+            return "\n".join(
+                (
+                    "Local task session: inactive",
+                    "Start a local session before running capability-scoped file, shell, browser, or desktop actions.",
+                )
+            )
+        return "\n".join(
+            (
+                "Local task session:",
+                f"Session: {session.session_id}",
+                f"Label: {session.label or '(none)'}",
+                f"Status: {session.status}",
+                f"Control mode: {session.control_mode}",
+                (
+                    f"Observation tier: requested {session.requested_observation_tier} | "
+                    f"effective {session.effective_observation_tier}"
+                ),
+                (
+                    "Observation degraded reason: "
+                    + (session.observation_degraded_reason or "(none)")
+                ),
+                (
+                    "Observation degraded features: "
+                    + (
+                        ", ".join(session.observation_degraded_features)
+                        if session.observation_degraded_features
+                        else "(none)"
+                    )
+                ),
+                f"Current target: {session.current_target or '(none)'}",
+                f"Pending approvals: {len(session.pending_approval_summaries)}",
+                (
+                    "Approval queue: "
+                    + (" | ".join(session.pending_approval_summaries) if session.pending_approval_summaries else "(none)")
+                ),
+                f"Last action: {session.last_action_summary or '(none)'}",
+                f"Last request: {session.last_request_id or '(none)'}",
+                (
+                    "Continuous capture: "
+                    + (
+                        f"active | {session.continuous_capture_retained_frame_count} retained / "
+                        f"{session.continuous_capture_frame_count} sampled | "
+                        f"{session.continuous_capture_max_width}x{session.continuous_capture_max_height} @ "
+                        f"{session.continuous_capture_fps:.2f} fps"
+                        if session.continuous_capture_active
+                        else "(inactive)"
+                    )
+                ),
+                (
+                    "Last observation: "
+                    + (
+                        f"{session.last_observation_tier} | {session.last_observation_status} | "
+                        f"{session.last_observation_summary}"
+                        if session.last_observation_tier or session.last_observation_summary
+                        else "(none)"
+                    )
+                ),
+                f"Kill switch: {'engaged' if session.kill_switch_engaged else 'clear'}",
+                f"Last control reason: {session.last_control_reason or '(none)'}",
+                f"Last error: {session.last_error or '(none)'}",
+            )
+        )
 
     def _format_duration(self, seconds: float | None) -> str:
         if seconds is None:
@@ -2177,6 +3284,10 @@ class DashboardService:
                     + (", ".join(view.active_heavy_roles) if view.active_heavy_roles else "(none)")
                 ),
                 (
+                    "Governor: "
+                    + (view.governor_summary if view.governor_summary else "nominal")
+                ),
+                (
                     "Advisory available: "
                     + ("yes" if view.advisory_available else "no")
                     + (
@@ -2215,6 +3326,77 @@ class DashboardService:
                 *(cache_lines or ["(none)"]),
             )
         )
+
+    def _format_capability_registry_view(
+        self,
+        view: CapabilityRegistryView,
+        readiness_lines: list[str],
+    ) -> str:
+        """Render typed capability registrations, recent decisions, and recent audits."""
+        lines: list[str] = list(readiness_lines)
+        if view.registrations:
+            if lines:
+                lines.append("Registry:")
+            for registration in view.registrations:
+                lines.extend(
+                    [
+                        (
+                            f"{registration.capability_type.value}: {registration.status.value}"
+                            f" | enabled {'yes' if registration.enabled else 'no'}"
+                            f" | default {registration.default_policy_outcome.value}"
+                            f" | executor {registration.executor_kind}"
+                        ),
+                        f"Reason: {registration.reason or '(none)'}",
+                        f"Detail: {registration.detail or '(none)'}",
+                        (
+                            "Allowlist: "
+                            + (
+                                ", ".join(registration.allowlisted_targets)
+                                if registration.allowlisted_targets
+                                else "(none)"
+                            )
+                        ),
+                        (
+                            "Supported actions: "
+                            + (
+                                ", ".join(registration.supported_actions)
+                                if registration.supported_actions
+                                else "(none)"
+                            )
+                        ),
+                        "",
+                    ]
+                )
+        if view.recent_decisions:
+            lines.append("Recent policy decisions:")
+            for decision in view.recent_decisions:
+                lines.extend(
+                    [
+                        (
+                            f"{decision.request_id}: {decision.capability_type.value} / {decision.action_name}"
+                            f" -> {decision.outcome.value}"
+                        ),
+                        "Reasons: " + (", ".join(decision.reason_codes) if decision.reason_codes else "(none)"),
+                        f"Detail: {decision.detail or '(none)'}",
+                        "",
+                    ]
+                )
+        if view.recent_audits:
+            lines.append("Recent audits:")
+            for record in view.recent_audits:
+                lines.extend(
+                    [
+                        (
+                            f"{record.audit_id}: {record.event_type.value}"
+                            f" | {record.capability_type.value}"
+                            f" | {record.summary}"
+                        ),
+                        "Reasons: " + (", ".join(record.reason_codes) if record.reason_codes else "(none)"),
+                        f"Detail: {record.detail or '(none)'}",
+                        "",
+                    ]
+                )
+        return "\n".join(lines).strip() if lines else "No capability-gating data yet."
 
     def _format_model_role_detail(
         self,
@@ -2572,6 +3754,15 @@ class DashboardService:
             self._observation_tier_var.set(str(profile.observation.get("tier", "screenshot_on_demand")))
         if self._cloud_mode_var is not None:
             self._cloud_mode_var.set(str(profile.cloud.get("mode", "auxiliary_only")))
+        cloud_capability_modes = dict(profile.cloud.get("capability_modes", {}))
+        for capability, _label in _CLOUD_CAPABILITY_CONTROL_LABELS:
+            variable = self._cloud_capability_vars.get(capability.value)
+            if variable is None:
+                continue
+            variable.set(
+                str(cloud_capability_modes.get(capability.value, CloudOffloadMode.DISABLED.value)).strip()
+                == CloudOffloadMode.AUXILIARY_ONLY.value
+            )
         if self._log_runtime_events_var is not None:
             self._log_runtime_events_var.set(bool(profile.privacy.get("log_runtime_events", True)))
         if self._allow_cloud_content_var is not None:
@@ -2664,6 +3855,15 @@ class DashboardService:
             self._observation_tier_var.get() if self._observation_tier_var is not None else "screenshot_on_demand"
         )
         cloud_mode = self._cloud_mode_var.get() if self._cloud_mode_var is not None else "auxiliary_only"
+        cloud_capability_modes = {
+            capability.value: (
+                CloudOffloadMode.AUXILIARY_ONLY.value
+                if bool(self._cloud_capability_vars.get(capability.value).get())
+                else CloudOffloadMode.DISABLED.value
+            )
+            for capability, _label in _CLOUD_CAPABILITY_CONTROL_LABELS
+            if self._cloud_capability_vars.get(capability.value) is not None
+        }
         log_runtime_events = (
             bool(self._log_runtime_events_var.get()) if self._log_runtime_events_var is not None else True
         )
@@ -2772,6 +3972,11 @@ class DashboardService:
                     )
                 ),
             },
+            coding={
+                **dict(current.coding),
+                "default_language": str(current.coding.get("default_language", self.config.coding_mode.default_language)).strip()
+                or self.config.coding_mode.default_language,
+            },
             desktop={
                 **current.desktop,
                 "enabled": desktop_enabled,
@@ -2787,7 +3992,15 @@ class DashboardService:
             cloud={
                 **current.cloud,
                 "mode": cloud_mode,
-                "enabled": cloud_mode != "disabled",
+                "enabled": cloud_mode != "disabled"
+                and any(mode != CloudOffloadMode.DISABLED.value for mode in cloud_capability_modes.values()),
+                "provider_family": str(current.cloud.get("provider_family", "provider_agnostic")).strip()
+                or "provider_agnostic",
+                "max_payload_bytes": int(current.cloud.get("max_payload_bytes", 1024 * 256) or 1024 * 256),
+                "max_retries": int(current.cloud.get("max_retries", 1) or 0),
+                "fallback_behavior": str(current.cloud.get("fallback_behavior", "retry_then_local")).strip()
+                or "retry_then_local",
+                "capability_modes": cloud_capability_modes,
             },
             privacy={
                 **current.privacy,
@@ -2798,7 +4011,7 @@ class DashboardService:
             ui={
                 **current.ui,
                 "show_debug_pane": show_debug_pane,
-                "app_shell": "tkinter",
+                "app_shell": str(current.ui.get("app_shell", "tkinter")),
             },
         )
         profile.validate()
@@ -2866,6 +4079,54 @@ class DashboardService:
         if self.request_action("long_horizon.cancel", {"session_id": session_id}):
             if self._run_status_var is not None:
                 self._run_status_var.set(f"Cancel requested for long-horizon session '{session_id}'.")
+
+    def _on_start_local_task_session_clicked(self) -> None:
+        label = self._question_var.get().strip() if self._question_var is not None else ""
+        if not label:
+            label = "Local task session"
+        if self.request_action("local_task_session.start", {"label": label}):
+            if self._run_status_var is not None:
+                self._run_status_var.set(f"Starting local task session '{label}'.")
+
+    def _on_pause_local_task_session_clicked(self) -> None:
+        session_id = self._active_local_task_session_id()
+        if not session_id:
+            if self._run_status_var is not None:
+                self._run_status_var.set("No active local task session is available to pause.")
+            return
+        if self.request_action("local_task_session.pause", {"session_id": session_id}):
+            if self._run_status_var is not None:
+                self._run_status_var.set(f"Pause requested for local task session '{session_id}'.")
+
+    def _on_resume_local_task_session_clicked(self) -> None:
+        session_id = self._active_local_task_session_id()
+        if not session_id:
+            if self._run_status_var is not None:
+                self._run_status_var.set("No local task session is selected for resume.")
+            return
+        if self.request_action("local_task_session.resume", {"session_id": session_id}):
+            if self._run_status_var is not None:
+                self._run_status_var.set(f"Resume requested for local task session '{session_id}'.")
+
+    def _on_stop_local_task_session_clicked(self) -> None:
+        session_id = self._active_local_task_session_id()
+        if not session_id:
+            if self._run_status_var is not None:
+                self._run_status_var.set("No active local task session is available to stop.")
+            return
+        if self.request_action("local_task_session.stop", {"session_id": session_id}):
+            if self._run_status_var is not None:
+                self._run_status_var.set(f"Stop requested for local task session '{session_id}'.")
+
+    def _on_kill_local_task_session_clicked(self) -> None:
+        session_id = self._active_local_task_session_id()
+        if not session_id:
+            if self._run_status_var is not None:
+                self._run_status_var.set("No active local task session is available for kill-switch.")
+            return
+        if self.request_action("local_task_session.kill", {"session_id": session_id}):
+            if self._run_status_var is not None:
+                self._run_status_var.set(f"Kill-switch engaged for local task session '{session_id}'.")
 
     def _on_run_clicked(self) -> None:
         question = self._question_var.get().strip() if self._question_var is not None else ""
@@ -3253,15 +4514,58 @@ class DashboardService:
             if self._code_status_var is not None:
                 self._code_status_var.set("Analyzing the current snippet.")
 
+    def _on_run_coding_task_clicked(self) -> None:
+        snippet = self._code_input_text.get("1.0", "end").strip() if self._code_input_text is not None else ""
+        source_path = self._code_source_path_var.get().strip() if self._code_source_path_var is not None else ""
+        prompt = self._code_request_var.get().strip() if self._code_request_var is not None else ""
+        task_type = self._coding_task_type_var.get().strip() if self._coding_task_type_var is not None else "code_review"
+        language = self._coding_language_var.get().strip() if self._coding_language_var is not None else self.config.coding_mode.default_language
+        framework = self._coding_framework_var.get().strip() if self._coding_framework_var is not None else ""
+        if not prompt and not source_path and not snippet:
+            if self._code_status_var is not None:
+                self._code_status_var.set("Enter a coding prompt, file path, or snippet before running Coding Mode.")
+            return
+        if self.request_action(
+            "coding.run_task",
+            {
+                "task_type": task_type,
+                "prompt": prompt,
+                "language": language,
+                "framework": framework,
+                "path": source_path,
+                "text": snippet,
+            },
+        ):
+            if self._code_status_var is not None:
+                self._code_status_var.set(f"Running Coding Mode task '{task_type}'.")
+
+    def _on_run_coding_practice_clicked(self) -> None:
+        if self.request_action("coding.practice_once", {}):
+            if self._code_status_var is not None:
+                self._code_status_var.set("Running one bounded Coding Dojo cycle.")
+
     def _on_clear_code_clicked(self) -> None:
         if self.request_action("code.clear", {}):
             if self._code_status_var is not None:
                 self._code_status_var.set("Clearing the current code-specialist result.")
+        if self.request_action("coding.clear", {}):
+            if self._code_status_var is not None:
+                self._code_status_var.set("Clearing the current code and Coding Mode results.")
 
     def _on_refresh_readiness_clicked(self) -> None:
         if self.request_action("readiness.refresh", {}):
             if self._app_notice_var is not None:
                 self._app_notice_var.set("Refreshing readiness report.")
+
+    def _on_export_readiness_clicked(self) -> None:
+        export_path = self._readiness_export_path_var.get().strip() if self._readiness_export_path_var is not None else ""
+        if not export_path:
+            if self._app_notice_var is not None:
+                self._app_notice_var.set("Enter an export directory before writing the packaged preflight report.")
+            return
+        if self.request_action("readiness.export_report", {"path": export_path}):
+            if self._app_notice_var is not None:
+                self._app_notice_var.set(f"Exporting packaged preflight artifacts to '{export_path}'.")
 
     def _on_window_close(self) -> None:
         self._stop_flag.set()

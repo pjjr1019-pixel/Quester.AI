@@ -618,6 +618,20 @@ class Phase19SpecialistControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Qwen/Qwen2.5-Coder-1.5B-Instruct", " ".join(state.model_role_action.guidance))
 
         await self.orchestrator._run_dashboard_action(
+            action="model.install_guidance",
+            payload={"role": "vision"},
+        )
+        state = self.orchestrator.dashboard.app_state_snapshot()
+        self.assertIn("HuggingFaceTB/SmolVLM-256M-Instruct", " ".join(state.model_role_action.guidance))
+
+        await self.orchestrator._run_dashboard_action(
+            action="model.install_guidance",
+            payload={"role": "specialist_perception"},
+        )
+        state = self.orchestrator.dashboard.app_state_snapshot()
+        self.assertIn("PaddleOCR", " ".join(state.model_role_action.guidance))
+
+        await self.orchestrator._run_dashboard_action(
             action="model.test_ping",
             payload={"role": "reranker"},
         )

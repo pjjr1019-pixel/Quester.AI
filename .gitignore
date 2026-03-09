@@ -22,6 +22,7 @@ dist/
 
 # Local runtime data
 logs/
+runtime_logs/
 *.sqlite3
 test_*_logs/
 

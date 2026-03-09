@@ -116,6 +116,18 @@ class LongHorizonSessionState(str, Enum):
     FAILED = "failed"
 
 
+class LocalTaskSessionState(str, Enum):
+    """Lifecycle state for explicit local task execution sessions."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    KILLED = "killed"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class SeverityLevel(str, Enum):
     """Severity values for issues and diagnostics."""
 
@@ -205,6 +217,40 @@ class ModelLoadPolicy(str, Enum):
     ALWAYS_ON = "always_on"
     ON_DEMAND = "on_demand"
     PREFER_IDLE_UNLOAD = "prefer_idle_unload"
+
+
+class CodingTaskType(str, Enum):
+    """Supported bounded coding-task workflows."""
+
+    FEATURE_GENERATION = "feature_generation"
+    BUG_FIXING = "bug_fixing"
+    REFACTORING = "refactoring"
+    TEST_GENERATION = "test_generation"
+    CODE_REVIEW = "code_review"
+    EXPLANATION = "explanation"
+    PROJECT_SCAFFOLDING = "project_scaffolding"
+    ARCHITECTURE_PLANNING = "architecture_planning"
+    PRACTICE = "practice"
+
+
+class CodingRole(str, Enum):
+    """Specialized coding-role assignments used by Coding Mode."""
+
+    PLANNER = "planner"
+    GENERATOR = "generator"
+    DEBUGGER = "debugger"
+    REVIEWER = "reviewer"
+    TEST_WRITER = "test_writer"
+    SUMMARIZER = "summarizer"
+    REFACTORER = "refactorer"
+
+
+class CodingPatternTier(str, Enum):
+    """Promotion tier for learned coding patterns."""
+
+    VERIFIED = "verified"
+    CANDIDATE = "candidate"
+    REJECTED = "rejected"
 
 
 @dataclass(slots=True, frozen=True)
@@ -2899,6 +2945,10 @@ class ModelRegistryView(DictSerializable):
     active_heavy_roles: tuple[str, ...] = ()
     heavy_slot_limit: int = 2
     fallback_reasons: dict[str, str] = field(default_factory=dict)
+    governor_active: bool = False
+    governor_pressure_reasons: tuple[str, ...] = ()
+    governor_degraded_features: tuple[str, ...] = ()
+    governor_summary: str = ""
     last_route_decisions: tuple[ModelRouteDecision, ...] = ()
     advisory_available: bool = False
     optimizer_subscriptions: tuple[str, ...] = ()
@@ -2926,6 +2976,14 @@ class ModelRegistryView(DictSerializable):
                 str(key): str(value)
                 for key, value in dict(data.get("fallback_reasons", {})).items()
             },
+            governor_active=bool(data.get("governor_active", False)),
+            governor_pressure_reasons=tuple(
+                str(item) for item in data.get("governor_pressure_reasons", ())
+            ),
+            governor_degraded_features=tuple(
+                str(item) for item in data.get("governor_degraded_features", ())
+            ),
+            governor_summary=str(data.get("governor_summary", "")),
             last_route_decisions=tuple(
                 ModelRouteDecision.from_dict(item) for item in data.get("last_route_decisions", ())
             ),
@@ -3055,6 +3113,8 @@ class DashboardRuntimeHealth(DictSerializable):
     embedding_backend: str = ""
     active_generation_jobs: int = 0
     active_embedding_jobs: int = 0
+    active_heavy_roles: tuple[str, ...] = ()
+    heavy_slot_limit: int = 2
     last_used_at: str = ""
     fallback_active: bool = False
     fallback_reason: str = ""
@@ -3062,6 +3122,17 @@ class DashboardRuntimeHealth(DictSerializable):
     total_ram_gb: float | None = None
     generation_backend_vram_gb: float | None = None
     embedding_backend_vram_gb: float | None = None
+    governor_active: bool = False
+    governor_pressure_reasons: tuple[str, ...] = ()
+    governor_degraded_features: tuple[str, ...] = ()
+    queue_pressure: bool = False
+    backend_health_degraded: bool = False
+    allow_continuous_capture: bool = True
+    allow_ocr_on_step: bool = True
+    allow_vision_on_step: bool = True
+    allow_optional_heavy_residency: bool = True
+    allow_background_work: bool = True
+    governor_summary: str = ""
     telemetry_enabled: bool = False
     last_error: str = ""
 
@@ -3073,6 +3144,8 @@ class DashboardRuntimeHealth(DictSerializable):
             embedding_backend=str(data.get("embedding_backend", "")),
             active_generation_jobs=int(data.get("active_generation_jobs", 0)),
             active_embedding_jobs=int(data.get("active_embedding_jobs", 0)),
+            active_heavy_roles=tuple(str(item) for item in data.get("active_heavy_roles", ())),
+            heavy_slot_limit=int(data.get("heavy_slot_limit", 2)),
             last_used_at=str(data.get("last_used_at", "")),
             fallback_active=bool(data.get("fallback_active", False)),
             fallback_reason=str(data.get("fallback_reason", "")),
@@ -3090,6 +3163,21 @@ class DashboardRuntimeHealth(DictSerializable):
                 if data.get("embedding_backend_vram_gb") is not None
                 else None
             ),
+            governor_active=bool(data.get("governor_active", False)),
+            governor_pressure_reasons=tuple(
+                str(item) for item in data.get("governor_pressure_reasons", ())
+            ),
+            governor_degraded_features=tuple(
+                str(item) for item in data.get("governor_degraded_features", ())
+            ),
+            queue_pressure=bool(data.get("queue_pressure", False)),
+            backend_health_degraded=bool(data.get("backend_health_degraded", False)),
+            allow_continuous_capture=bool(data.get("allow_continuous_capture", True)),
+            allow_ocr_on_step=bool(data.get("allow_ocr_on_step", True)),
+            allow_vision_on_step=bool(data.get("allow_vision_on_step", True)),
+            allow_optional_heavy_residency=bool(data.get("allow_optional_heavy_residency", True)),
+            allow_background_work=bool(data.get("allow_background_work", True)),
+            governor_summary=str(data.get("governor_summary", "")),
             telemetry_enabled=bool(data.get("telemetry_enabled", False)),
             last_error=str(data.get("last_error", "")),
         )
@@ -3242,6 +3330,944 @@ class DashboardTaskState(DictSerializable):
 
 
 @dataclass(slots=True, frozen=True)
+class FileOperationSpec(DictSerializable):
+    """Typed file-operation request payload used by the capability policy layer."""
+
+    operation: str
+    source_path: str
+    destination_path: str = ""
+    recursive: bool = False
+
+    def __post_init__(self) -> None:
+        _require(bool(self.operation.strip()), "FileOperationSpec.operation must not be empty.")
+        _require(bool(self.source_path.strip()), "FileOperationSpec.source_path must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> FileOperationSpec:
+        return cls(
+            operation=str(data.get("operation", "")),
+            source_path=str(data.get("source_path", "")),
+            destination_path=str(data.get("destination_path", "")),
+            recursive=bool(data.get("recursive", False)),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ShellCommandSpec(DictSerializable):
+    """Typed shell-command request payload used by the capability policy layer."""
+
+    command: str
+    args: tuple[str, ...] = ()
+    working_directory: str = ""
+
+    def __post_init__(self) -> None:
+        _require(bool(self.command.strip()), "ShellCommandSpec.command must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ShellCommandSpec:
+        return cls(
+            command=str(data.get("command", "")),
+            args=tuple(str(item) for item in data.get("args", ())),
+            working_directory=str(data.get("working_directory", "")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class BrowserActionSpec(DictSerializable):
+    """Typed browser-action request payload used by the capability policy layer."""
+
+    action: str
+    url: str = ""
+    domain: str = ""
+    selector: str = ""
+    text: str = ""
+
+    def __post_init__(self) -> None:
+        _require(bool(self.action.strip()), "BrowserActionSpec.action must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> BrowserActionSpec:
+        return cls(
+            action=str(data.get("action", "")),
+            url=str(data.get("url", "")),
+            domain=str(data.get("domain", "")),
+            selector=str(data.get("selector", "")),
+            text=str(data.get("text", "")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class AppFocusSpec(DictSerializable):
+    """Typed app or window focus request payload used by the capability policy layer."""
+
+    app_name: str
+    window_title: str = ""
+    require_visible_match: bool = True
+
+    def __post_init__(self) -> None:
+        _require(bool(self.app_name.strip()), "AppFocusSpec.app_name must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> AppFocusSpec:
+        return cls(
+            app_name=str(data.get("app_name", "")),
+            window_title=str(data.get("window_title", "")),
+            require_visible_match=bool(data.get("require_visible_match", True)),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ClipboardActionSpec(DictSerializable):
+    """Typed clipboard-action request payload used by the capability policy layer."""
+
+    action: str
+    text: str = ""
+
+    def __post_init__(self) -> None:
+        _require(bool(self.action.strip()), "ClipboardActionSpec.action must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ClipboardActionSpec:
+        return cls(
+            action=str(data.get("action", "")),
+            text=str(data.get("text", "")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ScreenshotSpec(DictSerializable):
+    """Typed screenshot request payload used by the capability policy layer."""
+
+    save_path: str
+    region: str = "full_screen"
+
+    def __post_init__(self) -> None:
+        _require(bool(self.save_path.strip()), "ScreenshotSpec.save_path must not be empty.")
+        _require(bool(self.region.strip()), "ScreenshotSpec.region must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ScreenshotSpec:
+        return cls(
+            save_path=str(data.get("save_path", "")),
+            region=str(data.get("region", "full_screen")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class OCRRequestSpec(DictSerializable):
+    """Typed OCR request payload used by the capability policy layer."""
+
+    source_image_path: str
+    languages: tuple[str, ...] = ()
+    region: str = "full_image"
+
+    def __post_init__(self) -> None:
+        _require(bool(self.source_image_path.strip()), "OCRRequestSpec.source_image_path must not be empty.")
+        _require(bool(self.region.strip()), "OCRRequestSpec.region must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OCRRequestSpec:
+        return cls(
+            source_image_path=str(data.get("source_image_path", "")),
+            languages=tuple(str(item) for item in data.get("languages", ())),
+            region=str(data.get("region", "full_image")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DesktopInputSpec(DictSerializable):
+    """Typed desktop-input request payload used by the capability policy layer."""
+
+    action: str
+    text: str = ""
+    keys: tuple[str, ...] = ()
+    target: str = ""
+    x: int | None = None
+    y: int | None = None
+
+    def __post_init__(self) -> None:
+        _require(bool(self.action.strip()), "DesktopInputSpec.action must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DesktopInputSpec:
+        raw_x = data.get("x")
+        raw_y = data.get("y")
+        return cls(
+            action=str(data.get("action", "")),
+            text=str(data.get("text", "")),
+            keys=tuple(str(item) for item in data.get("keys", ())),
+            target=str(data.get("target", "")),
+            x=None if raw_x in (None, "") else int(raw_x),
+            y=None if raw_y in (None, "") else int(raw_y),
+        )
+
+
+class CloudOffloadMode(str, Enum):
+    """Allowed cloud-dispatch modes before provider-specific adapters exist."""
+
+    DISABLED = "disabled"
+    AUXILIARY_ONLY = "auxiliary_only"
+
+
+class CloudOffloadCapability(str, Enum):
+    """Per-capability cloud helper categories kept independent in the user-facing control surface."""
+
+    OFFLINE_REPLAY = "offline_replay"
+    EXPORT = "export"
+    BROWSER_HELPER = "browser_helper"
+    OCR_HELPER = "ocr_helper"
+    VISION_HELPER = "vision_helper"
+    EMBEDDING_HELPER = "embedding_helper"
+    BACKGROUND_MAINTENANCE = "background_maintenance"
+
+
+class CloudJobPayloadClass(str, Enum):
+    """Provider-agnostic payload categories that future cloud adapters must honor."""
+
+    METADATA_ONLY = "metadata_only"
+    TEXT_SNIPPET = "text_snippet"
+    IMAGE_REGION = "image_region"
+    DOCUMENT_CHUNK = "document_chunk"
+    EMBEDDING_BATCH = "embedding_batch"
+    EXPORT_BUNDLE = "export_bundle"
+
+
+class CloudJobPrivacyClass(str, Enum):
+    """Privacy boundary used before any cloud helper may receive task data."""
+
+    METADATA_ONLY = "metadata_only"
+    APPROVED_CONTENT = "approved_content"
+    DENIED_CONTENT = "denied_content"
+
+
+class CloudFallbackBehavior(str, Enum):
+    """Fallback behaviors allowed by the Phase 23 guardrails."""
+
+    LOCAL_ONLY = "local_only"
+    RETRY_THEN_LOCAL = "retry_then_local"
+
+
+@dataclass(slots=True, frozen=True)
+class CloudJobContract(DictSerializable):
+    """Provider-agnostic cloud offload contract used before any concrete provider adapter is bound."""
+
+    job_id: str
+    capability: CloudOffloadCapability
+    payload_class: CloudJobPayloadClass
+    privacy_class: CloudJobPrivacyClass
+    max_payload_bytes: int
+    max_retries: int = 1
+    fallback_behavior: CloudFallbackBehavior = CloudFallbackBehavior.RETRY_THEN_LOCAL
+    dispatch_mode: CloudOffloadMode = CloudOffloadMode.AUXILIARY_ONLY
+    provider_family: str = "provider_agnostic"
+    content_approved: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.job_id.strip()), "CloudJobContract.job_id must not be empty.")
+        _require(bool(self.provider_family.strip()), "CloudJobContract.provider_family must not be empty.")
+        _require(
+            self.dispatch_mode == CloudOffloadMode.AUXILIARY_ONLY,
+            "CloudJobContract.dispatch_mode must remain auxiliary_only in Phase 23.0.x.",
+        )
+        _require(
+            1024 <= self.max_payload_bytes <= 10 * 1024 * 1024,
+            "CloudJobContract.max_payload_bytes must stay between 1024 and 10485760.",
+        )
+        _require(0 <= self.max_retries <= 3, "CloudJobContract.max_retries must stay between 0 and 3.")
+        if self.privacy_class == CloudJobPrivacyClass.APPROVED_CONTENT:
+            _require(
+                self.content_approved,
+                "CloudJobContract.content_approved must be true for approved_content jobs.",
+            )
+        else:
+            _require(
+                not self.content_approved,
+                "CloudJobContract.content_approved must remain false unless privacy_class is approved_content.",
+            )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CloudJobContract:
+        return cls(
+            job_id=str(data.get("job_id", "")),
+            capability=_parse_enum(
+                CloudOffloadCapability,
+                data.get("capability", CloudOffloadCapability.BACKGROUND_MAINTENANCE),
+            ),
+            payload_class=_parse_enum(
+                CloudJobPayloadClass,
+                data.get("payload_class", CloudJobPayloadClass.METADATA_ONLY),
+            ),
+            privacy_class=_parse_enum(
+                CloudJobPrivacyClass,
+                data.get("privacy_class", CloudJobPrivacyClass.METADATA_ONLY),
+            ),
+            max_payload_bytes=int(data.get("max_payload_bytes", 1024 * 256) or 1024 * 256),
+            max_retries=int(data.get("max_retries", 1) or 0),
+            fallback_behavior=_parse_enum(
+                CloudFallbackBehavior,
+                data.get("fallback_behavior", CloudFallbackBehavior.RETRY_THEN_LOCAL),
+            ),
+            dispatch_mode=_parse_enum(
+                CloudOffloadMode,
+                data.get("dispatch_mode", CloudOffloadMode.AUXILIARY_ONLY),
+            ),
+            provider_family=str(data.get("provider_family", "provider_agnostic")),
+            content_approved=bool(data.get("content_approved", False)),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+class CloudOffloadOutcome(str, Enum):
+    """Final outcome recorded for one auxiliary cloud dispatch attempt."""
+
+    BLOCKED = "blocked"
+    SUCCEEDED = "succeeded"
+    LOCAL_FALLBACK = "local_fallback"
+    FAILED = "failed"
+
+
+@dataclass(slots=True, frozen=True)
+class CloudOffloadRecord(DictSerializable):
+    """Append-only audit record for one auxiliary cloud helper dispatch."""
+
+    dispatch_id: str
+    job_id: str
+    capability: CloudOffloadCapability
+    provider_name: str
+    provider_family: str
+    payload_class: CloudJobPayloadClass
+    privacy_class: CloudJobPrivacyClass
+    outcome: CloudOffloadOutcome
+    summary: str
+    detail: str = ""
+    fallback_behavior: CloudFallbackBehavior = CloudFallbackBehavior.RETRY_THEN_LOCAL
+    bytes_sent: int = 0
+    latency_ms: int = 0
+    retry_count: int = 0
+    local_fallback_used: bool = False
+    fallback_reason: str = ""
+    response_ref: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.dispatch_id.strip()), "CloudOffloadRecord.dispatch_id must not be empty.")
+        _require(bool(self.job_id.strip()), "CloudOffloadRecord.job_id must not be empty.")
+        _require(bool(self.provider_name.strip()), "CloudOffloadRecord.provider_name must not be empty.")
+        _require(bool(self.provider_family.strip()), "CloudOffloadRecord.provider_family must not be empty.")
+        _require(bool(self.summary.strip()), "CloudOffloadRecord.summary must not be empty.")
+        _require(self.bytes_sent >= 0, "CloudOffloadRecord.bytes_sent must be >= 0.")
+        _require(self.latency_ms >= 0, "CloudOffloadRecord.latency_ms must be >= 0.")
+        _require(self.retry_count >= 0, "CloudOffloadRecord.retry_count must be >= 0.")
+        if self.local_fallback_used:
+            _require(
+                self.outcome == CloudOffloadOutcome.LOCAL_FALLBACK,
+                "CloudOffloadRecord.local_fallback_used requires outcome=local_fallback.",
+            )
+        if self.outcome == CloudOffloadOutcome.LOCAL_FALLBACK:
+            _require(
+                self.local_fallback_used,
+                "CloudOffloadRecord.outcome=local_fallback requires local_fallback_used=true.",
+            )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CloudOffloadRecord:
+        return cls(
+            dispatch_id=str(data.get("dispatch_id", "")),
+            job_id=str(data.get("job_id", "")),
+            capability=_parse_enum(
+                CloudOffloadCapability,
+                data.get("capability", CloudOffloadCapability.BACKGROUND_MAINTENANCE),
+            ),
+            provider_name=str(data.get("provider_name", "")),
+            provider_family=str(data.get("provider_family", "provider_agnostic")),
+            payload_class=_parse_enum(
+                CloudJobPayloadClass,
+                data.get("payload_class", CloudJobPayloadClass.METADATA_ONLY),
+            ),
+            privacy_class=_parse_enum(
+                CloudJobPrivacyClass,
+                data.get("privacy_class", CloudJobPrivacyClass.METADATA_ONLY),
+            ),
+            outcome=_parse_enum(
+                CloudOffloadOutcome,
+                data.get("outcome", CloudOffloadOutcome.FAILED),
+            ),
+            summary=str(data.get("summary", "")),
+            detail=str(data.get("detail", "")),
+            fallback_behavior=_parse_enum(
+                CloudFallbackBehavior,
+                data.get("fallback_behavior", CloudFallbackBehavior.RETRY_THEN_LOCAL),
+            ),
+            bytes_sent=int(data.get("bytes_sent", 0) or 0),
+            latency_ms=int(data.get("latency_ms", 0) or 0),
+            retry_count=int(data.get("retry_count", 0) or 0),
+            local_fallback_used=bool(data.get("local_fallback_used", False)),
+            fallback_reason=str(data.get("fallback_reason", "")),
+            response_ref=str(data.get("response_ref", "")),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+class CapabilityType(str, Enum):
+    """Typed capability families used by the local task-control policy layer."""
+
+    FILE_OPERATION = "file_operation"
+    SHELL_COMMAND = "shell_command"
+    BROWSER_ACTION = "browser_action"
+    APP_WINDOW_FOCUS = "app_window_focus"
+    CLIPBOARD_ACTION = "clipboard_action"
+    SCREENSHOT = "screenshot"
+    OCR_REQUEST = "ocr_request"
+    DESKTOP_INPUT = "desktop_input"
+
+
+class CapabilityAvailabilityStatus(str, Enum):
+    """Availability state tracked for one capability in the control plane."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    DENIED_BY_POLICY = "denied_by_policy"
+    DEGRADED = "degraded"
+    REQUIRES_APPROVAL = "requires_approval"
+
+
+class CapabilityPolicyOutcome(str, Enum):
+    """Policy-decision outcome returned before any capability executor runs."""
+
+    ALLOWED = "allowed"
+    REQUIRES_APPROVAL = "requires_approval"
+    DENIED = "denied"
+    DEGRADED = "degraded"
+
+
+class CapabilityAuditEventType(str, Enum):
+    """Audit lifecycle events persisted for capability requests."""
+
+    REQUESTED = "requested"
+    POLICY_DECISION = "policy_decision"
+    APPROVAL_GRANTED = "approval_granted"
+    APPROVAL_DENIED = "approval_denied"
+    EXECUTOR_RESULT = "executor_result"
+    WARNING = "warning"
+
+
+class CapabilityExecutionStatus(str, Enum):
+    """Execution result status for stub or future live capability executors."""
+
+    SUCCEEDED = "succeeded"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
+@dataclass(slots=True, frozen=True)
+class CapabilityRequest(DictSerializable):
+    """Typed capability request evaluated by policy before any executor runs."""
+
+    request_id: str
+    capability_type: CapabilityType
+    summary: str = ""
+    file_operation: FileOperationSpec | None = None
+    shell_command: ShellCommandSpec | None = None
+    browser_action: BrowserActionSpec | None = None
+    app_focus: AppFocusSpec | None = None
+    clipboard_action: ClipboardActionSpec | None = None
+    screenshot: ScreenshotSpec | None = None
+    ocr_request: OCRRequestSpec | None = None
+    desktop_input: DesktopInputSpec | None = None
+    requires_elevation: bool = False
+    persistent_background: bool = False
+    hidden_execution: bool = False
+    touches_credentials: bool = False
+    unrestricted_scope: bool = False
+    destructive: bool = False
+    cross_app: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+    requested_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.request_id.strip()), "CapabilityRequest.request_id must not be empty.")
+        selected_specs = tuple(
+            name
+            for name, value in (
+                ("file_operation", self.file_operation),
+                ("shell_command", self.shell_command),
+                ("browser_action", self.browser_action),
+                ("app_focus", self.app_focus),
+                ("clipboard_action", self.clipboard_action),
+                ("screenshot", self.screenshot),
+                ("ocr_request", self.ocr_request),
+                ("desktop_input", self.desktop_input),
+            )
+            if value is not None
+        )
+        _require(len(selected_specs) == 1, "CapabilityRequest must define exactly one typed capability payload.")
+        expected_spec_name = {
+            CapabilityType.FILE_OPERATION: "file_operation",
+            CapabilityType.SHELL_COMMAND: "shell_command",
+            CapabilityType.BROWSER_ACTION: "browser_action",
+            CapabilityType.APP_WINDOW_FOCUS: "app_focus",
+            CapabilityType.CLIPBOARD_ACTION: "clipboard_action",
+            CapabilityType.SCREENSHOT: "screenshot",
+            CapabilityType.OCR_REQUEST: "ocr_request",
+            CapabilityType.DESKTOP_INPUT: "desktop_input",
+        }[self.capability_type]
+        _require(
+            selected_specs[0] == expected_spec_name,
+            "CapabilityRequest payload must match capability_type.",
+        )
+
+    def action_name(self) -> str:
+        """Return the canonical action or operation name for audit and policy summaries."""
+        if self.file_operation is not None:
+            return self.file_operation.operation
+        if self.shell_command is not None:
+            return self.shell_command.command
+        if self.browser_action is not None:
+            return self.browser_action.action
+        if self.app_focus is not None:
+            return "focus_window"
+        if self.clipboard_action is not None:
+            return self.clipboard_action.action
+        if self.screenshot is not None:
+            return "capture_screenshot"
+        if self.ocr_request is not None:
+            return "ocr_image"
+        if self.desktop_input is not None:
+            return self.desktop_input.action
+        return ""
+
+    def target_summary(self) -> str:
+        """Return the primary target reference for audit and policy summaries."""
+        if self.file_operation is not None:
+            return self.file_operation.destination_path or self.file_operation.source_path
+        if self.shell_command is not None:
+            return self.shell_command.working_directory
+        if self.browser_action is not None:
+            return self.browser_action.url or self.browser_action.domain
+        if self.app_focus is not None:
+            return self.app_focus.window_title or self.app_focus.app_name
+        if self.clipboard_action is not None:
+            return "clipboard"
+        if self.screenshot is not None:
+            return self.screenshot.save_path
+        if self.ocr_request is not None:
+            return self.ocr_request.source_image_path
+        if self.desktop_input is not None:
+            return self.desktop_input.target
+        return ""
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CapabilityRequest:
+        raw_file_operation = data.get("file_operation")
+        raw_shell_command = data.get("shell_command")
+        raw_browser_action = data.get("browser_action")
+        raw_app_focus = data.get("app_focus")
+        raw_clipboard_action = data.get("clipboard_action")
+        raw_screenshot = data.get("screenshot")
+        raw_ocr_request = data.get("ocr_request")
+        raw_desktop_input = data.get("desktop_input")
+        return cls(
+            request_id=str(data.get("request_id", "")),
+            capability_type=_parse_enum(CapabilityType, data.get("capability_type", CapabilityType.FILE_OPERATION)),
+            summary=str(data.get("summary", "")),
+            file_operation=(
+                FileOperationSpec.from_dict(raw_file_operation)
+                if isinstance(raw_file_operation, Mapping)
+                else None
+            ),
+            shell_command=(
+                ShellCommandSpec.from_dict(raw_shell_command)
+                if isinstance(raw_shell_command, Mapping)
+                else None
+            ),
+            browser_action=(
+                BrowserActionSpec.from_dict(raw_browser_action)
+                if isinstance(raw_browser_action, Mapping)
+                else None
+            ),
+            app_focus=(
+                AppFocusSpec.from_dict(raw_app_focus)
+                if isinstance(raw_app_focus, Mapping)
+                else None
+            ),
+            clipboard_action=(
+                ClipboardActionSpec.from_dict(raw_clipboard_action)
+                if isinstance(raw_clipboard_action, Mapping)
+                else None
+            ),
+            screenshot=(
+                ScreenshotSpec.from_dict(raw_screenshot)
+                if isinstance(raw_screenshot, Mapping)
+                else None
+            ),
+            ocr_request=(
+                OCRRequestSpec.from_dict(raw_ocr_request)
+                if isinstance(raw_ocr_request, Mapping)
+                else None
+            ),
+            desktop_input=(
+                DesktopInputSpec.from_dict(raw_desktop_input)
+                if isinstance(raw_desktop_input, Mapping)
+                else None
+            ),
+            requires_elevation=bool(data.get("requires_elevation", False)),
+            persistent_background=bool(data.get("persistent_background", False)),
+            hidden_execution=bool(data.get("hidden_execution", False)),
+            touches_credentials=bool(data.get("touches_credentials", False)),
+            unrestricted_scope=bool(data.get("unrestricted_scope", False)),
+            destructive=bool(data.get("destructive", False)),
+            cross_app=bool(data.get("cross_app", False)),
+            metadata=dict(data.get("metadata", {})),
+            requested_at=_parse_datetime(data.get("requested_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CapabilityPolicyDecision(DictSerializable):
+    """Typed policy decision produced before any capability executor runs."""
+
+    request_id: str
+    capability_type: CapabilityType
+    action_name: str
+    outcome: CapabilityPolicyOutcome
+    availability: CapabilityAvailabilityStatus
+    requires_approval: bool = False
+    reason_codes: tuple[str, ...] = ()
+    detail: str = ""
+    warnings: tuple[str, ...] = ()
+    decided_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.request_id.strip()), "CapabilityPolicyDecision.request_id must not be empty.")
+        _require(bool(self.action_name.strip()), "CapabilityPolicyDecision.action_name must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CapabilityPolicyDecision:
+        return cls(
+            request_id=str(data.get("request_id", "")),
+            capability_type=_parse_enum(CapabilityType, data.get("capability_type", CapabilityType.FILE_OPERATION)),
+            action_name=str(data.get("action_name", "")),
+            outcome=_parse_enum(CapabilityPolicyOutcome, data.get("outcome", CapabilityPolicyOutcome.DENIED)),
+            availability=_parse_enum(
+                CapabilityAvailabilityStatus,
+                data.get("availability", CapabilityAvailabilityStatus.UNAVAILABLE),
+            ),
+            requires_approval=bool(data.get("requires_approval", False)),
+            reason_codes=tuple(str(item) for item in data.get("reason_codes", ())),
+            detail=str(data.get("detail", "")),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            decided_at=_parse_datetime(data.get("decided_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CapabilityRegistration(DictSerializable):
+    """Typed registry entry describing one capability's current policy and availability."""
+
+    capability_type: CapabilityType
+    summary: str
+    available: bool = True
+    enabled: bool = False
+    status: CapabilityAvailabilityStatus = CapabilityAvailabilityStatus.AVAILABLE
+    default_policy_outcome: CapabilityPolicyOutcome = CapabilityPolicyOutcome.DENIED
+    reason: str = ""
+    detail: str = ""
+    supported_actions: tuple[str, ...] = ()
+    allowlisted_targets: tuple[str, ...] = ()
+    executor_kind: str = "stub"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.summary.strip()), "CapabilityRegistration.summary must not be empty.")
+        _require(bool(self.executor_kind.strip()), "CapabilityRegistration.executor_kind must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CapabilityRegistration:
+        return cls(
+            capability_type=_parse_enum(CapabilityType, data.get("capability_type", CapabilityType.FILE_OPERATION)),
+            summary=str(data.get("summary", "")),
+            available=bool(data.get("available", True)),
+            enabled=bool(data.get("enabled", False)),
+            status=_parse_enum(
+                CapabilityAvailabilityStatus,
+                data.get("status", CapabilityAvailabilityStatus.AVAILABLE),
+            ),
+            default_policy_outcome=_parse_enum(
+                CapabilityPolicyOutcome,
+                data.get("default_policy_outcome", CapabilityPolicyOutcome.DENIED),
+            ),
+            reason=str(data.get("reason", "")),
+            detail=str(data.get("detail", "")),
+            supported_actions=tuple(str(item) for item in data.get("supported_actions", ())),
+            allowlisted_targets=tuple(str(item) for item in data.get("allowlisted_targets", ())),
+            executor_kind=str(data.get("executor_kind", "stub")),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CapabilityAuditRecord(DictSerializable):
+    """Persisted audit record for one capability request lifecycle step."""
+
+    audit_id: str
+    request_id: str
+    capability_type: CapabilityType
+    action_name: str
+    event_type: CapabilityAuditEventType
+    summary: str
+    detail: str = ""
+    policy_outcome: str = ""
+    reason_codes: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.audit_id.strip()), "CapabilityAuditRecord.audit_id must not be empty.")
+        _require(bool(self.request_id.strip()), "CapabilityAuditRecord.request_id must not be empty.")
+        _require(bool(self.action_name.strip()), "CapabilityAuditRecord.action_name must not be empty.")
+        _require(bool(self.summary.strip()), "CapabilityAuditRecord.summary must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CapabilityAuditRecord:
+        return cls(
+            audit_id=str(data.get("audit_id", "")),
+            request_id=str(data.get("request_id", "")),
+            capability_type=_parse_enum(CapabilityType, data.get("capability_type", CapabilityType.FILE_OPERATION)),
+            action_name=str(data.get("action_name", "")),
+            event_type=_parse_enum(CapabilityAuditEventType, data.get("event_type", CapabilityAuditEventType.REQUESTED)),
+            summary=str(data.get("summary", "")),
+            detail=str(data.get("detail", "")),
+            policy_outcome=str(data.get("policy_outcome", "")),
+            reason_codes=tuple(str(item) for item in data.get("reason_codes", ())),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CapabilityExecutionResult(DictSerializable):
+    """Typed execution result returned by the stub capability executor."""
+
+    request_id: str
+    capability_type: CapabilityType
+    action_name: str
+    status: CapabilityExecutionStatus
+    summary: str
+    detail: str = ""
+    executor_kind: str = "stub"
+    output_ref: str = ""
+    warnings: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+    completed_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.request_id.strip()), "CapabilityExecutionResult.request_id must not be empty.")
+        _require(bool(self.action_name.strip()), "CapabilityExecutionResult.action_name must not be empty.")
+        _require(bool(self.summary.strip()), "CapabilityExecutionResult.summary must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CapabilityExecutionResult:
+        return cls(
+            request_id=str(data.get("request_id", "")),
+            capability_type=_parse_enum(CapabilityType, data.get("capability_type", CapabilityType.FILE_OPERATION)),
+            action_name=str(data.get("action_name", "")),
+            status=_parse_enum(CapabilityExecutionStatus, data.get("status", CapabilityExecutionStatus.BLOCKED)),
+            summary=str(data.get("summary", "")),
+            detail=str(data.get("detail", "")),
+            executor_kind=str(data.get("executor_kind", "stub")),
+            output_ref=str(data.get("output_ref", "")),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            metadata=dict(data.get("metadata", {})),
+            completed_at=_parse_datetime(data.get("completed_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CapabilityRegistryView(DictSerializable):
+    """Persisted capability-control-plane view for typed local task capabilities."""
+
+    registrations: tuple[CapabilityRegistration, ...] = ()
+    recent_decisions: tuple[CapabilityPolicyDecision, ...] = ()
+    recent_audits: tuple[CapabilityAuditRecord, ...] = ()
+    updated_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CapabilityRegistryView:
+        return cls(
+            registrations=tuple(
+                CapabilityRegistration.from_dict(item) for item in data.get("registrations", ())
+            ),
+            recent_decisions=tuple(
+                CapabilityPolicyDecision.from_dict(item) for item in data.get("recent_decisions", ())
+            ),
+            recent_audits=tuple(
+                CapabilityAuditRecord.from_dict(item) for item in data.get("recent_audits", ())
+            ),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class LocalTaskPendingApproval(DictSerializable):
+    """One approval request waiting inside an explicit local task session."""
+
+    request_id: str
+    capability_type: CapabilityType
+    action_name: str
+    summary: str
+    target: str = ""
+    requested_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.request_id.strip()), "LocalTaskPendingApproval.request_id must not be empty.")
+        _require(bool(self.action_name.strip()), "LocalTaskPendingApproval.action_name must not be empty.")
+        _require(bool(self.summary.strip()), "LocalTaskPendingApproval.summary must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> LocalTaskPendingApproval:
+        return cls(
+            request_id=str(data.get("request_id", "")),
+            capability_type=_parse_enum(CapabilityType, data.get("capability_type", CapabilityType.FILE_OPERATION)),
+            action_name=str(data.get("action_name", "")),
+            summary=str(data.get("summary", "")),
+            target=str(data.get("target", "")),
+            requested_at=_parse_datetime(data.get("requested_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class LocalTaskSession(DictSerializable):
+    """Persisted session boundary for bounded local task execution."""
+
+    session_id: str
+    label: str
+    profile_name: str = "default"
+    status: LocalTaskSessionState = LocalTaskSessionState.PENDING
+    control_mode: str = "local_task"
+    current_target: str = ""
+    last_action_summary: str = ""
+    last_request_id: str = ""
+    last_request_fingerprint: str = ""
+    repeated_request_count: int = 0
+    last_task_id: str = ""
+    continuous_capture_active: bool = False
+    continuous_capture_directory: str = ""
+    continuous_capture_frame_count: int = 0
+    continuous_capture_retained_frame_count: int = 0
+    continuous_capture_last_frame_path: str = ""
+    continuous_capture_region: str = "full_screen"
+    continuous_capture_fps: float = 0.0
+    continuous_capture_max_width: int = 0
+    continuous_capture_max_height: int = 0
+    continuous_capture_last_diff_ratio: float = 0.0
+    continuous_capture_warnings: tuple[str, ...] = ()
+    continuous_capture_last_capture_at: datetime | None = None
+    requested_observation_tier: str = "screenshot_on_demand"
+    effective_observation_tier: str = "screenshot_on_demand"
+    observation_degraded_reason: str = ""
+    observation_degraded_features: tuple[str, ...] = ()
+    last_observation_tier: str = ""
+    last_observation_status: str = ""
+    last_observation_summary: str = ""
+    last_observation_output_ref: str = ""
+    last_observation_text_preview: str = ""
+    last_observation_backend: str = ""
+    last_observation_warnings: tuple[str, ...] = ()
+    last_observation_at: datetime | None = None
+    pending_approvals: tuple[LocalTaskPendingApproval, ...] = ()
+    pause_requested: bool = False
+    stop_requested: bool = False
+    kill_switch_engaged: bool = False
+    last_control_reason: str = ""
+    last_error: str = ""
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+    ended_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        _require(bool(self.session_id.strip()), "LocalTaskSession.session_id must not be empty.")
+        _require(bool(self.label.strip()), "LocalTaskSession.label must not be empty.")
+        _require(bool(self.profile_name.strip()), "LocalTaskSession.profile_name must not be empty.")
+        _require(bool(self.control_mode.strip()), "LocalTaskSession.control_mode must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> LocalTaskSession:
+        raw_continuous_capture_last_capture_at = data.get("continuous_capture_last_capture_at")
+        raw_last_observation_at = data.get("last_observation_at")
+        raw_ended_at = data.get("ended_at")
+        return cls(
+            session_id=str(data.get("session_id", "")),
+            label=str(data.get("label", "")),
+            profile_name=str(data.get("profile_name", "default")),
+            status=_parse_enum(LocalTaskSessionState, data.get("status", LocalTaskSessionState.PENDING)),
+            control_mode=str(data.get("control_mode", "local_task")),
+            current_target=str(data.get("current_target", "")),
+            last_action_summary=str(data.get("last_action_summary", "")),
+            last_request_id=str(data.get("last_request_id", "")),
+            last_request_fingerprint=str(data.get("last_request_fingerprint", "")),
+            repeated_request_count=int(data.get("repeated_request_count", 0)),
+            last_task_id=str(data.get("last_task_id", "")),
+            continuous_capture_active=bool(data.get("continuous_capture_active", False)),
+            continuous_capture_directory=str(data.get("continuous_capture_directory", "")),
+            continuous_capture_frame_count=int(data.get("continuous_capture_frame_count", 0)),
+            continuous_capture_retained_frame_count=int(data.get("continuous_capture_retained_frame_count", 0)),
+            continuous_capture_last_frame_path=str(data.get("continuous_capture_last_frame_path", "")),
+            continuous_capture_region=str(data.get("continuous_capture_region", "full_screen")),
+            continuous_capture_fps=float(data.get("continuous_capture_fps", 0.0)),
+            continuous_capture_max_width=int(data.get("continuous_capture_max_width", 0)),
+            continuous_capture_max_height=int(data.get("continuous_capture_max_height", 0)),
+            continuous_capture_last_diff_ratio=float(data.get("continuous_capture_last_diff_ratio", 0.0)),
+            continuous_capture_warnings=tuple(
+                str(item) for item in data.get("continuous_capture_warnings", ())
+            ),
+            continuous_capture_last_capture_at=(
+                None
+                if raw_continuous_capture_last_capture_at in (None, "")
+                else _parse_datetime(raw_continuous_capture_last_capture_at)
+            ),
+            requested_observation_tier=str(
+                data.get("requested_observation_tier", "screenshot_on_demand")
+            ),
+            effective_observation_tier=str(
+                data.get("effective_observation_tier", "screenshot_on_demand")
+            ),
+            observation_degraded_reason=str(data.get("observation_degraded_reason", "")),
+            observation_degraded_features=tuple(
+                str(item) for item in data.get("observation_degraded_features", ())
+            ),
+            last_observation_tier=str(data.get("last_observation_tier", "")),
+            last_observation_status=str(data.get("last_observation_status", "")),
+            last_observation_summary=str(data.get("last_observation_summary", "")),
+            last_observation_output_ref=str(data.get("last_observation_output_ref", "")),
+            last_observation_text_preview=str(data.get("last_observation_text_preview", "")),
+            last_observation_backend=str(data.get("last_observation_backend", "")),
+            last_observation_warnings=tuple(
+                str(item) for item in data.get("last_observation_warnings", ())
+            ),
+            last_observation_at=(
+                None if raw_last_observation_at in (None, "") else _parse_datetime(raw_last_observation_at)
+            ),
+            pending_approvals=tuple(
+                LocalTaskPendingApproval.from_dict(item)
+                for item in data.get("pending_approvals", ())
+            ),
+            pause_requested=bool(data.get("pause_requested", False)),
+            stop_requested=bool(data.get("stop_requested", False)),
+            kill_switch_engaged=bool(data.get("kill_switch_engaged", False)),
+            last_control_reason=str(data.get("last_control_reason", "")),
+            last_error=str(data.get("last_error", "")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+            ended_at=None if raw_ended_at in (None, "") else _parse_datetime(raw_ended_at),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class UserSettingsProfile(DictSerializable):
     """Persisted user-facing settings profile for the local app shell."""
 
@@ -3295,10 +4321,29 @@ class UserSettingsProfile(DictSerializable):
             "enabled_roles": ("generation", "embedding"),
         }
     )
+    coding: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "mode": "assistant",
+            "practice_when_idle": False,
+            "default_language": "python",
+            "default_framework": "",
+            "sandbox_enabled": True,
+            "local_only": True,
+            "preferred_models_by_role": {},
+            "enabled_roles": tuple(role.value for role in CodingRole),
+        }
+    )
     desktop: dict[str, Any] = field(
         default_factory=lambda: {
             "enabled": False,
             "approval_policy": "approve_risky_only",
+            "enabled_capabilities": (),
+            "allowlisted_roots": (".", "logs", "examples", "models"),
+            "allowlisted_shell_commands": ("python", "git", "rg", "pytest"),
+            "allowlisted_browser_domains": ("localhost", "127.0.0.1"),
+            "allowlisted_apps": (),
+            "allowlisted_background_services": (),
         }
     )
     observation: dict[str, Any] = field(
@@ -3307,12 +4352,27 @@ class UserSettingsProfile(DictSerializable):
             "continuous_capture": False,
             "ocr_on_step": False,
             "vision_on_step": False,
+            "capture_fps": 0.5,
+            "capture_max_width": 960,
+            "capture_max_height": 540,
+            "capture_frame_history": 4,
+            "capture_diff_threshold": 0.03,
+            "region_of_interest": "full_screen",
         }
     )
     cloud: dict[str, Any] = field(
         default_factory=lambda: {
             "enabled": False,
-            "mode": "auxiliary_only",
+            "mode": CloudOffloadMode.AUXILIARY_ONLY.value,
+            "provider": "stub_cloud",
+            "provider_family": "provider_agnostic",
+            "max_payload_bytes": 1024 * 256,
+            "max_retries": 1,
+            "fallback_behavior": CloudFallbackBehavior.RETRY_THEN_LOCAL.value,
+            "capability_modes": {
+                capability.value: CloudOffloadMode.DISABLED.value
+                for capability in CloudOffloadCapability
+            },
         }
     )
     privacy: dict[str, Any] = field(
@@ -3326,12 +4386,129 @@ class UserSettingsProfile(DictSerializable):
         default_factory=lambda: {
             "show_debug_pane": True,
             "app_shell": "tkinter",
+            "shell_variant": "classic_dashboard",
+            "lightweight_mode": False,
+            "show_utility_drawer": False,
+            "reduced_motion": False,
+            "activity_strip_visible": True,
+            "task_timeline_visible": True,
+            "resource_ribbon_visible": True,
+            "shell_notifications_visible": True,
+            "shell_preset": "balanced",
         }
     )
     updated_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
         _require(bool(self.profile_name.strip()), "UserSettingsProfile.profile_name must not be empty.")
+        canonical_desktop = {
+            "enabled": False,
+            "approval_policy": "approve_risky_only",
+            "enabled_capabilities": (),
+            "allowlisted_roots": (".", "logs", "examples", "models"),
+            "allowlisted_shell_commands": ("python", "git", "rg", "pytest"),
+            "allowlisted_browser_domains": ("localhost", "127.0.0.1"),
+            "allowlisted_apps": (),
+            "allowlisted_background_services": (),
+            **dict(self.desktop),
+        }
+        canonical_desktop["enabled_capabilities"] = tuple(
+            str(item) for item in canonical_desktop.get("enabled_capabilities", ()) if str(item).strip()
+        )
+        for key in (
+            "allowlisted_roots",
+            "allowlisted_shell_commands",
+            "allowlisted_browser_domains",
+            "allowlisted_apps",
+            "allowlisted_background_services",
+        ):
+            canonical_desktop[key] = tuple(
+                str(item) for item in canonical_desktop.get(key, ()) if str(item).strip()
+            )
+        object.__setattr__(self, "desktop", canonical_desktop)
+        canonical_observation = {
+            "tier": "screenshot_on_demand",
+            "continuous_capture": False,
+            "ocr_on_step": False,
+            "vision_on_step": False,
+            "capture_fps": 0.5,
+            "capture_max_width": 960,
+            "capture_max_height": 540,
+            "capture_frame_history": 4,
+            "capture_diff_threshold": 0.03,
+            "region_of_interest": "full_screen",
+            **dict(self.observation),
+        }
+        object.__setattr__(self, "observation", canonical_observation)
+        canonical_cloud = {
+            "enabled": False,
+            "mode": CloudOffloadMode.AUXILIARY_ONLY.value,
+            "provider": "stub_cloud",
+            "provider_family": "provider_agnostic",
+            "max_payload_bytes": 1024 * 256,
+            "max_retries": 1,
+            "fallback_behavior": CloudFallbackBehavior.RETRY_THEN_LOCAL.value,
+            "capability_modes": {
+                capability.value: CloudOffloadMode.DISABLED.value
+                for capability in CloudOffloadCapability
+            },
+            **dict(self.cloud),
+        }
+        raw_capability_modes = dict(canonical_cloud.get("capability_modes", {}))
+        canonical_capability_modes = {
+            capability.value: CloudOffloadMode.DISABLED.value
+            for capability in CloudOffloadCapability
+        }
+        for raw_name, raw_mode in raw_capability_modes.items():
+            capability_name = str(raw_name).strip()
+            if not capability_name:
+                continue
+            canonical_capability_modes[capability_name] = (
+                str(raw_mode).strip() or CloudOffloadMode.DISABLED.value
+            )
+        canonical_cloud["capability_modes"] = canonical_capability_modes
+        canonical_cloud["enabled"] = bool(
+            str(canonical_cloud.get("mode", CloudOffloadMode.AUXILIARY_ONLY.value)).strip()
+            != CloudOffloadMode.DISABLED.value
+            and any(mode != CloudOffloadMode.DISABLED.value for mode in canonical_capability_modes.values())
+        )
+        object.__setattr__(self, "cloud", canonical_cloud)
+        canonical_coding = {
+            "enabled": False,
+            "mode": "assistant",
+            "practice_when_idle": False,
+            "default_language": "python",
+            "default_framework": "",
+            "sandbox_enabled": True,
+            "local_only": True,
+            "preferred_models_by_role": {},
+            "enabled_roles": tuple(role.value for role in CodingRole),
+            **dict(self.coding),
+        }
+        canonical_coding["preferred_models_by_role"] = {
+            str(key): str(value)
+            for key, value in dict(canonical_coding.get("preferred_models_by_role", {})).items()
+            if str(key).strip() and str(value).strip()
+        }
+        canonical_coding["enabled_roles"] = tuple(
+            str(item) for item in canonical_coding.get("enabled_roles", ()) if str(item).strip()
+        )
+        object.__setattr__(self, "coding", canonical_coding)
+        canonical_ui = {
+            "show_debug_pane": True,
+            "app_shell": "tkinter",
+            "shell_variant": "classic_dashboard",
+            "lightweight_mode": False,
+            "show_utility_drawer": False,
+            "reduced_motion": False,
+            "activity_strip_visible": True,
+            "task_timeline_visible": True,
+            "resource_ribbon_visible": True,
+            "shell_notifications_visible": True,
+            "shell_preset": "balanced",
+            **dict(self.ui),
+        }
+        object.__setattr__(self, "ui", canonical_ui)
 
     def validate(self) -> None:
         """Validate bounded settings values used by the lightweight local app."""
@@ -3367,6 +4544,15 @@ class UserSettingsProfile(DictSerializable):
         )
         _require(cooldown_seconds >= 0.0, "long_horizon.cooldown_seconds must be zero or positive.")
         _require(max_resume_count >= 0, "long_horizon.max_resume_count must be zero or positive.")
+        coding_mode = str(self.coding.get("mode", "assistant") or "assistant")
+        _require(
+            coding_mode in {"assistant", "coding_workspace"},
+            "coding.mode must be assistant or coding_workspace.",
+        )
+        _require(
+            bool(str(self.coding.get("default_language", "python")).strip()),
+            "coding.default_language must not be empty.",
+        )
         observation_tier = str(self.observation.get("tier", "screenshot_on_demand"))
         _require(
             observation_tier in {
@@ -3377,15 +4563,107 @@ class UserSettingsProfile(DictSerializable):
             },
             "observation.tier is not recognized.",
         )
-        cloud_mode = str(self.cloud.get("mode", "auxiliary_only"))
-        _require(cloud_mode in {"auxiliary_only", "disabled"}, "cloud.mode is not recognized.")
+        capture_fps = float(self.observation.get("capture_fps", 0.5) or 0.5)
+        _require(
+            0.05 <= capture_fps <= 2.0,
+            "observation.capture_fps must stay between 0.05 and 2.0.",
+        )
+        capture_max_width = int(self.observation.get("capture_max_width", 960) or 960)
+        capture_max_height = int(self.observation.get("capture_max_height", 540) or 540)
+        _require(
+            64 <= capture_max_width <= 1280,
+            "observation.capture_max_width must stay between 64 and 1280.",
+        )
+        _require(
+            64 <= capture_max_height <= 720,
+            "observation.capture_max_height must stay between 64 and 720.",
+        )
+        capture_frame_history = int(self.observation.get("capture_frame_history", 4) or 4)
+        _require(
+            1 <= capture_frame_history <= 8,
+            "observation.capture_frame_history must stay between 1 and 8.",
+        )
+        capture_diff_threshold = float(self.observation.get("capture_diff_threshold", 0.03) or 0.03)
+        _require(
+            0.0 < capture_diff_threshold <= 1.0,
+            "observation.capture_diff_threshold must stay between 0 and 1.",
+        )
+        region_of_interest = str(self.observation.get("region_of_interest", "full_screen"))
+        if region_of_interest.strip().lower() != "full_screen":
+            parts = [part.strip() for part in region_of_interest.split(",")]
+            _require(
+                len(parts) == 4,
+                "observation.region_of_interest must be full_screen or left,top,width,height.",
+            )
+            left, top, width, height = (int(part) for part in parts)
+            _require(left >= 0 and top >= 0, "observation.region_of_interest must start on-screen.")
+            _require(width > 0 and height > 0, "observation.region_of_interest width and height must be positive.")
+        cloud_mode = str(self.cloud.get("mode", CloudOffloadMode.AUXILIARY_ONLY.value))
+        _require(
+            cloud_mode in {item.value for item in CloudOffloadMode},
+            "cloud.mode is not recognized.",
+        )
+        provider_name = str(self.cloud.get("provider", "stub_cloud")).strip()
+        _require(bool(provider_name), "cloud.provider must not be empty.")
+        provider_family = str(self.cloud.get("provider_family", "provider_agnostic")).strip()
+        _require(bool(provider_family), "cloud.provider_family must not be empty.")
+        max_payload_bytes = int(self.cloud.get("max_payload_bytes", 1024 * 256) or 1024 * 256)
+        _require(
+            1024 <= max_payload_bytes <= 10 * 1024 * 1024,
+            "cloud.max_payload_bytes must stay between 1024 and 10485760.",
+        )
+        max_retries = int(self.cloud.get("max_retries", 1) or 0)
+        _require(0 <= max_retries <= 3, "cloud.max_retries must stay between 0 and 3.")
+        fallback_behavior = str(
+            self.cloud.get("fallback_behavior", CloudFallbackBehavior.RETRY_THEN_LOCAL.value)
+        ).strip()
+        _require(
+            fallback_behavior in {item.value for item in CloudFallbackBehavior},
+            "cloud.fallback_behavior is not recognized.",
+        )
+        capability_modes = dict(self.cloud.get("capability_modes", {}))
+        valid_cloud_capabilities = {item.value for item in CloudOffloadCapability}
+        valid_cloud_modes = {item.value for item in CloudOffloadMode}
+        _require(
+            all(str(name).strip() in valid_cloud_capabilities for name in capability_modes),
+            "cloud.capability_modes contains an unknown capability.",
+        )
+        _require(
+            all(str(mode).strip() in valid_cloud_modes for mode in capability_modes.values()),
+            "cloud.capability_modes contains an unknown mode.",
+        )
         approval_policy = str(self.desktop.get("approval_policy", "approve_risky_only"))
         _require(
             approval_policy in {"approve_risky_only", "manual_only", "safe_auto"},
             "desktop.approval_policy is not recognized.",
         )
-        app_shell = str(self.ui.get("app_shell", "tkinter"))
-        _require(app_shell == "tkinter", "ui.app_shell must remain tkinter for the local app.")
+        enabled_capabilities = tuple(
+            str(item)
+            for item in self.desktop.get("enabled_capabilities", ())
+            if str(item).strip()
+        )
+        valid_capabilities = {item.value for item in CapabilityType}
+        _require(
+            all(item in valid_capabilities for item in enabled_capabilities),
+            "desktop.enabled_capabilities contains an unknown capability.",
+        )
+        for key in (
+            "allowlisted_roots",
+            "allowlisted_shell_commands",
+            "allowlisted_browser_domains",
+        ):
+            values = tuple(str(item) for item in self.desktop.get(key, ()) if str(item).strip())
+            _require(bool(values), f"desktop.{key} must keep at least one entry.")
+        app_shell = str(self.ui.get("app_shell", "tkinter")).strip()
+        _require(
+            app_shell in {"tkinter", "pyside6"},
+            "ui.app_shell must be tkinter or pyside6 for the local app.",
+        )
+        shell_preset = str(self.ui.get("shell_preset", "balanced")).strip().lower()
+        _require(
+            shell_preset in {"minimal", "balanced", "immersive"},
+            "ui.shell_preset must be minimal, balanced, or immersive.",
+        )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> UserSettingsProfile:
@@ -3413,9 +4691,71 @@ class UserSettingsProfile(DictSerializable):
                 "preferred_by_role": raw_preferred_by_role,
                 "enabled_roles": raw_enabled_roles or tuple(defaults.models.get("enabled_roles", ())),
             },
-            desktop={**defaults.desktop, **dict(data.get("desktop", {}))},
+            coding={**defaults.coding, **dict(data.get("coding", {}))},
+            desktop={
+                **defaults.desktop,
+                **dict(data.get("desktop", {})),
+                "enabled_capabilities": tuple(
+                    str(item)
+                    for item in dict(data.get("desktop", {})).get(
+                        "enabled_capabilities",
+                        defaults.desktop.get("enabled_capabilities", ()),
+                    )
+                    if str(item).strip()
+                ),
+                "allowlisted_roots": tuple(
+                    str(item)
+                    for item in dict(data.get("desktop", {})).get(
+                        "allowlisted_roots",
+                        defaults.desktop.get("allowlisted_roots", ()),
+                    )
+                    if str(item).strip()
+                )
+                or tuple(str(item) for item in defaults.desktop.get("allowlisted_roots", ())),
+                "allowlisted_shell_commands": tuple(
+                    str(item)
+                    for item in dict(data.get("desktop", {})).get(
+                        "allowlisted_shell_commands",
+                        defaults.desktop.get("allowlisted_shell_commands", ()),
+                    )
+                    if str(item).strip()
+                )
+                or tuple(str(item) for item in defaults.desktop.get("allowlisted_shell_commands", ())),
+                "allowlisted_browser_domains": tuple(
+                    str(item)
+                    for item in dict(data.get("desktop", {})).get(
+                        "allowlisted_browser_domains",
+                        defaults.desktop.get("allowlisted_browser_domains", ()),
+                    )
+                    if str(item).strip()
+                )
+                or tuple(str(item) for item in defaults.desktop.get("allowlisted_browser_domains", ())),
+                "allowlisted_apps": tuple(
+                    str(item)
+                    for item in dict(data.get("desktop", {})).get(
+                        "allowlisted_apps",
+                        defaults.desktop.get("allowlisted_apps", ()),
+                    )
+                    if str(item).strip()
+                ),
+                "allowlisted_background_services": tuple(
+                    str(item)
+                    for item in dict(data.get("desktop", {})).get(
+                        "allowlisted_background_services",
+                        defaults.desktop.get("allowlisted_background_services", ()),
+                    )
+                    if str(item).strip()
+                ),
+            },
             observation={**defaults.observation, **dict(data.get("observation", {}))},
-            cloud={**defaults.cloud, **dict(data.get("cloud", {}))},
+            cloud={
+                **defaults.cloud,
+                **dict(data.get("cloud", {})),
+                "capability_modes": {
+                    **dict(defaults.cloud.get("capability_modes", {})),
+                    **dict(dict(data.get("cloud", {})).get("capability_modes", {})),
+                },
+            },
             privacy={**defaults.privacy, **dict(data.get("privacy", {}))},
             ui={**defaults.ui, **dict(data.get("ui", {}))},
             updated_at=_parse_datetime(data.get("updated_at", utc_now())),
@@ -3684,9 +5024,13 @@ class PackagedSupportBundle(DictSerializable):
     manifest_path: str = ""
     launch_report_path: str = ""
     readiness_report_path: str = ""
+    preflight_report_path: str = ""
+    onboarding_guide_path: str = ""
+    setup_guide_path: str = ""
     user_settings_path: str = ""
     app_state_path: str = ""
     support_readme_path: str = ""
+    diagnostics_path: str = ""
     copied_artifact_paths: tuple[str, ...] = ()
     generated_at: datetime = field(default_factory=utc_now)
 
@@ -3700,9 +5044,13 @@ class PackagedSupportBundle(DictSerializable):
             manifest_path=str(data.get("manifest_path", "")),
             launch_report_path=str(data.get("launch_report_path", "")),
             readiness_report_path=str(data.get("readiness_report_path", "")),
+            preflight_report_path=str(data.get("preflight_report_path", "")),
+            onboarding_guide_path=str(data.get("onboarding_guide_path", "")),
+            setup_guide_path=str(data.get("setup_guide_path", "")),
             user_settings_path=str(data.get("user_settings_path", "")),
             app_state_path=str(data.get("app_state_path", "")),
             support_readme_path=str(data.get("support_readme_path", "")),
+            diagnostics_path=str(data.get("diagnostics_path", "")),
             copied_artifact_paths=tuple(str(item) for item in data.get("copied_artifact_paths", ())),
             generated_at=_parse_datetime(data.get("generated_at", utc_now())),
         )
@@ -4076,6 +5424,639 @@ class CodeSpecialistResult(DictSerializable):
 
 
 @dataclass(slots=True, frozen=True)
+class CodeQualityReport(DictSerializable):
+    """Machine-readable bounded validation summary for generated or reviewed code."""
+
+    tests_passed: bool = False
+    lint_passed: bool = False
+    complexity_passed: bool = False
+    security_passed: bool = False
+    maintainability_passed: bool = False
+    critique_passed: bool = False
+    regression_passed: bool = False
+    overall_passed: bool = False
+    quality_score: float = 0.0
+    findings: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    metrics: dict[str, float] = field(default_factory=dict)
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(0.0 <= float(self.quality_score) <= 1.0, "CodeQualityReport.quality_score must be between 0 and 1.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CodeQualityReport:
+        raw_metrics = dict(data.get("metrics", {}))
+        metrics: dict[str, float] = {}
+        for key, value in raw_metrics.items():
+            try:
+                metrics[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return cls(
+            tests_passed=bool(data.get("tests_passed", False)),
+            lint_passed=bool(data.get("lint_passed", False)),
+            complexity_passed=bool(data.get("complexity_passed", False)),
+            security_passed=bool(data.get("security_passed", False)),
+            maintainability_passed=bool(data.get("maintainability_passed", False)),
+            critique_passed=bool(data.get("critique_passed", False)),
+            regression_passed=bool(data.get("regression_passed", False)),
+            overall_passed=bool(data.get("overall_passed", False)),
+            quality_score=float(data.get("quality_score", 0.0) or 0.0),
+            findings=tuple(str(item) for item in data.get("findings", ())),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            metrics=metrics,
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CodingTaskArtifact(DictSerializable):
+    """One bounded artifact emitted by a coding task or practice cycle."""
+
+    artifact_id: str = ""
+    artifact_type: str = "code"
+    title: str = ""
+    language: str = ""
+    path: str = ""
+    content_preview: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CodingTaskArtifact:
+        return cls(
+            artifact_id=str(data.get("artifact_id", "")),
+            artifact_type=str(data.get("artifact_type", "code")),
+            title=str(data.get("title", "")),
+            language=str(data.get("language", "")),
+            path=str(data.get("path", "")),
+            content_preview=str(data.get("content_preview", "")),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CodingPatternValidation(DictSerializable):
+    """Validation history entry attached to one learned coding pattern."""
+
+    validation_id: str = ""
+    checks_passed: tuple[str, ...] = ()
+    checks_failed: tuple[str, ...] = ()
+    reviewer_summary: str = ""
+    quality_report: CodeQualityReport = field(default_factory=CodeQualityReport)
+    validated_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CodingPatternValidation:
+        return cls(
+            validation_id=str(data.get("validation_id", "")),
+            checks_passed=tuple(str(item) for item in data.get("checks_passed", ())),
+            checks_failed=tuple(str(item) for item in data.get("checks_failed", ())),
+            reviewer_summary=str(data.get("reviewer_summary", "")),
+            quality_report=CodeQualityReport.from_dict(data.get("quality_report", {})),
+            validated_at=_parse_datetime(data.get("validated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CodingPattern(DictSerializable):
+    """Structured local coding-memory pattern stored with gated promotion tiers."""
+
+    pattern_id: str = ""
+    title: str = ""
+    summary: str = ""
+    tier: CodingPatternTier = CodingPatternTier.CANDIDATE
+    category: str = "good_practice"
+    language: str = ""
+    framework: str = ""
+    task_type: CodingTaskType = CodingTaskType.CODE_REVIEW
+    source: str = ""
+    quality_score: float = 0.0
+    reuse_count: int = 0
+    code_snippet: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    validation_history: tuple[CodingPatternValidation, ...] = ()
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(0.0 <= float(self.quality_score) <= 1.0, "CodingPattern.quality_score must be between 0 and 1.")
+        _require(self.reuse_count >= 0, "CodingPattern.reuse_count must be zero or positive.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CodingPattern:
+        return cls(
+            pattern_id=str(data.get("pattern_id", "")),
+            title=str(data.get("title", "")),
+            summary=str(data.get("summary", "")),
+            tier=_parse_enum(CodingPatternTier, data.get("tier", CodingPatternTier.CANDIDATE)),
+            category=str(data.get("category", "good_practice")),
+            language=str(data.get("language", "")),
+            framework=str(data.get("framework", "")),
+            task_type=_parse_enum(CodingTaskType, data.get("task_type", CodingTaskType.CODE_REVIEW)),
+            source=str(data.get("source", "")),
+            quality_score=float(data.get("quality_score", 0.0) or 0.0),
+            reuse_count=int(data.get("reuse_count", 0)),
+            code_snippet=str(data.get("code_snippet", "")),
+            metadata=dict(data.get("metadata", {})),
+            validation_history=tuple(
+                CodingPatternValidation.from_dict(item) for item in data.get("validation_history", ())
+            ),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CodingTaskRequest(DictSerializable):
+    """One bounded Coding Mode request."""
+
+    request_id: str = ""
+    task_type: CodingTaskType = CodingTaskType.CODE_REVIEW
+    prompt: str = ""
+    language: str = "python"
+    framework: str = ""
+    source_scope: str = "snippet"
+    source_path: str = ""
+    source_text: str = ""
+    tests_text: str = ""
+    target_paths: tuple[str, ...] = ()
+    idle_practice: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CodingTaskRequest:
+        return cls(
+            request_id=str(data.get("request_id", "")),
+            task_type=_parse_enum(CodingTaskType, data.get("task_type", CodingTaskType.CODE_REVIEW)),
+            prompt=str(data.get("prompt", "")),
+            language=str(data.get("language", "python")),
+            framework=str(data.get("framework", "")),
+            source_scope=str(data.get("source_scope", "snippet")),
+            source_path=str(data.get("source_path", "")),
+            source_text=str(data.get("source_text", "")),
+            tests_text=str(data.get("tests_text", "")),
+            target_paths=tuple(str(item) for item in data.get("target_paths", ())),
+            idle_practice=bool(data.get("idle_practice", False)),
+            metadata=dict(data.get("metadata", {})),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class CodingTaskResult(DictSerializable):
+    """Typed result for one Coding Mode request."""
+
+    request_id: str = ""
+    task_type: CodingTaskType = CodingTaskType.CODE_REVIEW
+    status: str = "idle"
+    active_phase: str = "idle"
+    prompt: str = ""
+    summary: str = ""
+    language: str = ""
+    framework: str = ""
+    source_scope: str = "snippet"
+    role_assignments: dict[str, str] = field(default_factory=dict)
+    route_summary: tuple[str, ...] = ()
+    artifacts: tuple[CodingTaskArtifact, ...] = ()
+    quality_report: CodeQualityReport = field(default_factory=CodeQualityReport)
+    verified_patterns: tuple[str, ...] = ()
+    candidate_patterns: tuple[str, ...] = ()
+    rejected_patterns: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    practice_session_id: str = ""
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.status.strip()), "CodingTaskResult.status must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CodingTaskResult:
+        return cls(
+            request_id=str(data.get("request_id", "")),
+            task_type=_parse_enum(CodingTaskType, data.get("task_type", CodingTaskType.CODE_REVIEW)),
+            status=str(data.get("status", "idle")),
+            active_phase=str(data.get("active_phase", "idle")),
+            prompt=str(data.get("prompt", "")),
+            summary=str(data.get("summary", "")),
+            language=str(data.get("language", "")),
+            framework=str(data.get("framework", "")),
+            source_scope=str(data.get("source_scope", "snippet")),
+            role_assignments={str(key): str(value) for key, value in dict(data.get("role_assignments", {})).items()},
+            route_summary=tuple(str(item) for item in data.get("route_summary", ())),
+            artifacts=tuple(CodingTaskArtifact.from_dict(item) for item in data.get("artifacts", ())),
+            quality_report=CodeQualityReport.from_dict(data.get("quality_report", {})),
+            verified_patterns=tuple(str(item) for item in data.get("verified_patterns", ())),
+            candidate_patterns=tuple(str(item) for item in data.get("candidate_patterns", ())),
+            rejected_patterns=tuple(str(item) for item in data.get("rejected_patterns", ())),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            practice_session_id=str(data.get("practice_session_id", "")),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class PracticeSessionResult(DictSerializable):
+    """Typed bounded result for one idle Coding Dojo practice cycle."""
+
+    session_id: str = ""
+    status: str = "idle"
+    task_type: CodingTaskType = CodingTaskType.PRACTICE
+    prompt: str = ""
+    language: str = "python"
+    summary: str = ""
+    quality_score: float = 0.0
+    validated_patterns: tuple[str, ...] = ()
+    rejected_patterns: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    task_result: CodingTaskResult = field(default_factory=CodingTaskResult)
+    started_at: datetime = field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        _require(0.0 <= float(self.quality_score) <= 1.0, "PracticeSessionResult.quality_score must be between 0 and 1.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PracticeSessionResult:
+        raw_completed_at = data.get("completed_at")
+        return cls(
+            session_id=str(data.get("session_id", "")),
+            status=str(data.get("status", "idle")),
+            task_type=_parse_enum(CodingTaskType, data.get("task_type", CodingTaskType.PRACTICE)),
+            prompt=str(data.get("prompt", "")),
+            language=str(data.get("language", "python")),
+            summary=str(data.get("summary", "")),
+            quality_score=float(data.get("quality_score", 0.0) or 0.0),
+            validated_patterns=tuple(str(item) for item in data.get("validated_patterns", ())),
+            rejected_patterns=tuple(str(item) for item in data.get("rejected_patterns", ())),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            task_result=CodingTaskResult.from_dict(data.get("task_result", {})),
+            started_at=_parse_datetime(data.get("started_at", utc_now())),
+            completed_at=None if raw_completed_at in (None, "") else _parse_datetime(raw_completed_at),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class VisionInspectionResult(DictSerializable):
+    """Typed result of one bounded optional visual-role inspection request."""
+
+    status: str = "idle"
+    source_path: str = ""
+    request_text: str = ""
+    role: ModelRole = ModelRole.VISION
+    inspection_backend: str = ""
+    inspection_model: str = ""
+    summary: str = ""
+    extracted_text: str = ""
+    warnings: tuple[str, ...] = ()
+    degraded_reason: str = ""
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.status.strip()), "VisionInspectionResult.status must not be empty.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> VisionInspectionResult:
+        return cls(
+            status=str(data.get("status", "idle")),
+            source_path=str(data.get("source_path", "")),
+            request_text=str(data.get("request_text", "")),
+            role=_parse_enum(ModelRole, data.get("role", ModelRole.VISION)),
+            inspection_backend=str(data.get("inspection_backend", "")),
+            inspection_model=str(data.get("inspection_model", "")),
+            summary=str(data.get("summary", "")),
+            extracted_text=str(data.get("extracted_text", "")),
+            warnings=tuple(str(item) for item in data.get("warnings", ())),
+            degraded_reason=str(data.get("degraded_reason", "")),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class DashboardLocalTaskSessionState(DictSerializable):
+    """Read-only dashboard projection for the active local task execution session."""
+
+    session_id: str = ""
+    label: str = ""
+    profile_name: str = ""
+    status: str = "inactive"
+    control_mode: str = "local_task"
+    current_target: str = ""
+    last_action_summary: str = ""
+    last_request_id: str = ""
+    continuous_capture_active: bool = False
+    continuous_capture_directory: str = ""
+    continuous_capture_frame_count: int = 0
+    continuous_capture_retained_frame_count: int = 0
+    continuous_capture_last_frame_path: str = ""
+    continuous_capture_region: str = "full_screen"
+    continuous_capture_fps: float = 0.0
+    continuous_capture_max_width: int = 0
+    continuous_capture_max_height: int = 0
+    continuous_capture_last_diff_ratio: float = 0.0
+    continuous_capture_warnings: tuple[str, ...] = ()
+    continuous_capture_last_capture_at: datetime | None = None
+    requested_observation_tier: str = "screenshot_on_demand"
+    effective_observation_tier: str = "screenshot_on_demand"
+    observation_degraded_reason: str = ""
+    observation_degraded_features: tuple[str, ...] = ()
+    last_observation_tier: str = ""
+    last_observation_status: str = ""
+    last_observation_summary: str = ""
+    last_observation_output_ref: str = ""
+    last_observation_text_preview: str = ""
+    last_observation_backend: str = ""
+    last_observation_warnings: tuple[str, ...] = ()
+    last_observation_at: datetime | None = None
+    pending_approval_summaries: tuple[str, ...] = ()
+    pause_requested: bool = False
+    stop_requested: bool = False
+    kill_switch_engaged: bool = False
+    last_control_reason: str = ""
+    last_error: str = ""
+    created_at: datetime | None = None
+    updated_at: datetime = field(default_factory=utc_now)
+    ended_at: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DashboardLocalTaskSessionState:
+        raw_continuous_capture_last_capture_at = data.get("continuous_capture_last_capture_at")
+        raw_last_observation_at = data.get("last_observation_at")
+        raw_created_at = data.get("created_at")
+        raw_ended_at = data.get("ended_at")
+        return cls(
+            session_id=str(data.get("session_id", "")),
+            label=str(data.get("label", "")),
+            profile_name=str(data.get("profile_name", "")),
+            status=str(data.get("status", "inactive")),
+            control_mode=str(data.get("control_mode", "local_task")),
+            current_target=str(data.get("current_target", "")),
+            last_action_summary=str(data.get("last_action_summary", "")),
+            last_request_id=str(data.get("last_request_id", "")),
+            continuous_capture_active=bool(data.get("continuous_capture_active", False)),
+            continuous_capture_directory=str(data.get("continuous_capture_directory", "")),
+            continuous_capture_frame_count=int(data.get("continuous_capture_frame_count", 0)),
+            continuous_capture_retained_frame_count=int(data.get("continuous_capture_retained_frame_count", 0)),
+            continuous_capture_last_frame_path=str(data.get("continuous_capture_last_frame_path", "")),
+            continuous_capture_region=str(data.get("continuous_capture_region", "full_screen")),
+            continuous_capture_fps=float(data.get("continuous_capture_fps", 0.0)),
+            continuous_capture_max_width=int(data.get("continuous_capture_max_width", 0)),
+            continuous_capture_max_height=int(data.get("continuous_capture_max_height", 0)),
+            continuous_capture_last_diff_ratio=float(data.get("continuous_capture_last_diff_ratio", 0.0)),
+            continuous_capture_warnings=tuple(
+                str(item) for item in data.get("continuous_capture_warnings", ())
+            ),
+            continuous_capture_last_capture_at=(
+                None
+                if raw_continuous_capture_last_capture_at in (None, "")
+                else _parse_datetime(raw_continuous_capture_last_capture_at)
+            ),
+            requested_observation_tier=str(
+                data.get("requested_observation_tier", "screenshot_on_demand")
+            ),
+            effective_observation_tier=str(
+                data.get("effective_observation_tier", "screenshot_on_demand")
+            ),
+            observation_degraded_reason=str(data.get("observation_degraded_reason", "")),
+            observation_degraded_features=tuple(
+                str(item) for item in data.get("observation_degraded_features", ())
+            ),
+            last_observation_tier=str(data.get("last_observation_tier", "")),
+            last_observation_status=str(data.get("last_observation_status", "")),
+            last_observation_summary=str(data.get("last_observation_summary", "")),
+            last_observation_output_ref=str(data.get("last_observation_output_ref", "")),
+            last_observation_text_preview=str(data.get("last_observation_text_preview", "")),
+            last_observation_backend=str(data.get("last_observation_backend", "")),
+            last_observation_warnings=tuple(
+                str(item) for item in data.get("last_observation_warnings", ())
+            ),
+            last_observation_at=(
+                None if raw_last_observation_at in (None, "") else _parse_datetime(raw_last_observation_at)
+            ),
+            pending_approval_summaries=tuple(
+                str(item) for item in data.get("pending_approval_summaries", ())
+            ),
+            pause_requested=bool(data.get("pause_requested", False)),
+            stop_requested=bool(data.get("stop_requested", False)),
+            kill_switch_engaged=bool(data.get("kill_switch_engaged", False)),
+            last_control_reason=str(data.get("last_control_reason", "")),
+            last_error=str(data.get("last_error", "")),
+            created_at=None if raw_created_at in (None, "") else _parse_datetime(raw_created_at),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+            ended_at=None if raw_ended_at in (None, "") else _parse_datetime(raw_ended_at),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ActivityChip(DictSerializable):
+    """Compact shell activity badge derived from dashboard and runtime state."""
+
+    chip_id: str = ""
+    label: str = ""
+    tone: str = "neutral"
+    detail: str = ""
+    active: bool = True
+    created_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ActivityChip:
+        return cls(
+            chip_id=str(data.get("chip_id", "")),
+            label=str(data.get("label", "")),
+            tone=str(data.get("tone", "neutral")),
+            detail=str(data.get("detail", "")),
+            active=bool(data.get("active", True)),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class TimelineEntry(DictSerializable):
+    """One bounded timeline entry shown in the shell task tray."""
+
+    entry_id: str = ""
+    label: str = ""
+    stage: str = ""
+    detail: str = ""
+    severity: str = "info"
+    created_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> TimelineEntry:
+        return cls(
+            entry_id=str(data.get("entry_id", "")),
+            label=str(data.get("label", "")),
+            stage=str(data.get("stage", "")),
+            detail=str(data.get("detail", "")),
+            severity=str(data.get("severity", "info")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ShellNotification(DictSerializable):
+    """Operator-facing shell notification kept separate from raw notices."""
+
+    notification_id: str = ""
+    message: str = ""
+    severity: str = "info"
+    created_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ShellNotification:
+        return cls(
+            notification_id=str(data.get("notification_id", "")),
+            message=str(data.get("message", "")),
+            severity=str(data.get("severity", "info")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ConversationItem(DictSerializable):
+    """Presentation-only conversation/task card shown in the shell center pane."""
+
+    item_id: str = ""
+    role: str = "system"
+    title: str = ""
+    body: str = ""
+    status: str = ""
+    chips: tuple[str, ...] = ()
+    task_id: str = ""
+    created_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ConversationItem:
+        return cls(
+            item_id=str(data.get("item_id", "")),
+            role=str(data.get("role", "system")),
+            title=str(data.get("title", "")),
+            body=str(data.get("body", "")),
+            status=str(data.get("status", "")),
+            chips=tuple(str(item) for item in data.get("chips", ())),
+            task_id=str(data.get("task_id", "")),
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class OrbEffectState(DictSerializable):
+    """Bounded transient orb overlays derived from recent runtime events."""
+
+    transient_effects: tuple[str, ...] = ()
+    active_overlay: str = ""
+    insight_flash_pending: bool = False
+    consensus_shimmer_pending: bool = False
+    verification_lock_pending: bool = False
+    checkpoint_pulse_pending: bool = False
+    approval_hold: bool = False
+    degraded_undertone: bool = False
+    updated_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OrbEffectState:
+        return cls(
+            transient_effects=tuple(str(item) for item in data.get("transient_effects", ())),
+            active_overlay=str(data.get("active_overlay", "")),
+            insight_flash_pending=bool(data.get("insight_flash_pending", False)),
+            consensus_shimmer_pending=bool(data.get("consensus_shimmer_pending", False)),
+            verification_lock_pending=bool(data.get("verification_lock_pending", False)),
+            checkpoint_pulse_pending=bool(data.get("checkpoint_pulse_pending", False)),
+            approval_hold=bool(data.get("approval_hold", False)),
+            degraded_undertone=bool(data.get("degraded_undertone", False)),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ShellState(DictSerializable):
+    """Typed projection between backend state and premium shell visuals."""
+
+    orb_mode: str = "offline"
+    orb_palette: str = "slate_blue"
+    orb_intensity: float = 0.12
+    ring_mode: str = "dormant"
+    particle_mode: str = "sparse"
+    ambient_mode: str = "dormant"
+    status_text: str = "Offline"
+    sub_status_text: str = "Local shell is not ready."
+    active_agent: str = ""
+    secondary_agents: tuple[str, ...] = ()
+    active_tools: tuple[str, ...] = ()
+    active_roles: tuple[str, ...] = ()
+    confidence_band: str = "low"
+    verifier_state: str = "idle"
+    retrieval_state: str = "idle"
+    compression_state: str = "idle"
+    optimizer_state: str = "idle"
+    coding_state: str = "idle"
+    long_horizon_state: str = ""
+    checkpoint_count: int = 0
+    degraded_reason: str = ""
+    fallback_reason: str = ""
+    resource_pressure_level: str = "nominal"
+    speaking_state: str = "idle"
+    approval_pending: bool = False
+    capability_session_state: str = "inactive"
+    observation_tier: str = "screenshot_on_demand"
+    cloud_helper_state: str = "disabled"
+    activity_chips: tuple[ActivityChip, ...] = ()
+    timeline_entries: tuple[TimelineEntry, ...] = ()
+    shell_notifications: tuple[ShellNotification, ...] = ()
+    conversation_items: tuple[ConversationItem, ...] = ()
+    orb_effects: OrbEffectState = field(default_factory=OrbEffectState)
+    current_task_summary: str = ""
+    updated_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ShellState:
+        return cls(
+            orb_mode=str(data.get("orb_mode", "offline")),
+            orb_palette=str(data.get("orb_palette", "slate_blue")),
+            orb_intensity=float(data.get("orb_intensity", 0.12) or 0.12),
+            ring_mode=str(data.get("ring_mode", "dormant")),
+            particle_mode=str(data.get("particle_mode", "sparse")),
+            ambient_mode=str(data.get("ambient_mode", "dormant")),
+            status_text=str(data.get("status_text", "Offline")),
+            sub_status_text=str(data.get("sub_status_text", "Local shell is not ready.")),
+            active_agent=str(data.get("active_agent", "")),
+            secondary_agents=tuple(str(item) for item in data.get("secondary_agents", ())),
+            active_tools=tuple(str(item) for item in data.get("active_tools", ())),
+            active_roles=tuple(str(item) for item in data.get("active_roles", ())),
+            confidence_band=str(data.get("confidence_band", "low")),
+            verifier_state=str(data.get("verifier_state", "idle")),
+            retrieval_state=str(data.get("retrieval_state", "idle")),
+            compression_state=str(data.get("compression_state", "idle")),
+            optimizer_state=str(data.get("optimizer_state", "idle")),
+            coding_state=str(data.get("coding_state", "idle")),
+            long_horizon_state=str(data.get("long_horizon_state", "")),
+            checkpoint_count=int(data.get("checkpoint_count", 0)),
+            degraded_reason=str(data.get("degraded_reason", "")),
+            fallback_reason=str(data.get("fallback_reason", "")),
+            resource_pressure_level=str(data.get("resource_pressure_level", "nominal")),
+            speaking_state=str(data.get("speaking_state", "idle")),
+            approval_pending=bool(data.get("approval_pending", False)),
+            capability_session_state=str(data.get("capability_session_state", "inactive")),
+            observation_tier=str(data.get("observation_tier", "screenshot_on_demand")),
+            cloud_helper_state=str(data.get("cloud_helper_state", "disabled")),
+            activity_chips=tuple(ActivityChip.from_dict(item) for item in data.get("activity_chips", ())),
+            timeline_entries=tuple(TimelineEntry.from_dict(item) for item in data.get("timeline_entries", ())),
+            shell_notifications=tuple(
+                ShellNotification.from_dict(item) for item in data.get("shell_notifications", ())
+            ),
+            conversation_items=tuple(
+                ConversationItem.from_dict(item) for item in data.get("conversation_items", ())
+            ),
+            orb_effects=OrbEffectState.from_dict(data.get("orb_effects", {})),
+            current_task_summary=str(data.get("current_task_summary", "")),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class DashboardAppState(DictSerializable):
     """Typed read-only snapshot consumed by the dashboard shell."""
 
@@ -4083,6 +6064,7 @@ class DashboardAppState(DictSerializable):
     event_count: int = 0
     dropped_events: int = 0
     active_task: DashboardTaskState = field(default_factory=DashboardTaskState)
+    local_task_session: DashboardLocalTaskSessionState = field(default_factory=DashboardLocalTaskSessionState)
     runtime_health: DashboardRuntimeHealth = field(default_factory=DashboardRuntimeHealth)
     statuses: dict[str, AgentStatus] = field(default_factory=dict)
     recent_conditions: tuple[RuntimeCondition, ...] = ()
@@ -4092,6 +6074,7 @@ class DashboardAppState(DictSerializable):
     selected_task: DashboardTaskInspector = field(default_factory=DashboardTaskInspector)
     knowledge_sources: tuple[DashboardKnowledgeSource, ...] = ()
     readiness_report: DashboardReadinessReport = field(default_factory=DashboardReadinessReport)
+    capability_registry_view: CapabilityRegistryView = field(default_factory=CapabilityRegistryView)
     model_registry_view: ModelRegistryView = field(default_factory=ModelRegistryView)
     model_role_action: ModelRoleActionReport = field(default_factory=ModelRoleActionReport)
     demo_pack_status: DemoPackStatus = field(default_factory=DemoPackStatus)
@@ -4101,6 +6084,9 @@ class DashboardAppState(DictSerializable):
     audio_output: AudioSynthesisResult = field(default_factory=AudioSynthesisResult)
     translation_output: TextTranslationResult = field(default_factory=TextTranslationResult)
     code_output: CodeSpecialistResult = field(default_factory=CodeSpecialistResult)
+    coding_output: CodingTaskResult = field(default_factory=CodingTaskResult)
+    coding_practice: PracticeSessionResult = field(default_factory=PracticeSessionResult)
+    coding_patterns: tuple[CodingPattern, ...] = ()
     last_notice: str = ""
     last_notice_severity: str = "info"
     updated_at: datetime = field(default_factory=utc_now)
@@ -4113,6 +6099,7 @@ class DashboardAppState(DictSerializable):
             event_count=int(data.get("event_count", 0)),
             dropped_events=int(data.get("dropped_events", 0)),
             active_task=DashboardTaskState.from_dict(data.get("active_task", {})),
+            local_task_session=DashboardLocalTaskSessionState.from_dict(data.get("local_task_session", {})),
             runtime_health=DashboardRuntimeHealth.from_dict(data.get("runtime_health", {})),
             statuses={
                 str(key): AgentStatus.from_dict(value)
@@ -4136,6 +6123,9 @@ class DashboardAppState(DictSerializable):
             readiness_report=DashboardReadinessReport.from_dict(
                 data.get("readiness_report", {})
             ),
+            capability_registry_view=CapabilityRegistryView.from_dict(
+                data.get("capability_registry_view", {})
+            ),
             model_registry_view=ModelRegistryView.from_dict(data.get("model_registry_view", {})),
             model_role_action=ModelRoleActionReport.from_dict(data.get("model_role_action", {})),
             demo_pack_status=DemoPackStatus.from_dict(data.get("demo_pack_status", {})),
@@ -4149,6 +6139,9 @@ class DashboardAppState(DictSerializable):
             audio_output=AudioSynthesisResult.from_dict(data.get("audio_output", {})),
             translation_output=TextTranslationResult.from_dict(data.get("translation_output", {})),
             code_output=CodeSpecialistResult.from_dict(data.get("code_output", {})),
+            coding_output=CodingTaskResult.from_dict(data.get("coding_output", {})),
+            coding_practice=PracticeSessionResult.from_dict(data.get("coding_practice", {})),
+            coding_patterns=tuple(CodingPattern.from_dict(item) for item in data.get("coding_patterns", ())),
             last_notice=str(data.get("last_notice", "")),
             last_notice_severity=str(data.get("last_notice_severity", "info")),
             updated_at=_parse_datetime(data.get("updated_at", utc_now())),
@@ -4374,6 +6367,141 @@ def coerce_long_horizon_session(
     return LongHorizonSession.from_dict(value)
 
 
+def coerce_file_operation_spec(
+    value: FileOperationSpec | Mapping[str, Any],
+) -> FileOperationSpec:
+    """Convert mapping payloads to FileOperationSpec while preserving existing values."""
+    if isinstance(value, FileOperationSpec):
+        return value
+    return FileOperationSpec.from_dict(value)
+
+
+def coerce_shell_command_spec(
+    value: ShellCommandSpec | Mapping[str, Any],
+) -> ShellCommandSpec:
+    """Convert mapping payloads to ShellCommandSpec while preserving existing values."""
+    if isinstance(value, ShellCommandSpec):
+        return value
+    return ShellCommandSpec.from_dict(value)
+
+
+def coerce_browser_action_spec(
+    value: BrowserActionSpec | Mapping[str, Any],
+) -> BrowserActionSpec:
+    """Convert mapping payloads to BrowserActionSpec while preserving existing values."""
+    if isinstance(value, BrowserActionSpec):
+        return value
+    return BrowserActionSpec.from_dict(value)
+
+
+def coerce_app_focus_spec(
+    value: AppFocusSpec | Mapping[str, Any],
+) -> AppFocusSpec:
+    """Convert mapping payloads to AppFocusSpec while preserving existing values."""
+    if isinstance(value, AppFocusSpec):
+        return value
+    return AppFocusSpec.from_dict(value)
+
+
+def coerce_clipboard_action_spec(
+    value: ClipboardActionSpec | Mapping[str, Any],
+) -> ClipboardActionSpec:
+    """Convert mapping payloads to ClipboardActionSpec while preserving existing values."""
+    if isinstance(value, ClipboardActionSpec):
+        return value
+    return ClipboardActionSpec.from_dict(value)
+
+
+def coerce_screenshot_spec(
+    value: ScreenshotSpec | Mapping[str, Any],
+) -> ScreenshotSpec:
+    """Convert mapping payloads to ScreenshotSpec while preserving existing values."""
+    if isinstance(value, ScreenshotSpec):
+        return value
+    return ScreenshotSpec.from_dict(value)
+
+
+def coerce_ocr_request_spec(
+    value: OCRRequestSpec | Mapping[str, Any],
+) -> OCRRequestSpec:
+    """Convert mapping payloads to OCRRequestSpec while preserving existing values."""
+    if isinstance(value, OCRRequestSpec):
+        return value
+    return OCRRequestSpec.from_dict(value)
+
+
+def coerce_desktop_input_spec(
+    value: DesktopInputSpec | Mapping[str, Any],
+) -> DesktopInputSpec:
+    """Convert mapping payloads to DesktopInputSpec while preserving existing values."""
+    if isinstance(value, DesktopInputSpec):
+        return value
+    return DesktopInputSpec.from_dict(value)
+
+
+def coerce_capability_request(
+    value: CapabilityRequest | Mapping[str, Any],
+) -> CapabilityRequest:
+    """Convert mapping payloads to CapabilityRequest while preserving existing values."""
+    if isinstance(value, CapabilityRequest):
+        return value
+    return CapabilityRequest.from_dict(value)
+
+
+def coerce_capability_policy_decision(
+    value: CapabilityPolicyDecision | Mapping[str, Any],
+) -> CapabilityPolicyDecision:
+    """Convert mapping payloads to CapabilityPolicyDecision while preserving existing values."""
+    if isinstance(value, CapabilityPolicyDecision):
+        return value
+    return CapabilityPolicyDecision.from_dict(value)
+
+
+def coerce_capability_registration(
+    value: CapabilityRegistration | Mapping[str, Any],
+) -> CapabilityRegistration:
+    """Convert mapping payloads to CapabilityRegistration while preserving existing values."""
+    if isinstance(value, CapabilityRegistration):
+        return value
+    return CapabilityRegistration.from_dict(value)
+
+
+def coerce_capability_audit_record(
+    value: CapabilityAuditRecord | Mapping[str, Any],
+) -> CapabilityAuditRecord:
+    """Convert mapping payloads to CapabilityAuditRecord while preserving existing values."""
+    if isinstance(value, CapabilityAuditRecord):
+        return value
+    return CapabilityAuditRecord.from_dict(value)
+
+
+def coerce_cloud_offload_record(
+    value: CloudOffloadRecord | Mapping[str, Any],
+) -> CloudOffloadRecord:
+    """Convert mapping payloads to CloudOffloadRecord while preserving existing values."""
+    if isinstance(value, CloudOffloadRecord):
+        return value
+    return CloudOffloadRecord.from_dict(value)
+
+
+def coerce_capability_execution_result(
+    value: CapabilityExecutionResult | Mapping[str, Any],
+) -> CapabilityExecutionResult:
+    """Convert mapping payloads to CapabilityExecutionResult while preserving existing values."""
+    if isinstance(value, CapabilityExecutionResult):
+        return value
+    return CapabilityExecutionResult.from_dict(value)
+
+
+def coerce_capability_registry_view(
+    value: CapabilityRegistryView | Mapping[str, Any],
+) -> CapabilityRegistryView:
+    """Convert mapping payloads to CapabilityRegistryView while preserving existing values."""
+    if isinstance(value, CapabilityRegistryView):
+        return value
+    return CapabilityRegistryView.from_dict(value)
+
+
 def coerce_model_registration(
     value: ModelRegistration | Mapping[str, Any],
 ) -> ModelRegistration:
@@ -4464,6 +6592,51 @@ def coerce_code_specialist_result(
     return CodeSpecialistResult.from_dict(value)
 
 
+def coerce_code_quality_report(
+    value: CodeQualityReport | Mapping[str, Any],
+) -> CodeQualityReport:
+    """Convert mapping payloads to CodeQualityReport while preserving existing values."""
+    if isinstance(value, CodeQualityReport):
+        return value
+    return CodeQualityReport.from_dict(value)
+
+
+def coerce_coding_task_request(
+    value: CodingTaskRequest | Mapping[str, Any],
+) -> CodingTaskRequest:
+    """Convert mapping payloads to CodingTaskRequest while preserving existing values."""
+    if isinstance(value, CodingTaskRequest):
+        return value
+    return CodingTaskRequest.from_dict(value)
+
+
+def coerce_coding_task_result(
+    value: CodingTaskResult | Mapping[str, Any],
+) -> CodingTaskResult:
+    """Convert mapping payloads to CodingTaskResult while preserving existing values."""
+    if isinstance(value, CodingTaskResult):
+        return value
+    return CodingTaskResult.from_dict(value)
+
+
+def coerce_practice_session_result(
+    value: PracticeSessionResult | Mapping[str, Any],
+) -> PracticeSessionResult:
+    """Convert mapping payloads to PracticeSessionResult while preserving existing values."""
+    if isinstance(value, PracticeSessionResult):
+        return value
+    return PracticeSessionResult.from_dict(value)
+
+
+def coerce_coding_pattern(
+    value: CodingPattern | Mapping[str, Any],
+) -> CodingPattern:
+    """Convert mapping payloads to CodingPattern while preserving existing values."""
+    if isinstance(value, CodingPattern):
+        return value
+    return CodingPattern.from_dict(value)
+
+
 def coerce_long_horizon_export_bundle(
     value: LongHorizonExportBundle | Mapping[str, Any],
 ) -> LongHorizonExportBundle:
@@ -4489,6 +6662,33 @@ def coerce_dashboard_task_state(
     if isinstance(value, DashboardTaskState):
         return value
     return DashboardTaskState.from_dict(value)
+
+
+def coerce_local_task_pending_approval(
+    value: LocalTaskPendingApproval | Mapping[str, Any],
+) -> LocalTaskPendingApproval:
+    """Convert mapping payloads to LocalTaskPendingApproval while preserving existing values."""
+    if isinstance(value, LocalTaskPendingApproval):
+        return value
+    return LocalTaskPendingApproval.from_dict(value)
+
+
+def coerce_local_task_session(
+    value: LocalTaskSession | Mapping[str, Any],
+) -> LocalTaskSession:
+    """Convert mapping payloads to LocalTaskSession while preserving existing values."""
+    if isinstance(value, LocalTaskSession):
+        return value
+    return LocalTaskSession.from_dict(value)
+
+
+def coerce_dashboard_local_task_session_state(
+    value: DashboardLocalTaskSessionState | Mapping[str, Any],
+) -> DashboardLocalTaskSessionState:
+    """Convert mapping payloads to DashboardLocalTaskSessionState while preserving existing values."""
+    if isinstance(value, DashboardLocalTaskSessionState):
+        return value
+    return DashboardLocalTaskSessionState.from_dict(value)
 
 
 def coerce_user_settings_profile(
@@ -4593,3 +6793,10 @@ def coerce_dashboard_app_state(value: DashboardAppState | Mapping[str, Any]) -> 
     if isinstance(value, DashboardAppState):
         return value
     return DashboardAppState.from_dict(value)
+
+
+def coerce_shell_state(value: ShellState | Mapping[str, Any]) -> ShellState:
+    """Convert mapping payloads to ShellState while preserving existing values."""
+    if isinstance(value, ShellState):
+        return value
+    return ShellState.from_dict(value)

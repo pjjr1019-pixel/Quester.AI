@@ -1,6 +1,6 @@
 # Progress Summary
 
-Last updated: March 8, 2026
+Last updated: March 9, 2026
 
 ## Current status
 
@@ -14,8 +14,15 @@ Last updated: March 8, 2026
 - Phase 16 gate codification is now complete: the repo has explicit subsystem plus project-wide gates for data, storage, model, macro, agent, orchestrator, optimizer, dashboard, resource, smoke, release, and project-completion checks.
 - Phase 17 is complete and Phase 18 is now complete with a typed local-AI registry, advisory control plane, bounded cache layer, and shared compression prior-scoring path.
 - Phase 19 is now complete: optional reranker, local `speech_to_text`, `vad`, `text_to_speech`, offline `translation`, and `code_specialist` are routed through one typed control plane with app-surface actions, bounded compressor insights, pinned lightweight defaults, and Phase 19 regression coverage while preserving the default `generation + embedding` runtime.
-- Phase 20 is now started: the first local-first desktop/control guardrail is codified and tested so future desktop or cloud helpers must extend the current runtime rather than replace core local execution.
-- The next major implementation target is `20.0.2` plus `20.0.3` and `20.1`: add typed desktop capability contracts while keeping those tiers opt-in before any live computer-control executors land.
+- Phase 20 is now complete: typed capability contracts, policy outcomes, allowlists, audit records, persisted capability registry views, and a bounded control plane are in place so future desktop helpers have to pass through explicit local-first checks instead of jumping straight to OS actions.
+- The Phase 21 session foundation is now in place: explicit local task sessions, session-gated capability execution, pending approval queues, default `approve_risky_only` behavior inside active sessions, and visible dashboard session indicators are implemented and test-backed.
+- Phase 21 is now functionally complete: bounded local file execution, allowlisted shell execution, browser read or navigate actions, visible app or window focus control, approval-gated desktop input, and session safety recovery all run inside the same explicit local-task boundary.
+- Phase 22 is now complete: screenshot-on-demand, CPU-first OCR, bounded continuous capture, explicit per-step observation modes, optional routed visual roles, the hardware governor, bounded optimizer advisory inputs, degradation UI, and pressure regressions all run inside the existing local task boundary.
+- Phase 23 is now complete: provider-agnostic auxiliary cloud adapters, explicit per-capability dispatch enforcement, persisted cloud-offload audits, privacy-classified dispatch gates, export-path cloud integration, and regression coverage all preserve the baseline local path.
+- Phase 24 is now complete: the packaged runner has its own entrypoint, first-run onboarding/setup guidance, exportable/reopenable preflight artifacts, crash diagnostics with stub-mode recovery, and packaged startup validation on clean temporary paths.
+- A parallel PySide6 shell migration tranche is now underway: the repo has a live optional Qt shell path, a swappable dashboard UI host boundary, a state-driven orb hero, activity strip, conversation surface, drawers, secondary sheets, and a resource ribbon without disturbing the existing backend contracts.
+- A bounded first Coding Mode slice is now live: typed coding-task/pattern/practice contracts, local coding-memory storage, a bounded sandbox runner, coding-role routing over the existing `code_specialist` registry, machine-readable coding events, Coding Dojo practice cycles, and orb/dashboard state projection now exist without changing the core task pipeline.
+- The next major implementation target is the remaining Phase `14.10` / `14.12` compressor-optimizer follow-through plus the Phase `15` failure-hardening checklist.
 
 ## Completed in the current checkpoint
 
@@ -29,6 +36,23 @@ Last updated: March 8, 2026
 - Closed the remaining Phase 17 tail: long-horizon runs now record advisor request/accept/reject/defer outcomes in checkpoints and dashboard state, export machine-readable bundles that only include verified final traces, and can early-stop with a structured no-improvement explanation instead of spending the full wall-clock budget blindly.
 - Added the Phase 18 local-AI registry foundation: typed model roles, typed registrations, routed capability decisions, heavy-slot scheduling, sidecar classification, persisted model-registry views, and an integrated dashboard control-plane panel.
 - Added bounded cross-agent advisory and cache integration: the existing runtime event/status surfaces now carry typed optimizer suggestions, model registry state is persisted and surfaced in the app shell, and the shared bounded-cache layer now covers embeddings, retrieval candidates, runtime subsets, strategy artifacts, and compression artifacts.
+- Completed Phase 23 auxiliary cloud offload: a provider-agnostic cloud manager now dispatches bounded helper jobs through swappable adapters, per-capability policy and approved-content gates are enforced before dispatch, cloud attempts and fallback outcomes persist to SQLite plus `cloud_offload.jsonl`, support-bundle export exercises the auxiliary export path without making cloud mandatory, and regression coverage proves provider availability, local fallback, privacy blocking, and baseline-local behavior.
+- Added the Phase 24 startup foundation: the developer/source runner no longer goes through packaged planning, packaged startup now uses an explicit startup plan with requested-vs-effective launch reporting, first-run packaged startup is forced into stub mode, packaged fallback can no longer be overwritten by a saved real-mode profile during startup, and new regressions lock the shared preflight contract plus returning-user stub fallback behavior.
+- Completed the rest of Phase 24 packaging hardening: `quester-ai-packaged` now exposes the packaged entrypoint, packaged startup exports reopenable preflight and onboarding artifacts plus the pinned `LOCAL_MODEL_SETUP.md` guide, the Readiness tab can export that preflight bundle on demand, startup failures write exportable diagnostics and recover into stub mode when real-mode startup throws unexpectedly, and the packaged regressions now cover clean temp-path launch, readable failure messaging, and recovery.
+- Started the PySide6 shell migration beyond scaffolding: `dashboard.py` now launches a real optional Qt shell host when `app_shell=\"pyside6\"`, the shell binds directly to typed `ShellState` and `DashboardAppState` snapshots, and headless plus packaged startup behavior remain green.
+- Replaced the old preview-only Qt window with a live orb shell in `pyside_shell.py`: the app now has a custom-painted orb, status and sub-status hero, activity strip, resource ribbon, conversation cards, premium input dock, left and right operator drawers, and lower secondary sheets for history, knowledge, settings, readiness, capabilities, and debug.
+- Added Qt-specific regression coverage and local validation for the new shell path, including offscreen widget creation, submission callbacks, threaded host startup/shutdown, and dashboard-driven PySide startup, while keeping the existing Phase 12 and Phase 24 headless/package regressions passing.
+- Added the first real Coding Mode vertical slice:
+  - `config.py` now defines bounded `coding_mode` settings.
+  - `data_structures.py` now defines typed coding requests/results, quality reports, pattern tiers/history, practice sessions, and additive dashboard/shell-state fields plus Coding Mode settings inside `UserSettingsProfile`.
+  - `coding_mode.py` now provides a bounded coding router, a local sandbox runner with syntax/lint/complexity/security/maintainability/test checks, gated pattern promotion, and deterministic Coding Dojo practice tasks.
+  - `storage.py` now persists coding task runs, coding-memory patterns, and coding practice sessions in explicit repositories.
+  - `orchestrator.py` now exposes `coding.run_task`, `coding.practice_once`, and `coding.clear` dashboard actions, emits machine-readable coding runtime stages, and republishes coding results/patterns into the dashboard path.
+  - `dashboard.py` now consumes typed coding events/results, extends the existing Code tab with Coding Mode controls, projects coding-specific orb states/activity chips/timeline entries, and surfaces coding summaries plus learned patterns in the shell state.
+  - `tests/test_coding_mode.py` and `tests/test_shell_state_projection.py` now cover gated coding-task persistence, verified practice promotion, and coding orb-state synchronization, while existing Phase 19 and GUI acceptance regressions remain green.
+- Added the routed-visual-role Phase 22 tranche: optional `vision` roles can now swap into the heavy-slot scheduler on demand, `vision_on_step` uses CPU OCR as a bounded seed before routed visual inspection, and the reserved `specialist_perception` role plus pinned `SmolVLM` / `PaddleOCR` recommendations are now part of the typed local-AI control plane.
+- Added the next Phase 22 observation tranche: `ocr_on_step` and `vision_on_step` are now explicit session-scoped observation modes with bounded per-step captures, typed session state, route-aware vision fallback, and low-headroom gating instead of acting like implicit background capture.
+- Completed the remaining Phase 22 governor tranche: runtime health now emits typed hardware-governor state for RAM or VRAM or queue or backend pressure, bounded optimizer `model_loading` and `cache_prefetch` hints can inform idle retention and governor summaries without overriding live pressure decisions, optional heavy roles are blocked or unloaded before core reasoning is degraded, continuous capture and per-step observation tiers fall back to lighter modes inside the active session, and the dashboard now shows requested vs effective observation tier, governor reasons, degraded features, and heavy-slot usage directly.
 - Added shared lightweight compression prior scoring so the compressor and Self-Optimizer can reuse bounded compression-artifact summaries instead of creating a second proposal store.
 - Started Phase 19 specialist-role expansion: `model_manager.py` now applies per-role user settings, reroutes a bounded opt-in reranker role, and keeps reranker plus `speech_to_text` plus `vad` independently enableable, unloadable, and disabled without weakening the base runtime.
 - Surfaced the first Phase 19 specialist controls in the app shell: Settings now persist reranker and `speech_to_text` and `vad` enablement, Readiness now reports specialist-role status, and the Local AI control-plane panel now summarizes one visible registration per role instead of truncating the registry arbitrarily.
@@ -39,6 +63,43 @@ Last updated: March 8, 2026
 - Closed the rest of Phase 19: `local_translation.py` now provides bounded local translation through stub or optional Argos routing, `local_code_specialist.py` now provides bounded file or snippet analysis through an opt-in code-specialist role, the dashboard now has Translation and Code tabs, task inspectors now explain specialist-role use plus advisor suggestions, and the Local AI panel now shows typed compressor insights.
 - Pinned and surfaced the recommended lightweight specialist defaults in the runtime guidance and README: `jinaai/jina-reranker-v1-tiny-en`, `whisper.cpp` or `openai/whisper-tiny`, `Silero VAD`, `Piper`, `Argos Translate`, and `Qwen/Qwen2.5-Coder-1.5B-Instruct`.
 - Added `capability_guardrails.py` and `tests/test_phase20_local_first_guardrail.py` so the first Phase 20 rule is executable: desktop or cloud helpers must stay additive to the existing orchestrator, keep `Orchestrator.run_task(question, thinking_minutes)` public, preserve the base local runtime and storage path, remain opt-in, and never make cloud execution primary.
+- Completed the rest of the Phase 20 foundation:
+  - `data_structures.py` now defines typed capability contracts for file, shell, browser, app-focus, clipboard, screenshot, OCR, and desktop-input requests plus typed policy decisions, capability registrations, audit records, execution results, and a persisted capability-registry view.
+  - `capability_runtime.py` now owns the bounded capability policy engine and the initial executor layer, including default-denied dangerous request flags, per-capability allowlists, opt-in desktop capability toggles, resource-pressure degradation, and approval-gated desktop-input or destructive-action handling.
+  - `storage.py` now persists capability-audit records to SQLite and `capability_audit.jsonl`, and persists the typed capability-registry view for the dashboard shell.
+  - `orchestrator.py` now publishes the capability registry into the dashboard, evaluates typed capability requests through policy before execution, and records requested or policy-decision or approval or warning or executor-result audits.
+  - `dashboard.py` now renders capability-gating summaries from the typed capability registry instead of only static placeholder messages.
+  - `tests/test_phase20_capability_foundation.py` now locks the policy outcomes, allowlist enforcement, approval-gated requests, audit persistence, execution behavior, and dashboard or storage projection.
+- Added the first Phase 21 session tranche:
+  - `data_structures.py` now defines explicit local task-session state plus pending-approval and dashboard session projection types.
+  - `storage.py` now persists local task sessions, their active-session pointer, and restart-safe session snapshots.
+  - `orchestrator.py` now starts, pauses, resumes, stops, and kill-switches local task sessions, pauses active sessions on shutdown, recovers running sessions safely, and denies capability execution unless an explicit session is active.
+  - `dashboard.py` now exposes local-session controls and visible indicators for control mode, current target, pending approvals, kill-switch state, and last action.
+  - `tests/test_phase21_local_task_sessions.py` now locks lifecycle, session-gate, approval-queue, and kill-switch behavior.
+- Added the next Phase 21 live executor tranche:
+  - `capability_runtime.py` now runs bounded live file operations for read, write, copy, move, archive, delete, and bounded directory listing inside allowlisted roots, while keeping the higher-risk capability families on the stub path.
+  - `capability_runtime.py` now runs allowlisted shell commands inside allowlisted working directories with bounded timeout and stdout or stderr capture, and reports nonzero-exit or timeout failures explicitly instead of silently degrading.
+  - `orchestrator.py` now awaits the live executor path, keeps the session and approval boundary intact around those actions, and surfaces partial-live desktop readiness instead of treating every capability as still stub-only.
+  - `dashboard.py` now shows per-capability executor kind so the control plane distinguishes live-backed file or shell tools from still-stubbed browser, app-focus, OCR, and desktop-input tiers.
+  - `tests/test_phase21_live_capability_execution.py` now locks the live file lifecycle, successful shell execution, and bounded shell-timeout behavior, while Phase 12 acceptance checks now expect the partial-live readiness state.
+- Added the rest of the current Phase 21 non-input tier:
+  - `capability_runtime.py` now executes bounded browser `read` and `navigate` actions for allowlisted domains, including bounded local fetch previews plus visible browser-window validation for navigation.
+  - `capability_runtime.py` now executes app or window focus actions through visible-window enumeration, title matching, and foreground-title validation instead of leaving those requests on the stub path.
+  - `tests/test_phase21_browser_app_control.py` now locks the browser-read path against a local HTTP target and the browser-navigate plus app-focus validation path through mocked visible-window checks.
+- Added the remaining Phase 21 control-safety tranche:
+  - `capability_runtime.py` now executes approval-gated desktop input for bounded text typing, key chords, mouse moves, and mouse clicks against explicit allowlisted targets, with foreground-target validation before and during execution.
+  - `orchestrator.py` now tracks repeated capability-request fingerprints inside each local task session, pauses sessions automatically when loop thresholds trip, and triggers recovery pauses when focus changes unexpectedly, emergency-stop signals fire, or long-running local actions time out.
+  - `data_structures.py` now persists repeated-request loop state inside `LocalTaskSession`, so recovery decisions survive the existing session snapshot path.
+  - `tests/test_phase21_desktop_input_safety.py` now locks loop-guard pauses, approval-gated live desktop input, focus-loss recovery, and emergency-stop recovery.
+- Added the first Phase 22 observation tranche:
+  - `capability_runtime.py` now executes bounded screenshot-on-demand capture into allowlisted output paths, plus CPU-first OCR against allowlisted local images and selected image regions through Windows OCR first with local `tesseract` fallback when available.
+  - `orchestrator.py` now reports screenshot-on-demand and `ocr_on_step` as live observation tiers in readiness, while keeping `vision_on_step` and `continuous_capture` visibly blocked behind later Phase 22 work.
+  - `tests/test_phase22_observation_execution.py` now locks live screenshot capture, full-image OCR, and selected-region OCR behavior, while the existing Phase 12 and Phase 20 readiness tests now expect the new partial-live observation state.
+- Added the next Phase 22 observation tranche:
+  - `config.py` and `data_structures.py` now define strict continuous-capture caps for FPS, downscaled resolution, frame-history depth, diff thresholds, and region-of-interest behavior, and `UserSettingsProfile` now normalizes those observation settings explicitly.
+  - `capability_runtime.py` now provides a bounded continuous-capture frame helper that captures and downscales Windows screenshots directly into the observation path without turning continuous capture into a separate unrestricted adapter.
+  - `orchestrator.py` now starts and stops capped continuous capture with the local-task session lifecycle, retains only diff-worthy frames inside a bounded history window, surfaces capture state in the dashboard session projection, and reports `continuous_capture` as a live observation tier.
+  - `tests/test_phase22_continuous_capture.py` now locks frame-retention behavior, cap enforcement, and readiness projection for the continuous-capture tier.
 - Added explicit Phase 12 acceptance thresholds for validity, compression, and bounded resource usage, and wired the current foreground compression caps to that registry.
 - Implemented shared model management, bounded concurrency, backend fallback rules, and health snapshots.
 - Finished Phase 4 budget mapping so `thinking_minutes` changes real planner, researcher, reasoner, and critic behavior.
@@ -230,12 +291,12 @@ Last updated: March 8, 2026
 
 ## Verified state
 
-- Full test suite passes: `python -m pytest -q --cache-clear`
-- Current passing count: `220 passed`
+- Full test suite passes: `python -m pytest -q`
+- Current passing count: `278 passed`
 
 ## Main gaps remaining
 
-- Phase 12 now also has constructor-level dependency injection for the main agents plus explicit mocked unit coverage for agent delegation, candidate generation, verifier scoring, abstain handling, dashboard backpressure, deep-mode bounds, and optimizer simulation-before-activation behavior.
+- Phase 22 is now complete: heavier observation tiers now degrade automatically under the hardware governor, bounded optimizer advisory inputs stay advisory-only under live pressure, the dashboard surfaces active vs effective observation state plus heavy-slot usage, and pressure regressions cover the 6GB VRAM / 8GB RAM baseline path.
 - Phase 12 cleanup is now effectively closed: retrieval no longer carries dead prompt coupling, stale placeholder wording was replaced with phase-accurate capability gating, duplicated orchestrator trace-selection logic was consolidated, and the long-horizon completion path now emits the real aggregated final result.
 - Phase 12 now also has explicit acceptance thresholds in repo artifacts: validity, compression, and bounded resource expectations are no longer implicit checklist text only.
 - Phase 17 is now complete: long-horizon scheduling, control actions, pressure-aware throttling, advisor explainability, bounded validation, machine-readable export bundles, and structured early-stop behavior are all implemented and test-backed.
@@ -245,11 +306,12 @@ Last updated: March 8, 2026
 - The skipped Phase 12 to 14 tail is now mostly reconciled: compatibility fixtures, direct `MacroEngine` coverage, model/resource bounds, structured Planner/Reasoner/Critic behavior, non-placeholder compression, and orchestrator cancellation or retry or warning flow are all reflected in the roadmap; `14.12` remains open because optimizer activation is still proposal-only by policy.
 - Phase 16 is now fully codified in repo artifacts: subsystem and project-wide completion are tied to named validation commands instead of checklist text alone.
 - Phase 18 is now complete: typed model routing, heavy-slot governance, sidecar classification, persisted registry state, integrated control-plane UI, bounded cross-agent advisory flow, and bounded cache sharing are implemented and covered by deterministic tests.
-- Packaged Windows app, onboarding, and release-hardening work are still future-phase items.
+- Phase 20 is complete and the Phase 21 session boundary is in place, with live file, shell, browser, app/window, and approval-gated desktop-input execution now active.
+- Phase 24 is now complete: packaged startup, onboarding/setup guidance, exportable preflight reporting, diagnostics, and stub-mode recovery are implemented and test-backed.
 - `7.6.1.1`: `z3-solver` remains intentionally deferred until deterministic contradiction or satisfiability checks become a real Critic requirement.
 
 ## Recommended next steps
 
-1. Continue Phase 20 with `20.0.2` and `20.0.3`: define typed capability contracts first and keep heavy observation or desktop-control tiers opt-in by default.
-2. Then implement `20.1` to `20.3`: add typed capability contracts, a capability registry, and a policy engine that returns `allowed`, `requires_approval`, `denied`, or `degraded` before any action runs.
-3. Keep `20.4` to `20.7` in the same tranche: dangerous capabilities blocked by default, explicit allowlists, audit records, and stub executors with deterministic tests before OS adapters.
+1. Extract the shared `MacroProposalBuilder` for `CompressionService` and `SelfOptimizer`, then move proposal ranking to the bounded deterministic-first path described in `14.10.1` to `14.10.4`.
+2. Add the bounded macro-effectiveness registry and context-scoped proposal scoring from `14.12.1` and `14.12.2` so replay outcomes feed future compression safely.
+3. Turn the Phase `15` failure checklist into explicit tests or degraded-mode branches where it is still only roadmap prose, especially optimizer rollback and repeated-critic-rejection handling.

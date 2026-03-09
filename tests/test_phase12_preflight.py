@@ -228,12 +228,12 @@ class Phase12PreflightAcceptanceTests(unittest.TestCase):
 
         capabilities = {item.capability_name: item for item in report.capabilities}
 
-        self.assertEqual(capabilities["desktop_control"].status, "blocked_by_policy")
-        self.assertEqual(capabilities["desktop_control"].reason, "phase_20_21_not_implemented")
-        self.assertEqual(capabilities["observation_tiers"].status, "blocked_by_policy")
-        self.assertEqual(capabilities["observation_tiers"].reason, "phase_22_not_implemented")
-        self.assertEqual(capabilities["cloud_offload"].status, "blocked_by_policy")
-        self.assertEqual(capabilities["cloud_offload"].reason, "phase_23_not_implemented")
+        self.assertEqual(capabilities["desktop_control"].status, "visible_not_enabled")
+        self.assertEqual(capabilities["desktop_control"].reason, "desktop_capabilities_not_enabled")
+        self.assertEqual(capabilities["observation_tiers"].status, "degraded")
+        self.assertEqual(capabilities["observation_tiers"].reason, "vision_on_step_cpu_fallback")
+        self.assertEqual(capabilities["cloud_offload"].status, "visible_not_enabled")
+        self.assertEqual(capabilities["cloud_offload"].reason, "cloud_capabilities_not_enabled")
 
 
 if __name__ == "__main__":

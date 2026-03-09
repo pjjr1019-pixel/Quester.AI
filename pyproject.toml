@@ -32,6 +32,12 @@ structured = [
 telemetry = [
   "psutil>=5.9,<7.0",
 ]
+desktop = [
+  "PySide6>=6.8,<7.0",
+]
+windows-packaging = [
+  "PyInstaller>=6.0,<7.0",
+]
 embeddings = [
   "sentence-transformers>=3.0,<4.0",
 ]
@@ -48,12 +54,15 @@ dev = [
 
 [project.scripts]
 quester-ai = "orchestrator:main"
+quester-ai-packaged = "orchestrator:packaged_main"
 
 [tool.setuptools]
 py-modules = [
   "acceptance_thresholds",
   "bounded_cache",
   "capability_guardrails",
+  "capability_runtime",
+  "cloud_offload",
   "compressor",
   "config",
   "critic",
@@ -62,6 +71,7 @@ py-modules = [
   "local_audio",
   "local_code_specialist",
   "local_translation",
+  "local_vision",
   "macro_engine",
   "model_backends",
   "model_manager",
@@ -69,6 +79,7 @@ py-modules = [
   "phase11_content",
   "phase6_benchmark",
   "planner",
+  "pyside_shell",
   "prompts",
   "reasoner",
   "retrieval",

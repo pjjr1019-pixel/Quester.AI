@@ -8,9 +8,9 @@ import logging
 import os
 import shutil
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from bounded_cache import BoundedCacheManager
 from config import APP_CONFIG, AppConfig
@@ -25,8 +25,10 @@ from data_structures import (
     ModelResourceClass,
     ModelRole,
     ModelRouteDecision,
+    OptimizerSuggestionKind,
     OptimizerSuggestionRecord,
     TextTranslationResult,
+    VisionInspectionResult,
     VoiceActivityReport,
 )
 from local_audio import (
@@ -39,6 +41,7 @@ from local_audio import (
 )
 from local_code_specialist import analyze_code_file_with_stub, analyze_code_with_stub
 from local_translation import argos_translate_available, translate_with_argos, translate_with_stub
+from local_vision import inspect_image_with_stub
 from model_backends import (
     BackendHealth,
     EmbeddingBackendAdapter,
@@ -85,8 +88,58 @@ class ModelHealthSnapshot:
     total_ram_gb: float | None
     generation_backend_vram_gb: float | None
     embedding_backend_vram_gb: float | None
-    telemetry_enabled: bool
-    last_error: str | None
+    active_heavy_roles: tuple[str, ...] = field(default_factory=tuple)
+    heavy_slot_limit: int = 2
+    governor_active: bool = False
+    governor_pressure_reasons: tuple[str, ...] = field(default_factory=tuple)
+    governor_degraded_features: tuple[str, ...] = field(default_factory=tuple)
+    queue_pressure: bool = False
+    backend_health_degraded: bool = False
+    allow_continuous_capture: bool = True
+    allow_ocr_on_step: bool = True
+    allow_vision_on_step: bool = True
+    allow_optional_heavy_residency: bool = True
+    allow_background_work: bool = True
+    governor_summary: str = ""
+    telemetry_enabled: bool = False
+    last_error: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class HardwareGovernorState:
+    """Live pressure state used to degrade optional observation/model behavior before core reasoning."""
+
+    active: bool = False
+    pressure_reasons: tuple[str, ...] = ()
+    degraded_features: tuple[str, ...] = ()
+    queue_pressure: bool = False
+    backend_health_degraded: bool = False
+    allow_continuous_capture: bool = True
+    allow_ocr_on_step: bool = True
+    allow_vision_on_step: bool = True
+    allow_optional_heavy_residency: bool = True
+    allow_background_work: bool = True
+    summary: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class _GovernorAdvisoryInput:
+    """Clamped optimizer input that may inform, but never override, live governor decisions."""
+
+    suggestion_id: str
+    kind: OptimizerSuggestionKind
+    optional_heavy_roles: tuple[str, ...] = ()
+    cache_namespaces: tuple[str, ...] = ()
+    warm_key_count: int = 0
+    expires_at_monotonic: float = 0.0
+
+    def summary_fragment(self, *, now: float) -> str:
+        ttl_seconds = max(0, int(self.expires_at_monotonic - now))
+        if self.kind == OptimizerSuggestionKind.MODEL_LOADING:
+            roles = ",".join(self.optional_heavy_roles) if self.optional_heavy_roles else "optional_heavy"
+            return f"retain({roles})/{ttl_seconds}s"
+        namespaces = ",".join(self.cache_namespaces) if self.cache_namespaces else "background_cache"
+        return f"prefetch({namespaces}:{self.warm_key_count})/{ttl_seconds}s"
 
 
 class ModelManager:
@@ -110,7 +163,22 @@ class ModelManager:
         ModelRole.VAD: "Silero VAD",
         ModelRole.TRANSLATION: "Argos Translate",
         ModelRole.CODE_SPECIALIST: "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+        ModelRole.VISION: "HuggingFaceTB/SmolVLM-256M-Instruct",
+        ModelRole.SPECIALIST_PERCEPTION: "PaddleOCR",
     }
+    _GOVERNOR_ADVISORY_KINDS = frozenset(
+        {
+            OptimizerSuggestionKind.MODEL_LOADING,
+            OptimizerSuggestionKind.CACHE_PREFETCH,
+        }
+    )
+    _GOVERNOR_ADVISORY_CACHE_NAMESPACES = frozenset(
+        {"retrieval_candidates", "runtime_subsets", "strategy_artifacts", "compression_artifacts"}
+    )
+    _MAX_GOVERNOR_ADVISORIES = 4
+    _MAX_GOVERNOR_ADVISORY_ROLES = 2
+    _MAX_GOVERNOR_ADVISORY_WARM_KEYS = 4
+    _MAX_GOVERNOR_ADVISORY_RETENTION_S = 120.0
 
     def __init__(
         self,
@@ -162,6 +230,8 @@ class ModelManager:
         self._route_history: list[ModelRouteDecision] = []
         self._active_heavy_roles: list[str] = []
         self._loaded_optional_heavy_roles: dict[str, float] = {}
+        self._governor_advisory_inputs: dict[str, _GovernorAdvisoryInput] = {}
+        self._suspended_default_heavy_roles: set[str] = set()
         self._heavy_slot_limit = 2
         self._cache_manager = BoundedCacheManager(
             {
@@ -221,6 +291,7 @@ class ModelManager:
                 self.logger.warning("Backend stop failed for %s: %s", backend.backend_name, exc)
         self._active_heavy_roles = []
         self._loaded_optional_heavy_roles = {}
+        self._suspended_default_heavy_roles = set()
         self.logger.info("ModelManager stopped.")
 
     async def generate(self, prompt: str, max_tokens: int | None = None) -> str:
@@ -306,6 +377,11 @@ class ModelManager:
             self.config.backend_runtime.telemetry_enable_psutil
             or self.config.backend_runtime.telemetry_enable_backend_stats
         )
+        self._sync_active_heavy_roles()
+        governor = self._hardware_governor_state(
+            total_ram_gb=total_ram_gb,
+            available_ram_gb=available_ram_gb,
+        )
         active_generation_name = (
             self._active_generation_backend.backend_name
             if self._active_generation_backend is not None
@@ -329,6 +405,19 @@ class ModelManager:
             total_ram_gb=total_ram_gb,
             generation_backend_vram_gb=self._generation_health.estimated_vram_gb,
             embedding_backend_vram_gb=self._embedding_health.estimated_vram_gb,
+            active_heavy_roles=tuple(self._active_heavy_roles),
+            heavy_slot_limit=self._heavy_slot_limit,
+            governor_active=governor.active,
+            governor_pressure_reasons=governor.pressure_reasons,
+            governor_degraded_features=governor.degraded_features,
+            queue_pressure=governor.queue_pressure,
+            backend_health_degraded=governor.backend_health_degraded,
+            allow_continuous_capture=governor.allow_continuous_capture,
+            allow_ocr_on_step=governor.allow_ocr_on_step,
+            allow_vision_on_step=governor.allow_vision_on_step,
+            allow_optional_heavy_residency=governor.allow_optional_heavy_residency,
+            allow_background_work=governor.allow_background_work,
+            governor_summary=governor.summary,
             telemetry_enabled=telemetry_enabled,
             last_error=self._last_error,
         )
@@ -540,8 +629,10 @@ class ModelManager:
             ModelRole.TEXT_TO_SPEECH: "Text-to-speech route is enabled but no synthesis backend is registered yet.",
             ModelRole.TRANSLATION: "Translation route is ready. Use the Translation tab for bounded local translation.",
             ModelRole.CODE_SPECIALIST: "Code-specialist route is ready. Use the Code tab for bounded local review.",
-            ModelRole.VISION: "Vision route is enabled but no vision backend is registered yet.",
-            ModelRole.SPECIALIST_PERCEPTION: "Specialist-perception route is enabled but no backend is registered yet.",
+            ModelRole.VISION: "Vision route is ready for bounded on-step screenshot inspection.",
+            ModelRole.SPECIALIST_PERCEPTION: (
+                "Specialist-perception route is ready; keep it disabled unless CPU OCR plus vision are insufficient."
+            ),
         }
         return decision, capability_messages.get(
             resolved_role,
@@ -820,6 +911,58 @@ class ModelManager:
         await self._refresh_health()
         return result
 
+    async def inspect_image(
+        self,
+        image_path: str | Path,
+        *,
+        request_text: str,
+        extracted_text: str = "",
+        role: ModelRole | str = ModelRole.VISION,
+    ) -> VisionInspectionResult:
+        """Run one bounded optional visual-role inspection request."""
+        self._require_started()
+        resolved_role = role if isinstance(role, ModelRole) else ModelRole(str(role))
+        if resolved_role not in {ModelRole.VISION, ModelRole.SPECIALIST_PERCEPTION}:
+            raise ValueError("inspect_image only supports vision or specialist_perception roles.")
+        capability = "vision_inference" if resolved_role == ModelRole.VISION else "specialist_perception"
+        decision = self.route_role(resolved_role, capability=capability)
+        source_path = Path(image_path)
+        if not decision.allowed:
+            return VisionInspectionResult(
+                status="blocked",
+                source_path=str(source_path),
+                request_text=request_text,
+                role=resolved_role,
+                inspection_backend=decision.selected_backend,
+                inspection_model=decision.selected_model_identifier,
+                warnings=(decision.fallback_reason or f"{resolved_role.value}_routing_blocked",),
+                degraded_reason=decision.fallback_reason or f"{resolved_role.value}_routing_blocked",
+            )
+        backend_name = decision.selected_backend or f"stub_{resolved_role.value}"
+        if backend_name.startswith("stub_"):
+            result = await asyncio.to_thread(
+                inspect_image_with_stub,
+                source_path,
+                request_text=request_text,
+                extracted_text=extracted_text,
+                role=resolved_role,
+                vision_model=decision.selected_model_identifier or f"stub-{resolved_role.value}",
+            )
+        else:
+            result = VisionInspectionResult(
+                status="blocked",
+                source_path=str(source_path),
+                request_text=request_text,
+                role=resolved_role,
+                inspection_backend=backend_name,
+                inspection_model=decision.selected_model_identifier,
+                warnings=(f"{resolved_role.value}_backend_unimplemented",),
+                degraded_reason=f"{resolved_role.value}_backend_unimplemented",
+            )
+        self._mark_used()
+        await self._refresh_health()
+        return result
+
     def route_role(self, role: ModelRole | str, *, capability: str = "") -> ModelRouteDecision:
         """Route one requested role through the typed registry without changing wrappers."""
         resolved_role = role if isinstance(role, ModelRole) else ModelRole(str(role))
@@ -870,31 +1013,57 @@ class ModelManager:
             self._record_route_decision(decision)
             return decision
 
-        if (
-            selected.resource_class == ModelResourceClass.HEAVY
-            and resolved_role.value not in self._active_heavy_roles
-            and len(self._active_heavy_roles) >= self._heavy_slot_limit
-        ):
-            decision = ModelRouteDecision(
-                requested_role=resolved_role,
-                selected_registration_id=selected.registration_id,
-                selected_backend=selected.backend,
-                selected_model_identifier=selected.model_identifier,
-                resource_class=selected.resource_class,
-                capability=capability,
-                allowed=False,
-                fallback_reason="heavy_slot_cap_reached",
-                active_heavy_roles=tuple(self._active_heavy_roles),
-                heavy_slot_limit=self._heavy_slot_limit,
-            )
-            self._record_route_decision(decision)
-            return decision
-
-        if (
-            selected.resource_class == ModelResourceClass.HEAVY
-            and resolved_role not in {ModelRole.GENERATION, ModelRole.EMBEDDING}
-        ):
-            self._touch_optional_heavy_role(resolved_role)
+        swapped_out_roles: tuple[str, ...] = ()
+        reactivated_roles: tuple[str, ...] = ()
+        if selected.resource_class == ModelResourceClass.HEAVY:
+            governor = self._hardware_governor_state()
+            if (
+                resolved_role not in self._MANDATORY_ROLES
+                and not governor.allow_optional_heavy_residency
+            ):
+                decision = ModelRouteDecision(
+                    requested_role=resolved_role,
+                    selected_registration_id=selected.registration_id,
+                    selected_backend=selected.backend,
+                    selected_model_identifier=selected.model_identifier,
+                    resource_class=selected.resource_class,
+                    capability=capability,
+                    allowed=False,
+                    fallback_reason="hardware_governor_optional_heavy_residency_disabled",
+                    active_heavy_roles=tuple(self._active_heavy_roles),
+                    heavy_slot_limit=self._heavy_slot_limit,
+                    metadata={
+                        "pressure_reasons": governor.pressure_reasons,
+                        "degraded_features": governor.degraded_features,
+                    },
+                )
+                self._record_route_decision(decision)
+                return decision
+            if resolved_role in self._MANDATORY_ROLES:
+                reactivated_roles = self._ensure_mandatory_heavy_role_active(resolved_role)
+            elif resolved_role.value not in self._active_heavy_roles:
+                if len(self._active_heavy_roles) >= self._heavy_slot_limit:
+                    swap_result = self._swap_in_optional_heavy_role(resolved_role)
+                    if swap_result is None:
+                        decision = ModelRouteDecision(
+                            requested_role=resolved_role,
+                            selected_registration_id=selected.registration_id,
+                            selected_backend=selected.backend,
+                            selected_model_identifier=selected.model_identifier,
+                            resource_class=selected.resource_class,
+                            capability=capability,
+                            allowed=False,
+                            fallback_reason="heavy_slot_cap_reached",
+                            active_heavy_roles=tuple(self._active_heavy_roles),
+                            heavy_slot_limit=self._heavy_slot_limit,
+                        )
+                        self._record_route_decision(decision)
+                        return decision
+                    swapped_out_roles = swap_result
+                else:
+                    self._touch_optional_heavy_role(resolved_role)
+            else:
+                self._touch_optional_heavy_role(resolved_role)
 
         decision = ModelRouteDecision(
             requested_role=resolved_role,
@@ -912,6 +1081,11 @@ class ModelManager:
             fallback_reason=(self._fallback_reason or "") if self._fallback_active else "",
             active_heavy_roles=tuple(self._active_heavy_roles),
             heavy_slot_limit=self._heavy_slot_limit,
+            metadata={
+                "swapped_out_roles": swapped_out_roles,
+                "reactivated_roles": reactivated_roles,
+                "load_policy": selected.load_policy.value,
+            },
         )
         self._record_route_decision(decision)
         return decision
@@ -928,12 +1102,17 @@ class ModelManager:
         if self._fallback_reason:
             fallback_reasons["generation"] = self._fallback_reason
             fallback_reasons["embedding"] = self._fallback_reason
+        governor = self._hardware_governor_state()
         return ModelRegistryView(
             registrations=tuple(self._registrations.values()),
             preferred_models=dict(self._preferred_models),
             active_heavy_roles=tuple(self._active_heavy_roles),
             heavy_slot_limit=self._heavy_slot_limit,
             fallback_reasons=fallback_reasons,
+            governor_active=governor.active,
+            governor_pressure_reasons=governor.pressure_reasons,
+            governor_degraded_features=governor.degraded_features,
+            governor_summary=governor.summary,
             last_route_decisions=tuple(self._route_history[-8:]),
             advisory_available=advisory_available,
             optimizer_subscriptions=optimizer_subscriptions,
@@ -953,6 +1132,26 @@ class ModelManager:
     def warm_cache(self, namespace: str, key: str, value) -> None:
         """Warm a bounded cache namespace without creating unbounded background work."""
         self._cache_manager.put(namespace, key, value)
+
+    def apply_governor_advisory_inputs(self, suggestions: Sequence[OptimizerSuggestionRecord]) -> None:
+        """Clamp optimizer hints into short-lived governor inputs without creating a second control path."""
+        now = time.monotonic()
+        self._prune_governor_advisory_inputs(now=now)
+        accepted: dict[str, _GovernorAdvisoryInput] = {}
+        for suggestion in suggestions[: self._MAX_GOVERNOR_ADVISORIES]:
+            parsed = self._parse_governor_advisory_input(suggestion, now=now)
+            if parsed is None:
+                continue
+            accepted[parsed.suggestion_id] = parsed
+        if not accepted:
+            return
+        merged = {**self._governor_advisory_inputs, **accepted}
+        ordered = sorted(
+            merged.values(),
+            key=lambda item: (item.expires_at_monotonic, item.kind.value, item.suggestion_id),
+            reverse=True,
+        )[: self._MAX_GOVERNOR_ADVISORIES]
+        self._governor_advisory_inputs = {item.suggestion_id: item for item in ordered}
 
     def compression_insight_summaries(self, *, limit: int = 4) -> tuple[CompressionInsightSummary, ...]:
         """Return bounded typed compression summaries for the app shell."""
@@ -1250,6 +1449,38 @@ class ModelManager:
                     metadata={"stub": True, "recommended_default": "Qwen/Qwen2.5-Coder-1.5B-Instruct"},
                 )
             )
+            self.register_model(
+                ModelRegistration(
+                    registration_id="vision_stub:stub_vision:stub-smolvlm-256m",
+                    role=ModelRole.VISION,
+                    backend="stub_vision",
+                    model_identifier="stub-smolvlm-256m",
+                    resource_class=ModelResourceClass.HEAVY,
+                    enabled=False,
+                    preferred_device="cpu",
+                    load_policy=ModelLoadPolicy.ON_DEMAND,
+                    supported_capabilities=("vision_inference",),
+                    metadata={"stub": True, "recommended_default": "HuggingFaceTB/SmolVLM-256M-Instruct"},
+                )
+            )
+            self.register_model(
+                ModelRegistration(
+                    registration_id="specialist_perception_stub:stub_specialist_perception:stub-paddleocr",
+                    role=ModelRole.SPECIALIST_PERCEPTION,
+                    backend="stub_specialist_perception",
+                    model_identifier="stub-paddleocr",
+                    resource_class=ModelResourceClass.HEAVY,
+                    enabled=False,
+                    preferred_device="cpu",
+                    load_policy=ModelLoadPolicy.ON_DEMAND,
+                    supported_capabilities=("specialist_perception",),
+                    metadata={
+                        "stub": True,
+                        "recommended_default": "PaddleOCR",
+                        "upgrade_only": True,
+                    },
+                )
+            )
         for role, resource_class, capabilities in (
             (ModelRole.RERANKER, ModelResourceClass.SIDECAR, ("rerank",)),
             (ModelRole.SPEECH_TO_TEXT, ModelResourceClass.SIDECAR, ("transcribe",)),
@@ -1272,7 +1503,10 @@ class ModelManager:
                     load_policy=ModelLoadPolicy.ON_DEMAND,
                     supported_capabilities=capabilities,
                     missing_dependencies=("not_installed",),
-                    metadata={"placeholder": True},
+                    metadata={
+                        "placeholder": True,
+                        "recommended_default": self._RECOMMENDED_SPECIALIST_DEFAULTS.get(role, ""),
+                    },
                 )
             )
 
@@ -1461,13 +1695,46 @@ class ModelManager:
             or bool(registration.metadata.get("placeholder"))
         )
 
+    def _ensure_mandatory_heavy_role_active(self, role: ModelRole) -> tuple[str, ...]:
+        removed_roles: list[str] = []
+        if role.value not in self._suspended_default_heavy_roles:
+            return ()
+        if len(self._active_heavy_roles) >= self._heavy_slot_limit:
+            removed_role = self._select_optional_heavy_role_to_unload(exclude=role.value)
+            if removed_role is not None:
+                self._loaded_optional_heavy_roles.pop(removed_role, None)
+                removed_roles.append(removed_role)
+        self._suspended_default_heavy_roles.discard(role.value)
+        self._sync_active_heavy_roles()
+        return tuple(removed_roles)
+
+    def _swap_in_optional_heavy_role(self, role: ModelRole) -> tuple[str, ...] | None:
+        removed_roles: list[str] = []
+        if role in self._MANDATORY_ROLES:
+            return ()
+        if role.value in self._active_heavy_roles:
+            self._touch_optional_heavy_role(role)
+            return ()
+        if len(self._active_heavy_roles) < self._heavy_slot_limit:
+            self._touch_optional_heavy_role(role)
+            return ()
+        removed_role = self._select_optional_heavy_role_to_unload(exclude=role.value)
+        if removed_role is not None:
+            self._loaded_optional_heavy_roles.pop(removed_role, None)
+            removed_roles.append(removed_role)
+        elif ModelRole.EMBEDDING.value in self._active_heavy_roles and role != ModelRole.EMBEDDING:
+            self._suspended_default_heavy_roles.add(ModelRole.EMBEDDING.value)
+            removed_roles.append(ModelRole.EMBEDDING.value)
+        elif ModelRole.GENERATION.value in self._active_heavy_roles and role != ModelRole.GENERATION:
+            self._suspended_default_heavy_roles.add(ModelRole.GENERATION.value)
+            removed_roles.append(ModelRole.GENERATION.value)
+        else:
+            return None
+        self._touch_optional_heavy_role(role)
+        return tuple(removed_roles)
+
     def _sync_active_heavy_roles(self) -> None:
         active_roles: list[str] = []
-        if self._generation_health.started or self._generation_health.available:
-            active_roles.append(ModelRole.GENERATION.value)
-        if self._embedding_health.started or self._embedding_health.available:
-            active_roles.append(ModelRole.EMBEDDING.value)
-        remaining_slots = max(0, self._heavy_slot_limit - len(active_roles))
         optional_roles = [
             role
             for role, _timestamp in sorted(
@@ -1475,9 +1742,25 @@ class ModelManager:
                 key=lambda item: item[1],
                 reverse=True,
             )
-            if role not in active_roles
         ]
-        kept_optional_roles = optional_roles[:remaining_slots]
+        if not optional_roles:
+            self._suspended_default_heavy_roles.clear()
+        if (
+            (self._generation_health.started or self._generation_health.available)
+            and ModelRole.GENERATION.value not in self._suspended_default_heavy_roles
+        ):
+            active_roles.append(ModelRole.GENERATION.value)
+        if (
+            (self._embedding_health.started or self._embedding_health.available)
+            and ModelRole.EMBEDDING.value not in self._suspended_default_heavy_roles
+        ):
+            active_roles.append(ModelRole.EMBEDDING.value)
+        remaining_slots = max(0, self._heavy_slot_limit - len(active_roles))
+        kept_optional_roles = [
+            role
+            for role in optional_roles
+            if role not in active_roles
+        ][:remaining_slots]
         self._loaded_optional_heavy_roles = {
             role: self._loaded_optional_heavy_roles[role]
             for role in kept_optional_roles
@@ -1489,6 +1772,155 @@ class ModelManager:
         self._loaded_optional_heavy_roles[role.value] = time.monotonic()
         self._mark_used()
         self._sync_active_heavy_roles()
+
+    def _parse_governor_advisory_input(
+        self,
+        suggestion: OptimizerSuggestionRecord,
+        *,
+        now: float,
+    ) -> _GovernorAdvisoryInput | None:
+        if suggestion.kind not in self._GOVERNOR_ADVISORY_KINDS:
+            return None
+        retention_seconds = self._clamped_governor_advisory_retention_s(suggestion.metadata)
+        if suggestion.kind == OptimizerSuggestionKind.MODEL_LOADING:
+            roles = self._bounded_optional_heavy_roles_from_metadata(suggestion.metadata)
+            if not roles:
+                return None
+            return _GovernorAdvisoryInput(
+                suggestion_id=suggestion.suggestion_id,
+                kind=suggestion.kind,
+                optional_heavy_roles=roles,
+                expires_at_monotonic=now + retention_seconds,
+            )
+        namespaces, warm_key_count = self._bounded_cache_prefetch_from_metadata(suggestion.metadata)
+        if not namespaces:
+            return None
+        return _GovernorAdvisoryInput(
+            suggestion_id=suggestion.suggestion_id,
+            kind=suggestion.kind,
+            cache_namespaces=namespaces,
+            warm_key_count=warm_key_count,
+            expires_at_monotonic=now + retention_seconds,
+        )
+
+    def _clamped_governor_advisory_retention_s(self, metadata: dict[str, object]) -> float:
+        raw_retention = metadata.get("retention_seconds", 30.0)
+        try:
+            retention_seconds = float(raw_retention)
+        except (TypeError, ValueError):
+            retention_seconds = 30.0
+        return max(5.0, min(retention_seconds, self._MAX_GOVERNOR_ADVISORY_RETENTION_S))
+
+    def _bounded_optional_heavy_roles_from_metadata(self, metadata: dict[str, object]) -> tuple[str, ...]:
+        raw_roles = metadata.get("roles", ())
+        if not raw_roles and "role" in metadata:
+            raw_roles = (metadata.get("role"),)
+        if isinstance(raw_roles, str):
+            raw_roles = (raw_roles,)
+        accepted: list[str] = []
+        role_limit = min(self._MAX_GOVERNOR_ADVISORY_ROLES, self._heavy_slot_limit)
+        for item in raw_roles:
+            role_value = str(item).strip()
+            if not role_value:
+                continue
+            try:
+                resolved_role = ModelRole(role_value)
+            except ValueError:
+                continue
+            if resolved_role in self._MANDATORY_ROLES:
+                continue
+            registrations = self.list_registered_models(role=resolved_role)
+            if not any(
+                registration.resource_class == ModelResourceClass.HEAVY and registration.enabled
+                for registration in registrations
+            ):
+                continue
+            if resolved_role.value in accepted:
+                continue
+            accepted.append(resolved_role.value)
+            if len(accepted) >= role_limit:
+                break
+        return tuple(accepted)
+
+    def _bounded_cache_prefetch_from_metadata(self, metadata: dict[str, object]) -> tuple[tuple[str, ...], int]:
+        raw_namespaces = metadata.get("cache_namespaces", ())
+        if not raw_namespaces and "cache_namespace" in metadata:
+            raw_namespaces = (metadata.get("cache_namespace"),)
+        if isinstance(raw_namespaces, str):
+            raw_namespaces = (raw_namespaces,)
+        namespaces: list[str] = []
+        for item in raw_namespaces:
+            namespace = str(item).strip()
+            if not namespace or namespace not in self._GOVERNOR_ADVISORY_CACHE_NAMESPACES:
+                continue
+            if namespace in namespaces:
+                continue
+            namespaces.append(namespace)
+            if len(namespaces) >= 2:
+                break
+        raw_warm_keys = metadata.get("warm_keys", ())
+        if isinstance(raw_warm_keys, str):
+            raw_warm_keys = (raw_warm_keys,)
+        warm_key_count = 0
+        for item in raw_warm_keys:
+            if not str(item).strip():
+                continue
+            warm_key_count += 1
+            if warm_key_count >= self._MAX_GOVERNOR_ADVISORY_WARM_KEYS:
+                break
+        return (tuple(namespaces), warm_key_count)
+
+    def _prune_governor_advisory_inputs(self, *, now: float | None = None) -> None:
+        current_time = time.monotonic() if now is None else now
+        self._governor_advisory_inputs = {
+            suggestion_id: payload
+            for suggestion_id, payload in self._governor_advisory_inputs.items()
+            if payload.expires_at_monotonic > current_time
+        }
+
+    def _active_governor_advisory_inputs(self, *, now: float | None = None) -> tuple[_GovernorAdvisoryInput, ...]:
+        current_time = time.monotonic() if now is None else now
+        self._prune_governor_advisory_inputs(now=current_time)
+        return tuple(
+            sorted(
+                self._governor_advisory_inputs.values(),
+                key=lambda item: (item.expires_at_monotonic, item.kind.value, item.suggestion_id),
+                reverse=True,
+            )
+        )
+
+    def _advised_optional_heavy_roles(self, *, now: float | None = None) -> set[str]:
+        roles: set[str] = set()
+        for payload in self._active_governor_advisory_inputs(now=now):
+            if payload.kind == OptimizerSuggestionKind.MODEL_LOADING:
+                roles.update(payload.optional_heavy_roles)
+        return roles
+
+    def _select_optional_heavy_role_to_unload(
+        self,
+        *,
+        exclude: str | None = None,
+        now: float | None = None,
+    ) -> str | None:
+        current_time = time.monotonic() if now is None else now
+        advised_roles = self._advised_optional_heavy_roles(now=current_time)
+        candidates = [
+            item
+            for item in self._loaded_optional_heavy_roles.items()
+            if exclude is None or item[0] != exclude
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0] in advised_roles, item[1]))
+        return candidates[0][0]
+
+    def _governor_advisory_summary(self, *, now: float | None = None) -> str:
+        current_time = time.monotonic() if now is None else now
+        advisory_inputs = self._active_governor_advisory_inputs(now=current_time)
+        if not advisory_inputs:
+            return ""
+        fragments = [payload.summary_fragment(now=current_time) for payload in advisory_inputs]
+        return "advisory=" + "; ".join(fragments)
 
     async def _start_backend_with_fallback(self, kind: str) -> None:
         if kind == "generation":
@@ -1629,10 +2061,43 @@ class ModelManager:
             raise ResourcePressureError(low_memory_reason) from None
 
     async def _maintenance_loop(self) -> None:
+        """
+        Hardware governor/model scheduler:
+        - Monitors RAM/VRAM/queue pressure
+        - Enforces heavy slot cap
+        - Degrades/disables features in order when under pressure
+        - Surfaces degrade/disable reasons to dashboard/orchestrator
+        """
         while not self._stop_event.is_set():
             try:
                 await self._refresh_health()
                 await self._maybe_unload_idle_backends()
+                governor = self._hardware_governor_state()
+                log_messages: list[str] = []
+                if len(self._active_heavy_roles) > self._heavy_slot_limit:
+                    log_messages.append(
+                        f"heavy slot cap exceeded: {len(self._active_heavy_roles)}/{self._heavy_slot_limit}"
+                    )
+                    while len(self._active_heavy_roles) > self._heavy_slot_limit:
+                        unload_role = self._select_optional_heavy_role_to_unload()
+                        if unload_role is None:
+                            break
+                        self._loaded_optional_heavy_roles.pop(unload_role, None)
+                        log_messages.append(f"unloaded optional heavy role: {unload_role}")
+                        self._sync_active_heavy_roles()
+                if not governor.allow_optional_heavy_residency and self._loaded_optional_heavy_roles:
+                    unload_role = self._select_optional_heavy_role_to_unload()
+                    if unload_role is None:
+                        await asyncio.sleep(self.config.backend_runtime.idle_check_interval_s)
+                        continue
+                    self._loaded_optional_heavy_roles.pop(unload_role, None)
+                    self._sync_active_heavy_roles()
+                    log_messages.append(f"hardware governor unloaded optional heavy role: {unload_role}")
+                if governor.active or log_messages:
+                    details = list(log_messages)
+                    if governor.summary:
+                        details.insert(0, governor.summary)
+                    self.logger.warning("Hardware governor: %s", "; ".join(details))
             except Exception as exc:  # pragma: no cover - defensive runtime guard
                 self._last_error = str(exc)
                 self.logger.warning("ModelManager maintenance loop error: %s", exc)
@@ -1643,11 +2108,19 @@ class ModelManager:
             return
         if self._active_generation_jobs or self._active_embedding_jobs:
             return
-        idle_seconds = time.monotonic() - self._last_used_monotonic
+        current_time = time.monotonic()
+        idle_seconds = current_time - self._last_used_monotonic
         if idle_seconds < self.config.backend_runtime.idle_unload_after_s:
             return
-        optional_unloaded = bool(self._loaded_optional_heavy_roles)
-        self._loaded_optional_heavy_roles = {}
+        advised_roles = self._advised_optional_heavy_roles(now=current_time)
+        retained_optional_roles = {
+            role: timestamp
+            for role, timestamp in self._loaded_optional_heavy_roles.items()
+            if role in advised_roles
+        }
+        optional_unloaded = len(retained_optional_roles) != len(self._loaded_optional_heavy_roles)
+        self._loaded_optional_heavy_roles = retained_optional_roles
+        self._sync_active_heavy_roles()
         unloaded = False
         for backend in (self._active_generation_backend, self._active_embedding_backend):
             if backend is None:
@@ -1765,13 +2238,26 @@ class ModelManager:
         memory = psutil.virtual_memory()
         return (memory.total / (1024**3), memory.available / (1024**3))
 
+    def _low_ram_threshold_gb(self, total_ram_gb: float | None) -> float:
+        """Return the effective low-RAM threshold used by governor and fallback checks.
+
+        The configured headroom remains the upper bound, but the live threshold is
+        reduced on larger-memory hosts so background system pressure does not
+        disable optional features too aggressively during otherwise healthy runs.
+        """
+        configured = max(0.1, float(self.config.backend_runtime.low_ram_headroom_gb))
+        if total_ram_gb is None:
+            return configured
+        return min(configured, max(0.25, float(total_ram_gb) * 0.05))
+
     def _detect_memory_pressure(self) -> str | None:
         total_ram_gb, available_ram_gb = self._read_ram_telemetry()
         reasons: list[str] = []
-        if available_ram_gb is not None and available_ram_gb <= self.config.backend_runtime.low_ram_headroom_gb:
+        low_ram_threshold_gb = self._low_ram_threshold_gb(total_ram_gb)
+        if available_ram_gb is not None and available_ram_gb <= low_ram_threshold_gb:
             reasons.append(
                 f"available RAM {available_ram_gb:.2f}GB is below headroom "
-                f"{self.config.backend_runtime.low_ram_headroom_gb:.2f}GB"
+                f"{low_ram_threshold_gb:.2f}GB"
             )
         if (
             self._generation_health.estimated_vram_gb is not None
@@ -1795,6 +2281,121 @@ class ModelManager:
         if not reasons:
             return None
         return "; ".join(reasons)
+
+    def _hardware_governor_state(
+        self,
+        *,
+        total_ram_gb: float | None = None,
+        available_ram_gb: float | None = None,
+    ) -> HardwareGovernorState:
+        current_time = time.monotonic()
+        if total_ram_gb is None or available_ram_gb is None:
+            total_ram_gb, available_ram_gb = self._read_ram_telemetry()
+        pressure_reasons: list[str] = []
+        queue_pressure = False
+        backend_health_degraded = False
+        if self._fallback_active:
+            pressure_reasons.append("model_fallback_active")
+            backend_health_degraded = True
+        low_ram_threshold_gb = self._low_ram_threshold_gb(total_ram_gb)
+        if available_ram_gb is not None and available_ram_gb <= low_ram_threshold_gb:
+            pressure_reasons.append("low_available_ram")
+        max_vram_gb = self.config.preflight.hardware.max_vram_gb
+        low_vram_headroom = self.config.backend_runtime.low_vram_headroom_gb
+        if (
+            self._generation_health.estimated_vram_gb is not None
+            and self._generation_health.estimated_vram_gb >= max_vram_gb - low_vram_headroom
+        ):
+            pressure_reasons.append("generation_vram_pressure")
+        if (
+            self._embedding_health.estimated_vram_gb is not None
+            and self._embedding_health.estimated_vram_gb >= max_vram_gb - low_vram_headroom
+        ):
+            pressure_reasons.append("embedding_vram_pressure")
+        if self._active_generation_jobs >= self.config.concurrency.generation_slots:
+            pressure_reasons.append("generation_queue_pressure")
+            queue_pressure = True
+        if self._active_embedding_jobs >= self.config.concurrency.embedding_slots:
+            pressure_reasons.append("embedding_queue_pressure")
+            queue_pressure = True
+        if self._started and (
+            bool(self._generation_health.last_error)
+            or (
+                self._active_generation_backend is not None
+                and self._generation_health.started
+                and not self._generation_health.available
+            )
+        ):
+            pressure_reasons.append("generation_backend_unhealthy")
+            backend_health_degraded = True
+        if self._started and (
+            bool(self._embedding_health.last_error)
+            or (
+                self._active_embedding_backend is not None
+                and self._embedding_health.started
+                and not self._embedding_health.available
+            )
+        ):
+            pressure_reasons.append("embedding_backend_unhealthy")
+            backend_health_degraded = True
+        if len(self._active_heavy_roles) > self._heavy_slot_limit:
+            pressure_reasons.append("heavy_slot_cap_exceeded")
+        unique_reasons = tuple(dict.fromkeys(pressure_reasons))
+        severe_pressure = any(
+            reason in {
+                "model_fallback_active",
+                "low_available_ram",
+                "generation_vram_pressure",
+                "embedding_vram_pressure",
+                "generation_backend_unhealthy",
+                "embedding_backend_unhealthy",
+                "heavy_slot_cap_exceeded",
+            }
+            for reason in unique_reasons
+        )
+        allow_continuous_capture = not bool(unique_reasons)
+        allow_ocr_on_step = not severe_pressure
+        allow_vision_on_step = not bool(unique_reasons)
+        allow_optional_heavy_residency = not bool(unique_reasons)
+        allow_background_work = not bool(unique_reasons)
+        degraded_features: list[str] = []
+        if not allow_continuous_capture:
+            degraded_features.append("continuous_capture")
+        if not allow_ocr_on_step:
+            degraded_features.append("ocr_on_step")
+        if not allow_vision_on_step:
+            degraded_features.append("vision_on_step")
+        if not allow_optional_heavy_residency:
+            degraded_features.append("optional_heavy_residency")
+        if not allow_background_work:
+            degraded_features.append("background_work")
+        summary = ""
+        advisory_summary = self._governor_advisory_summary(now=current_time)
+        if unique_reasons:
+            summary = (
+                "pressure="
+                + ", ".join(unique_reasons)
+                + " | degraded="
+                + (", ".join(degraded_features) if degraded_features else "(none)")
+            )
+            if advisory_summary:
+                summary += " | " + advisory_summary
+        elif advisory_summary:
+            summary = advisory_summary
+        _ = total_ram_gb
+        return HardwareGovernorState(
+            active=bool(unique_reasons),
+            pressure_reasons=unique_reasons,
+            degraded_features=tuple(degraded_features),
+            queue_pressure=queue_pressure,
+            backend_health_degraded=backend_health_degraded,
+            allow_continuous_capture=allow_continuous_capture,
+            allow_ocr_on_step=allow_ocr_on_step,
+            allow_vision_on_step=allow_vision_on_step,
+            allow_optional_heavy_residency=allow_optional_heavy_residency,
+            allow_background_work=allow_background_work,
+            summary=summary,
+        )
 
     def _require_started(self) -> None:
         if not self._started:
