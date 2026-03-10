@@ -16,7 +16,26 @@ from pyside_shell import (
 )
 
 
+def _cleanup_qt() -> None:
+    if not pyside6_available():
+        return
+    from PySide6 import QtCore, QtWidgets
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    app.closeAllWindows()
+    QtCore.QCoreApplication.sendPostedEvents(None, 0)
+    app.processEvents()
+    app.quit()
+    QtCore.QCoreApplication.sendPostedEvents(None, 0)
+    app.processEvents()
+
+
 class PySideShellModuleTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        _cleanup_qt()
+
     def test_pyside6_dependency_is_available_in_the_active_desktop_env(self) -> None:
         self.assertTrue(pyside6_available())
 
@@ -32,6 +51,10 @@ class PySideShellModuleTests(unittest.TestCase):
             shell_state=ShellState(
                 status_text="Deep Thought",
                 sub_status_text="Ranking options",
+                hero_metric_strip=("Candidates 3", "Evidence 6", "Verifier verified"),
+                active_route_summary=("generation:qwen", "embedding:e5-small"),
+                current_project="sandbox",
+                current_file="sandbox:solution.py",
                 current_task_summary="Analyze multiple candidates.",
             ),
             app_state=DashboardAppState(),
@@ -43,10 +66,11 @@ class PySideShellModuleTests(unittest.TestCase):
 
         self.assertEqual(window.windowTitle(), "Quester.AI")
         self.assertEqual(window._status.text(), "Deep Thought")
+        self.assertIn("Candidates 3", window._hero_metrics.text())
+        self.assertIn("generation:qwen", window._route_summary.text())
         self.assertEqual(submissions, [("Test the shell", 120)])
         window.close()
-        app.quit()
-        app.processEvents()
+        _cleanup_qt()
 
     def test_shell_host_starts_and_stops_cleanly(self) -> None:
         if not pyside6_available():
@@ -57,6 +81,10 @@ class PySideShellModuleTests(unittest.TestCase):
                 )
             return
 
+        from PySide6 import QtWidgets
+
+        _ = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
         host = PySideShellHost(
             shell_state_provider=ShellState,
             app_state_provider=DashboardAppState,
@@ -66,12 +94,7 @@ class PySideShellModuleTests(unittest.TestCase):
         self.assertTrue(host.is_running)
         host.stop(timeout_s=5.0)
         self.assertFalse(host.is_running)
-        from PySide6 import QtWidgets
-
-        app = QtWidgets.QApplication.instance()
-        if app is not None:
-            app.quit()
-            app.processEvents()
+        _cleanup_qt()
 
 
 if __name__ == "__main__":

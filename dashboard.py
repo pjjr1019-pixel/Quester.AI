@@ -7,6 +7,7 @@ import queue
 import threading
 from datetime import timedelta
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Callable
 
 from config import APP_CONFIG, AppConfig
@@ -27,6 +28,7 @@ from data_structures import (
     DashboardCapabilityAvailability,
     DashboardKnowledgeSource,
     DashboardLocalTaskSessionState,
+    DashboardTaskState,
     ModelRole,
     ModelRoleActionReport,
     ModelRegistryView,
@@ -2240,6 +2242,46 @@ class DashboardService:
             if coding_output.active_phase not in {"", "idle"}
             else "idle"
         )
+        practice_session_state = (
+            coding_practice.status if coding_practice.status not in {"", "idle"} else "idle"
+        )
+        workspace_mode = (
+            "coding_workspace"
+            if str(state.user_settings.coding.get("mode", "assistant")) == "coding_workspace"
+            or coding_state != "idle"
+            or practice_session_state != "idle"
+            else "assistant"
+        )
+        active_route_summary = self._active_route_summary(
+            state=state,
+            stage=stage,
+            coding_output=coding_output,
+            coding_practice=coding_practice,
+        )
+        active_model_roles = self._active_model_roles(state)
+        candidate_count = int(task.candidate_trace_count)
+        evidence_count = max(
+            int(task.local_result_count) + int(task.web_result_count),
+            len(task.supporting_evidence_ids),
+        )
+        elapsed_seconds = float(task.long_horizon_elapsed_seconds or 0.0)
+        current_file, current_project = self._coding_context_paths(
+            coding_output=coding_output,
+            coding_practice=coding_practice,
+        )
+        sandbox_state = self._sandbox_state(
+            state=state,
+            stage=stage,
+            coding_output=coding_output,
+            coding_state=coding_state,
+            practice_session_state=practice_session_state,
+        )
+        quality_gate_state = self._quality_gate_state(
+            stage=stage,
+            coding_output=coding_output,
+            verifier_state=verifier_state,
+        )
+        pattern_tier_counts = self._pattern_tier_counts(state=state, coding_output=coding_output)
 
         if health.governor_active and (health.queue_pressure or health.backend_health_degraded):
             resource_pressure_level = "high"
@@ -2250,6 +2292,40 @@ class DashboardService:
 
         cloud_mode = str(state.user_settings.cloud.get("mode", "auxiliary_only")).strip()
         cloud_helper_state = "disabled" if cloud_mode == "disabled" else "available"
+        approval_prompt_summary = str(session.pending_approval_summaries[0]).strip() if approval_pending else ""
+        panel_visibility_state = {
+            "resource_ribbon": bool(state.user_settings.ui.get("resource_ribbon_visible", True)),
+            "activity_strip": bool(state.user_settings.ui.get("activity_strip_visible", True)),
+            "task_timeline": bool(state.user_settings.ui.get("task_timeline_visible", True)),
+            "notifications": bool(state.user_settings.ui.get("shell_notifications_visible", True)),
+            "utility_drawer": bool(state.user_settings.ui.get("show_utility_drawer", False)),
+        }
+        resource_ribbon_flags = self._resource_ribbon_flags(
+            coding_state=coding_state,
+            optimizer_state=optimizer_state,
+            approval_pending=approval_pending,
+            observation_tier=(
+                session.effective_observation_tier
+                or session.requested_observation_tier
+                or str(state.user_settings.observation.get("tier", "screenshot_on_demand"))
+            ),
+            cloud_helper_state=cloud_helper_state,
+            resource_pressure_level=resource_pressure_level,
+            degraded_reason=degraded_reason,
+            fallback_reason=fallback_reason,
+            capability_session_active=bool(session.session_id),
+        )
+        hero_metric_strip = self._hero_metric_strip(
+            workspace_mode=workspace_mode,
+            task=task,
+            verifier_state=verifier_state,
+            coding_output=coding_output,
+            coding_practice=coding_practice,
+            sandbox_state=sandbox_state,
+            quality_gate_state=quality_gate_state,
+            pattern_tier_counts=pattern_tier_counts,
+            evidence_count=evidence_count,
+        )
 
         activity_chips: list[ActivityChip] = []
         def add_chip(label: str, tone: str, detail: str = "") -> None:
@@ -2367,6 +2443,22 @@ class DashboardService:
             compression_state=compression_state,
             optimizer_state=optimizer_state,
             coding_state=coding_state,
+            workspace_mode=workspace_mode,
+            active_route_summary=active_route_summary,
+            active_model_roles=active_model_roles,
+            candidate_count=candidate_count,
+            evidence_count=evidence_count,
+            elapsed_seconds=elapsed_seconds,
+            current_file=current_file,
+            current_project=current_project,
+            sandbox_state=sandbox_state,
+            quality_gate_state=quality_gate_state,
+            pattern_tier_counts=pattern_tier_counts,
+            practice_session_state=practice_session_state,
+            approval_prompt_summary=approval_prompt_summary,
+            resource_ribbon_flags=resource_ribbon_flags,
+            panel_visibility_state=panel_visibility_state,
+            hero_metric_strip=hero_metric_strip,
             long_horizon_state=str(task.long_horizon_status or ""),
             checkpoint_count=int(task.long_horizon_completed_cycles),
             degraded_reason=degraded_reason,
@@ -2393,6 +2485,216 @@ class DashboardService:
             ),
             current_task_summary=current_task_summary,
         )
+
+    def _active_route_summary(
+        self,
+        *,
+        state: DashboardAppState,
+        stage: str,
+        coding_output: CodingTaskResult,
+        coding_practice: PracticeSessionResult,
+    ) -> tuple[str, ...]:
+        if stage.startswith("coding.") and coding_output.route_summary:
+            return tuple(coding_output.route_summary[:4])
+        if coding_output.route_summary:
+            return tuple(coding_output.route_summary[:4])
+        if coding_practice.task_result.route_summary:
+            return tuple(coding_practice.task_result.route_summary[:4])
+        summary: list[str] = []
+        for decision in state.model_registry_view.last_route_decisions[:4]:
+            summary.append(
+                f"{decision.requested_role.value}:"
+                f"{decision.selected_model_identifier or decision.fallback_reason or 'unavailable'}"
+            )
+        return tuple(summary)
+
+    def _active_model_roles(self, state: DashboardAppState) -> tuple[str, ...]:
+        roles = list(state.runtime_health.active_heavy_roles)
+        roles.extend(
+            decision.requested_role.value for decision in state.model_registry_view.last_route_decisions[:4]
+        )
+        return tuple(dict.fromkeys(role for role in roles if role))
+
+    def _coding_context_paths(
+        self,
+        *,
+        coding_output: CodingTaskResult,
+        coding_practice: PracticeSessionResult,
+    ) -> tuple[str, str]:
+        artifacts = coding_output.artifacts or coding_practice.task_result.artifacts
+        current_file = next((artifact.path for artifact in artifacts if artifact.path.strip()), "")
+        if not current_file:
+            return "", ""
+        if current_file.startswith("sandbox:"):
+            return current_file, "sandbox"
+        try:
+            project = str(Path(current_file).parent)
+        except (TypeError, ValueError):
+            project = ""
+        return current_file, project if project not in {"", "."} else ""
+
+    def _sandbox_state(
+        self,
+        *,
+        state: DashboardAppState,
+        stage: str,
+        coding_output: CodingTaskResult,
+        coding_state: str,
+        practice_session_state: str,
+    ) -> str:
+        sandbox_enabled = bool(state.user_settings.coding.get("sandbox_enabled", True))
+        if not sandbox_enabled and (coding_state != "idle" or practice_session_state != "idle"):
+            return "disabled"
+        if stage == "coding.testing":
+            return "running"
+        if stage in {"coding.debugging", "coding.regression_detected"}:
+            return "failed"
+        if any(
+            warning in {"sandbox_execution_skipped", "non_python_execution_skipped"}
+            for warning in coding_output.warnings
+        ):
+            return "skipped"
+        if coding_output.status not in {"", "idle"} and coding_output.artifacts:
+            return "completed"
+        if str(state.user_settings.coding.get("mode", "assistant")) == "coding_workspace" and sandbox_enabled:
+            return "ready"
+        return "idle"
+
+    def _quality_gate_state(
+        self,
+        *,
+        stage: str,
+        coding_output: CodingTaskResult,
+        verifier_state: str,
+    ) -> str:
+        if stage.startswith("coding.") or coding_output.status not in {"", "idle"}:
+            report = coding_output.quality_report
+            if stage in {"coding.testing", "coding.reviewing", "coding.debugging"}:
+                return "running"
+            passed_checks = sum(
+                1
+                for passed in (
+                    report.tests_passed,
+                    report.lint_passed,
+                    report.complexity_passed,
+                    report.security_passed,
+                    report.maintainability_passed,
+                    report.critique_passed,
+                    report.regression_passed,
+                )
+                if passed
+            )
+            if report.overall_passed:
+                return "passed"
+            if stage == "coding.regression_detected":
+                return "failed"
+            if passed_checks > 0:
+                return "partial"
+            return "failed" if report.findings or report.warnings else "idle"
+        if verifier_state == "running":
+            return "running"
+        if verifier_state == "verified":
+            return "passed"
+        if verifier_state == "degraded":
+            return "failed"
+        return "idle"
+
+    def _pattern_tier_counts(
+        self,
+        *,
+        state: DashboardAppState,
+        coding_output: CodingTaskResult,
+    ) -> dict[str, int]:
+        counts = {"verified": 0, "candidate": 0, "rejected": 0}
+        for pattern in state.coding_patterns:
+            tier = str(getattr(pattern.tier, "value", pattern.tier)).strip().lower()
+            if tier in counts:
+                counts[tier] += 1
+        if not any(counts.values()):
+            counts["verified"] = len(coding_output.verified_patterns)
+            counts["candidate"] = len(coding_output.candidate_patterns)
+            counts["rejected"] = len(coding_output.rejected_patterns)
+        return counts
+
+    def _resource_ribbon_flags(
+        self,
+        *,
+        coding_state: str,
+        optimizer_state: str,
+        approval_pending: bool,
+        observation_tier: str,
+        cloud_helper_state: str,
+        resource_pressure_level: str,
+        degraded_reason: str,
+        fallback_reason: str,
+        capability_session_active: bool,
+    ) -> tuple[str, ...]:
+        flags: list[str] = []
+        if resource_pressure_level != "nominal":
+            flags.append(f"pressure:{resource_pressure_level}")
+        if fallback_reason:
+            flags.append("fallback_active")
+        if degraded_reason:
+            flags.append("degraded")
+        if optimizer_state != "idle":
+            flags.append("optimizer_advisory")
+        if approval_pending:
+            flags.append("approval_pending")
+        if capability_session_active:
+            flags.append("capability_session")
+        if observation_tier and observation_tier != "screenshot_on_demand":
+            flags.append(f"observation:{observation_tier}")
+        if cloud_helper_state != "disabled":
+            flags.append("cloud_helper")
+        if coding_state != "idle":
+            flags.append(f"coding:{coding_state}")
+        return tuple(flags)
+
+    def _hero_metric_strip(
+        self,
+        *,
+        workspace_mode: str,
+        task: DashboardTaskState,
+        verifier_state: str,
+        coding_output: CodingTaskResult,
+        coding_practice: PracticeSessionResult,
+        sandbox_state: str,
+        quality_gate_state: str,
+        pattern_tier_counts: dict[str, int],
+        evidence_count: int,
+    ) -> tuple[str, ...]:
+        metrics: list[str] = []
+        if workspace_mode == "coding_workspace":
+            quality_score = (
+                coding_output.quality_report.quality_score
+                if coding_output.status not in {"", "idle"}
+                else coding_practice.quality_score
+            )
+            metrics.extend(
+                [
+                    f"Quality {quality_score:.2f}",
+                    f"Sandbox {sandbox_state}",
+                    f"Gates {quality_gate_state}",
+                    (
+                        "Patterns "
+                        f"V{pattern_tier_counts.get('verified', 0)} "
+                        f"C{pattern_tier_counts.get('candidate', 0)} "
+                        f"R{pattern_tier_counts.get('rejected', 0)}"
+                    ),
+                ]
+            )
+        else:
+            if task.candidate_trace_count:
+                metrics.append(f"Candidates {task.candidate_trace_count}")
+            if evidence_count:
+                metrics.append(f"Evidence {evidence_count}")
+            if verifier_state != "idle":
+                metrics.append(f"Verifier {verifier_state}")
+            if task.long_horizon_session_id:
+                metrics.append(
+                    f"Cycles {task.long_horizon_completed_cycles}/{task.long_horizon_total_cycles or '?'}"
+                )
+        return tuple(metric for metric in metrics if metric)[:4]
 
     def _active_agent_from_stage(
         self,

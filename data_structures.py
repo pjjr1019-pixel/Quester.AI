@@ -180,6 +180,16 @@ class OptimizerSuggestionKind(str, Enum):
     CACHE_PREFETCH = "cache_prefetch"
 
 
+class CompressionHintType(str, Enum):
+    """Typed upstream hint kinds used by the compressor to seed deterministic proposals."""
+
+    SHARED_SUBPROOF = "shared_subproof"
+    STABLE_SYMBOL_BUNDLE = "stable_symbol_bundle"
+    REPEATED_EVIDENCE_PATH = "repeated_evidence_path"
+    VERIFIER_STABLE_MOTIF = "verifier_stable_motif"
+    GRAPH_PATH = "graph_path"
+
+
 class OptimizerSuggestionDisposition(str, Enum):
     """Lifecycle disposition for one advisory suggestion in a foreground run."""
 
@@ -580,7 +590,7 @@ class PerformanceMetric(DictSerializable):
         _require(self.iterations >= 0, "PerformanceMetric.iterations must be >= 0.")
 
     def to_dict(self) -> dict[str, Any]:
-        payload = super().to_dict()
+        payload = DictSerializable.to_dict(self)
         payload["VRAM_usage"] = payload.pop("vram_usage")
         return payload
 
@@ -786,6 +796,59 @@ class OptimizerProposalRecord(DictSerializable):
             contradiction_risk=float(data.get("contradiction_risk", 1.0)),
             activation_eligible=bool(data.get("activation_eligible", False)),
             created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class MacroEffectivenessRecord(DictSerializable):
+    """Bounded persisted effectiveness summary for one macro proposal/context combination."""
+
+    record_id: str
+    proposal_id: str
+    proof_fingerprint: str = ""
+    macro_name: str = ""
+    context_tags: tuple[str, ...] = ()
+    seen_count: int = 0
+    replay_pass_rate: float = 0.0
+    proof_hash_stability: float = 0.0
+    critic_validity_rate: float = 0.0
+    realized_compression_gain: float = 0.0
+    last_used_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.record_id.strip()), "MacroEffectivenessRecord.record_id must not be empty.")
+        _require(bool(self.proposal_id.strip()), "MacroEffectivenessRecord.proposal_id must not be empty.")
+        _require(self.seen_count >= 0, "MacroEffectivenessRecord.seen_count must be >= 0.")
+        _require(0.0 <= self.replay_pass_rate <= 1.0, "MacroEffectivenessRecord.replay_pass_rate must be between 0 and 1.")
+        _require(
+            0.0 <= self.proof_hash_stability <= 1.0,
+            "MacroEffectivenessRecord.proof_hash_stability must be between 0 and 1.",
+        )
+        _require(
+            0.0 <= self.critic_validity_rate <= 1.0,
+            "MacroEffectivenessRecord.critic_validity_rate must be between 0 and 1.",
+        )
+        _require(
+            0.0 <= self.realized_compression_gain <= 1.0,
+            "MacroEffectivenessRecord.realized_compression_gain must be between 0 and 1.",
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> MacroEffectivenessRecord:
+        return cls(
+            record_id=str(data["record_id"]),
+            proposal_id=str(data["proposal_id"]),
+            proof_fingerprint=str(data.get("proof_fingerprint", "")),
+            macro_name=str(data.get("macro_name", "")),
+            context_tags=tuple(str(item) for item in data.get("context_tags", [])),
+            seen_count=int(data.get("seen_count", 0)),
+            replay_pass_rate=float(data.get("replay_pass_rate", 0.0)),
+            proof_hash_stability=float(data.get("proof_hash_stability", 0.0)),
+            critic_validity_rate=float(data.get("critic_validity_rate", 0.0)),
+            realized_compression_gain=float(data.get("realized_compression_gain", 0.0)),
+            last_used_at=_parse_datetime(data.get("last_used_at", utc_now())),
+            updated_at=_parse_datetime(data.get("updated_at", utc_now())),
         )
 
 
@@ -1148,7 +1211,7 @@ class SemanticEntity(DictSerializable):
 
     def to_dict(self) -> dict[str, Any]:
         return _compact_payload(
-            super().to_dict(),
+            DictSerializable.to_dict(self),
             drop_empty=("evidence_handles", "attributes", "uncertainty"),
             drop_defaults={"confidence": 1.0},
         )
@@ -1186,7 +1249,7 @@ class SemanticActivity(DictSerializable):
 
     def to_dict(self) -> dict[str, Any]:
         return _compact_payload(
-            super().to_dict(),
+            DictSerializable.to_dict(self),
             drop_empty=("input_entity_ids", "output_entity_ids", "agent_id", "evidence_handles", "metadata"),
         )
 
@@ -1221,7 +1284,7 @@ class SemanticAgent(DictSerializable):
 
     def to_dict(self) -> dict[str, Any]:
         return _compact_payload(
-            super().to_dict(),
+            DictSerializable.to_dict(self),
             drop_empty=("backend", "role", "metadata"),
         )
 
@@ -1253,7 +1316,7 @@ class ProvenanceBundle(DictSerializable):
 
     def to_dict(self) -> dict[str, Any]:
         return _compact_payload(
-            super().to_dict(),
+            DictSerializable.to_dict(self),
             drop_empty=("entity_ids", "activity_ids", "agent_ids", "metadata"),
         )
 
@@ -1288,7 +1351,7 @@ class ContextFrame(DictSerializable):
 
     def to_dict(self) -> dict[str, Any]:
         return _compact_payload(
-            super().to_dict(),
+            DictSerializable.to_dict(self),
             drop_empty=("provenance_bundle_id", "assumptions", "metadata"),
         )
 
@@ -1323,7 +1386,7 @@ class OperationStep(DictSerializable):
 
     def to_dict(self) -> dict[str, Any]:
         return _compact_payload(
-            super().to_dict(),
+            DictSerializable.to_dict(self),
             drop_empty=("args", "output_ref", "context_frame_id", "evidence_handles", "metadata"),
         )
 
@@ -1356,7 +1419,7 @@ class DecodeHint(DictSerializable):
 
     def to_dict(self) -> dict[str, Any]:
         return _compact_payload(
-            super().to_dict(),
+            DictSerializable.to_dict(self),
             drop_empty=("entity_ids", "metadata"),
         )
 
@@ -1395,7 +1458,7 @@ class CanonicalReasoningGraph(DictSerializable):
 
     def to_dict(self) -> dict[str, Any]:
         return _compact_payload(
-            super().to_dict(),
+            DictSerializable.to_dict(self),
             drop_empty=("entities", "activities", "agents", "bundles"),
         )
 
@@ -1472,6 +1535,42 @@ class CandidateTrace(DictSerializable):
 
 
 @dataclass(slots=True, frozen=True)
+class CompressionHint(DictSerializable):
+    """Typed upstream structure hint that can seed deterministic macro proposals."""
+
+    hint_id: str
+    hint_type: CompressionHintType
+    signature: tuple[str, ...]
+    source_component: str
+    reason: str
+    weight: float = 0.0
+    supporting_refs: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        _require(bool(self.hint_id.strip()), "CompressionHint.hint_id must not be empty.")
+        _require(bool(self.source_component.strip()), "CompressionHint.source_component must not be empty.")
+        _require(bool(self.reason.strip()), "CompressionHint.reason must not be empty.")
+        _require(len(self.signature) > 0, "CompressionHint.signature must not be empty.")
+        _require(0.0 <= self.weight <= 1.0, "CompressionHint.weight must be between 0 and 1.")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CompressionHint:
+        return cls(
+            hint_id=str(data["hint_id"]),
+            hint_type=_parse_enum(CompressionHintType, data.get("hint_type", CompressionHintType.SHARED_SUBPROOF)),
+            signature=tuple(str(item) for item in data.get("signature", [])),
+            source_component=str(data.get("source_component", "")),
+            reason=str(data.get("reason", "")),
+            weight=float(data.get("weight", 0.0)),
+            supporting_refs=tuple(str(item) for item in data.get("supporting_refs", [])),
+            metadata={str(key): value for key, value in dict(data.get("metadata", {})).items()},
+            created_at=_parse_datetime(data.get("created_at", utc_now())),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class CompressedTrace(DictSerializable):
     """Compressed reasoning chain used by critic and compressor."""
 
@@ -1489,6 +1588,7 @@ class CompressedTrace(DictSerializable):
     evidence_handles: tuple[str, ...] = ()
     context_frames: tuple[ContextFrame, ...] = ()
     candidate_traces: tuple[CandidateTrace, ...] = ()
+    compression_hints: tuple[CompressionHint, ...] = ()
     proof_hash: str = ""
     decode_hints: tuple[DecodeHint, ...] = ()
     created_at: datetime = field(default_factory=utc_now)
@@ -1500,7 +1600,7 @@ class CompressedTrace(DictSerializable):
 
     def to_dict(self) -> dict[str, Any]:
         payload = _compact_payload(
-            super().to_dict(),
+            DictSerializable.to_dict(self),
             drop_empty=(
                 "expanded_preview",
                 "macros_used",
@@ -1513,6 +1613,7 @@ class CompressedTrace(DictSerializable):
                 "evidence_handles",
                 "context_frames",
                 "candidate_traces",
+                "compression_hints",
                 "proof_hash",
                 "decode_hints",
             ),
@@ -1566,6 +1667,9 @@ class CompressedTrace(DictSerializable):
         )
         candidate_traces = tuple(
             CandidateTrace.from_dict(item) for item in data.get("candidate_traces", [])
+        )
+        compression_hints = tuple(
+            CompressionHint.from_dict(item) for item in data.get("compression_hints", [])
         )
         decode_hints = tuple(DecodeHint.from_dict(item) for item in data.get("decode_hints", []))
         created_at = _parse_datetime(data.get("created_at", utc_now()))
@@ -1634,6 +1738,7 @@ class CompressedTrace(DictSerializable):
             evidence_handles=evidence_handles,
             context_frames=context_frames,
             candidate_traces=candidate_traces,
+            compression_hints=compression_hints,
             proof_hash=str(data.get("proof_hash", "")),
             decode_hints=decode_hints,
             created_at=created_at,
@@ -5993,6 +6098,22 @@ class ShellState(DictSerializable):
     compression_state: str = "idle"
     optimizer_state: str = "idle"
     coding_state: str = "idle"
+    workspace_mode: str = "assistant"
+    active_route_summary: tuple[str, ...] = ()
+    active_model_roles: tuple[str, ...] = ()
+    candidate_count: int = 0
+    evidence_count: int = 0
+    elapsed_seconds: float = 0.0
+    current_file: str = ""
+    current_project: str = ""
+    sandbox_state: str = "idle"
+    quality_gate_state: str = "idle"
+    pattern_tier_counts: dict[str, int] = field(default_factory=dict)
+    practice_session_state: str = "idle"
+    approval_prompt_summary: str = ""
+    resource_ribbon_flags: tuple[str, ...] = ()
+    panel_visibility_state: dict[str, bool] = field(default_factory=dict)
+    hero_metric_strip: tuple[str, ...] = ()
     long_horizon_state: str = ""
     checkpoint_count: int = 0
     degraded_reason: str = ""
@@ -6032,6 +6153,28 @@ class ShellState(DictSerializable):
             compression_state=str(data.get("compression_state", "idle")),
             optimizer_state=str(data.get("optimizer_state", "idle")),
             coding_state=str(data.get("coding_state", "idle")),
+            workspace_mode=str(data.get("workspace_mode", "assistant")),
+            active_route_summary=tuple(str(item) for item in data.get("active_route_summary", ())),
+            active_model_roles=tuple(str(item) for item in data.get("active_model_roles", ())),
+            candidate_count=int(data.get("candidate_count", 0)),
+            evidence_count=int(data.get("evidence_count", 0)),
+            elapsed_seconds=float(data.get("elapsed_seconds", 0.0) or 0.0),
+            current_file=str(data.get("current_file", "")),
+            current_project=str(data.get("current_project", "")),
+            sandbox_state=str(data.get("sandbox_state", "idle")),
+            quality_gate_state=str(data.get("quality_gate_state", "idle")),
+            pattern_tier_counts={
+                str(key): int(value)
+                for key, value in dict(data.get("pattern_tier_counts", {})).items()
+            },
+            practice_session_state=str(data.get("practice_session_state", "idle")),
+            approval_prompt_summary=str(data.get("approval_prompt_summary", "")),
+            resource_ribbon_flags=tuple(str(item) for item in data.get("resource_ribbon_flags", ())),
+            panel_visibility_state={
+                str(key): bool(value)
+                for key, value in dict(data.get("panel_visibility_state", {})).items()
+            },
+            hero_metric_strip=tuple(str(item) for item in data.get("hero_metric_strip", ())),
             long_horizon_state=str(data.get("long_horizon_state", "")),
             checkpoint_count=int(data.get("checkpoint_count", 0)),
             degraded_reason=str(data.get("degraded_reason", "")),
@@ -6272,6 +6415,15 @@ def coerce_optimizer_proposal_record(
     if isinstance(value, OptimizerProposalRecord):
         return value
     return OptimizerProposalRecord.from_dict(value)
+
+
+def coerce_macro_effectiveness_record(
+    value: MacroEffectivenessRecord | Mapping[str, Any],
+) -> MacroEffectivenessRecord:
+    """Convert mapping payloads to MacroEffectivenessRecord while preserving existing values."""
+    if isinstance(value, MacroEffectivenessRecord):
+        return value
+    return MacroEffectivenessRecord.from_dict(value)
 
 
 def coerce_optimizer_activation_record(

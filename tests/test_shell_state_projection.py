@@ -16,6 +16,22 @@ def _build_headless_config():
     return replace(APP_CONFIG, dashboard=replace(APP_CONFIG.dashboard, enable_ui=False))
 
 
+def _cleanup_qt() -> None:
+    if not pyside6_available():
+        return
+    from PySide6 import QtCore, QtWidgets
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    app.closeAllWindows()
+    QtCore.QCoreApplication.sendPostedEvents(None, 0)
+    app.processEvents()
+    app.quit()
+    QtCore.QCoreApplication.sendPostedEvents(None, 0)
+    app.processEvents()
+
+
 class _FakeVar:
     def __init__(self, value):
         self._value = value
@@ -145,6 +161,10 @@ class ShellStateProjectionTests(unittest.TestCase):
         self.assertEqual(shell_state.long_horizon_state, "running")
         self.assertEqual(shell_state.resource_pressure_level, "elevated")
         self.assertEqual(shell_state.observation_tier, "ocr_on_step")
+        self.assertEqual(shell_state.workspace_mode, "assistant")
+        self.assertEqual(shell_state.approval_prompt_summary, "Approve browser click")
+        self.assertIn("pressure:elevated", shell_state.resource_ribbon_flags)
+        self.assertTrue(shell_state.panel_visibility_state["resource_ribbon"])
         self.assertIn("desktop", shell_state.active_tools)
         self.assertTrue(any(chip.label == "Approval Needed" for chip in shell_state.activity_chips))
 
@@ -243,6 +263,9 @@ class ShellStateProjectionTests(unittest.TestCase):
         testing_state = dashboard.shell_state_snapshot()
         self.assertEqual(testing_state.orb_mode, "code_testing")
         self.assertEqual(testing_state.coding_state, "testing")
+        self.assertEqual(testing_state.workspace_mode, "coding_workspace")
+        self.assertEqual(testing_state.sandbox_state, "running")
+        self.assertEqual(testing_state.quality_gate_state, "running")
         self.assertTrue(any(chip.label == "Coding Mode" for chip in testing_state.activity_chips))
 
         dashboard.publish_event(
@@ -257,6 +280,17 @@ class ShellStateProjectionTests(unittest.TestCase):
                     "summary": "Completed a bounded coding task.",
                     "language": "python",
                     "role_assignments": {"generator": "stub"},
+                    "route_summary": ("generator:stub-model", "reviewer:stub-reviewer"),
+                    "artifacts": (
+                        {
+                            "artifact_id": "artifact-code",
+                            "artifact_type": "code",
+                            "title": "Generated Code",
+                            "language": "python",
+                            "path": "sandbox:solution.py",
+                            "content_preview": "def helper():\n    return 1\n",
+                        },
+                    ),
                     "quality_report": {
                         "tests_passed": True,
                         "lint_passed": True,
@@ -286,12 +320,27 @@ class ShellStateProjectionTests(unittest.TestCase):
         self.assertEqual(learning_state.orb_mode, "code_learning")
         self.assertEqual(learning_state.verifier_state, "verified")
         self.assertEqual(learning_state.coding_state, "completed")
+        self.assertEqual(learning_state.workspace_mode, "coding_workspace")
+        self.assertEqual(learning_state.sandbox_state, "completed")
+        self.assertEqual(learning_state.quality_gate_state, "passed")
+        self.assertEqual(learning_state.current_file, "sandbox:solution.py")
+        self.assertEqual(learning_state.current_project, "sandbox")
+        self.assertEqual(learning_state.active_route_summary, ("generator:stub-model", "reviewer:stub-reviewer"))
+        self.assertEqual(learning_state.pattern_tier_counts["verified"], 1)
+        self.assertIn("Quality 0.90", learning_state.hero_metric_strip)
         self.assertTrue(learning_state.orb_effects.verification_lock_pending)
 
 
 class PySideDashboardServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self) -> None:
+        _cleanup_qt()
+
     async def test_dashboard_service_can_start_and_stop_pyside_shell_when_requested(self) -> None:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        if pyside6_available():
+            from PySide6 import QtWidgets
+
+            _ = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         config = replace(APP_CONFIG, dashboard=replace(APP_CONFIG.dashboard, enable_ui=True))
         dashboard = DashboardService(config=config)
         dashboard.apply_user_settings(
@@ -306,13 +355,7 @@ class PySideDashboardServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(dashboard.ui_running)
         finally:
             await dashboard.stop()
-            if pyside6_available():
-                from PySide6 import QtWidgets
-
-                app = QtWidgets.QApplication.instance()
-                if app is not None:
-                    app.quit()
-                    app.processEvents()
+            _cleanup_qt()
         self.assertFalse(dashboard.ui_running)
 
 

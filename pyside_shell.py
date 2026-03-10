@@ -35,9 +35,11 @@ if QtWidgets is not None:  # pragma: no branch
             "vivid_blue": ("#59c7ff", "#08121f", "#ecfbff"),
             "cyan_blue": ("#79d1ff", "#071722", "#f0fdff"),
             "blue_gold": ("#8ab8ff", "#101522", "#fff4db"),
+            "green_blue": ("#73d7c4", "#08171a", "#e7fff8"),
             "amber_gold": ("#ffb85a", "#1a120b", "#fff4cb"),
             "focused_yellow": ("#ffd760", "#171208", "#fff8d8"),
             "deep_red": ("#ff646e", "#19080d", "#ffe0d5"),
+            "indigo_gold": ("#9d9cff", "#0f0d1b", "#fff0c9"),
             "violet_magenta": ("#c98bff", "#12091a", "#ffe8ff"),
             "white_gold": ("#ffe4a1", "#17140c", "#ffffff"),
             "cyan_white": ("#b5ecff", "#09131c", "#ffffff"),
@@ -97,6 +99,10 @@ if QtWidgets is not None:  # pragma: no branch
         def _on_tick(self) -> None:
             self._phase = (self._phase + (0.025 if self._reduced_motion else 0.04)) % (math.tau * 8.0)
             self.update()
+
+        def shutdown(self) -> None:
+            if self._timer.isActive():
+                self._timer.stop()
 
         def _palette(self) -> tuple[QtGui.QColor, QtGui.QColor, QtGui.QColor]:
             theme = _theme(self._shell_state)
@@ -287,6 +293,10 @@ if QtWidgets is not None:  # pragma: no branch
             self._status = QtWidgets.QLabel(alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
             self._sub_status = QtWidgets.QLabel(alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
             self._sub_status.setWordWrap(True)
+            self._hero_metrics = QtWidgets.QLabel(alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+            self._hero_metrics.setWordWrap(True)
+            self._route_summary = QtWidgets.QLabel(alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+            self._route_summary.setWordWrap(True)
             self._activity_bar = QtWidgets.QWidget(central)
             self._activity_layout = QtWidgets.QHBoxLayout(self._activity_bar)
             self._activity_layout.setContentsMargins(0, 0, 0, 0)
@@ -297,6 +307,8 @@ if QtWidgets is not None:  # pragma: no branch
             root.addWidget(self._orb, stretch=5)
             root.addWidget(self._status)
             root.addWidget(self._sub_status)
+            root.addWidget(self._hero_metrics)
+            root.addWidget(self._route_summary)
             root.addWidget(self._activity_bar)
             root.addWidget(self._notification)
             self._conversation_scroll = QtWidgets.QScrollArea(central)
@@ -454,7 +466,29 @@ if QtWidgets is not None:  # pragma: no branch
             self._orb.set_shell_state(shell_state)
             self._status.setText(shell_state.status_text)
             self._sub_status.setText(shell_state.sub_status_text or shell_state.current_task_summary)
+            self._input.setPlaceholderText(
+                "Describe the coding task..."
+                if shell_state.workspace_mode == "coding_workspace"
+                else "Type a message..."
+            )
+            hero_metrics = "   |   ".join(shell_state.hero_metric_strip)
+            self._hero_metrics.setText(hero_metrics)
+            self._hero_metrics.setVisible(bool(hero_metrics))
+            route_bits = []
+            if shell_state.current_project:
+                route_bits.append(f"Project {shell_state.current_project}")
+            if shell_state.current_file:
+                route_bits.append(f"File {shell_state.current_file}")
+            if shell_state.active_route_summary:
+                route_bits.append("Routes " + " | ".join(shell_state.active_route_summary[:4]))
+            route_summary = "   |   ".join(route_bits)
+            self._route_summary.setText(route_summary)
+            self._route_summary.setToolTip(route_summary)
+            self._route_summary.setVisible(bool(route_summary))
             self._notification.setText(shell_state.shell_notifications[-1].message if shell_state.shell_notifications else "")
+            self._ribbon.setVisible(bool(shell_state.panel_visibility_state.get("resource_ribbon", True)))
+            self._activity_bar.setVisible(bool(shell_state.panel_visibility_state.get("activity_strip", True)))
+            self._notification.setVisible(bool(shell_state.panel_visibility_state.get("notifications", True)))
             _clear(self._activity_layout)
             self._activity_layout.addStretch(1)
             theme = _theme(shell_state)
@@ -548,6 +582,10 @@ if QtWidgets is not None:  # pragma: no branch
                 ribbon_parts.append("Cloud helper available")
             if self._shell_state.observation_tier and self._shell_state.observation_tier != "screenshot_on_demand":
                 ribbon_parts.append(f"Observation {self._shell_state.observation_tier}")
+            for flag in self._shell_state.resource_ribbon_flags:
+                label = flag.replace("_", " ").replace(":", " ").strip().title()
+                if label and label not in ribbon_parts:
+                    ribbon_parts.append(label)
             self._ribbon.setText("   |   ".join(ribbon_parts))
 
         def _apply_theme(self) -> None:
@@ -574,12 +612,23 @@ if QtWidgets is not None:  # pragma: no branch
             )
             self._status.setStyleSheet(f"font-size: 34px; font-weight: 700; color: {theme['highlight']};")
             self._sub_status.setStyleSheet(f"font-size: 15px; color: {theme['muted']};")
+            self._hero_metrics.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {theme['highlight']};")
+            self._route_summary.setStyleSheet(f"font-size: 12px; color: {theme['muted']};")
             self._notification.setStyleSheet(f"font-size: 13px; color: {theme['warning'] if self._shell_state.approval_pending or self._shell_state.degraded_reason else theme['muted']};")
             self._ribbon.setStyleSheet(f"padding: 8px 12px; border-radius: 14px; background: rgba(255,255,255,0.03); border: 1px solid {theme['edge']}; color: {theme['muted']};")
 
         @QtCore.Slot()
         def shutdown(self) -> None:
+            if self._timer.isActive():
+                self._timer.stop()
+            self._orb.shutdown()
             self.close()
+
+        def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # pragma: no cover - exercised in UI tests
+            if self._timer.isActive():
+                self._timer.stop()
+            self._orb.shutdown()
+            super().closeEvent(event)
 
 
     class PySideShellHost:
@@ -644,8 +693,12 @@ if QtWidgets is not None:  # pragma: no branch
         def stop(self, timeout_s: float = 5.0) -> None:
             if self._attached_mode:
                 if self._window is not None:
-                    self._window.close()
+                    self._window.shutdown()
+                    self._window.deleteLater()
                 if self._app is not None:
+                    self._app.closeAllWindows()
+                    self._app.processEvents()
+                    QtCore.QCoreApplication.sendPostedEvents(None, 0)
                     self._app.processEvents()
                 self._window = None
                 self._app = None
@@ -654,9 +707,18 @@ if QtWidgets is not None:  # pragma: no branch
             if self._window is not None:
                 QtCore.QMetaObject.invokeMethod(self._window, "shutdown", QtCore.Qt.ConnectionType.QueuedConnection)
             if self._app is not None:
+                QtCore.QMetaObject.invokeMethod(
+                    self._app,
+                    "closeAllWindows",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                )
                 QtCore.QMetaObject.invokeMethod(self._app, "quit", QtCore.Qt.ConnectionType.QueuedConnection)
             if self._thread and self._thread.is_alive():
                 self._thread.join(timeout=timeout_s)
+            self._stopped.wait(timeout=timeout_s)
+            self._thread = None
+            self._window = None
+            self._app = None
 
         def _run(self) -> None:  # pragma: no cover - exercised through host smoke coverage
             try:
