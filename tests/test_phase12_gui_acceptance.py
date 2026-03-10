@@ -245,6 +245,19 @@ class Phase12GuiAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(export_path.exists())
         self.assertEqual(state.selected_task.trace_debug_export_path, str(export_path))
 
+    async def test_support_bundle_action_exports_bundle_for_shell_shortcuts(self) -> None:
+        export_dir = self.test_logs / "phase12_shell_support_bundle"
+
+        await self.orchestrator._run_dashboard_action(
+            action="support.export_bundle",
+            payload={"path": str(export_dir)},
+        )
+
+        state = self.orchestrator.dashboard.app_state_snapshot()
+        self.assertTrue((export_dir / "support_bundle_manifest.json").exists())
+        self.assertTrue((export_dir / "packaged_onboarding.txt").exists())
+        self.assertIn("Exported support bundle", state.last_notice)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -243,27 +243,27 @@
 - [x] Create a user message card style.
 - [x] Create an assistant answer card style.
 - [x] Create system/tool/status card styles.
-- [ ] Create an active task card that shows:
-  - [ ] current phase
-  - [ ] elapsed time
-  - [ ] candidate count
-  - [ ] evidence count
-  - [ ] verification state
-  - [ ] fallback status
-  - [ ] confidence band
-  - [ ] route summary
-- [ ] Create a final answer card that shows:
-  - [ ] final answer
-  - [ ] evidence summary
-  - [ ] citations
-  - [ ] warnings
-  - [ ] verification result
-  - [ ] degraded or uncertainty notes
-  - [ ] export shortcuts
-- [ ] Add expandable sections:
-  - [ ] Why this answer
-  - [ ] How it was verified
-  - [ ] What deep mode changed
+- [x] Create an active task card that shows:
+  - [x] current phase
+  - [x] elapsed time
+  - [x] candidate count
+  - [x] evidence count
+  - [x] verification state
+  - [x] fallback status
+  - [x] confidence band
+  - [x] route summary
+- [x] Create a final answer card that shows:
+  - [x] final answer
+  - [x] evidence summary
+  - [x] citations
+  - [x] warnings
+  - [x] verification result
+  - [x] degraded or uncertainty notes
+  - [x] export shortcuts
+- [x] Add expandable sections:
+  - [x] Why this answer
+  - [x] How it was verified
+  - [x] What deep mode changed
 - [ ] Add entry transitions for new cards.
 - [ ] Keep auto-scroll bounded and non-jarring.
 - [ ] Keep the surface readable without overpowering the orb.
@@ -271,23 +271,23 @@
 ## Phase 11 - Input Dock and Task Controls
 - [x] Build a premium bottom input dock.
 - [ ] Add:
-  - [ ] mic/voice button
-  - [ ] text input
-  - [ ] send button
-  - [ ] thinking-time slider
-  - [ ] quick mode buttons
-  - [ ] stop button during active runs
-  - [ ] pause/resume for long-horizon runs
+  - [x] mic/voice button
+  - [x] text input
+  - [x] send button
+  - [x] thinking-time slider
+  - [x] quick mode buttons
+  - [x] stop button during active runs
+  - [x] pause/resume for long-horizon runs
 - [ ] Add quick mode buttons:
-  - [ ] Fast
-  - [ ] Deep
-  - [ ] Long Horizon
+  - [x] Fast
+  - [x] Deep
+  - [x] Long Horizon
 - [ ] Add optional compact toggles:
-  - [ ] Web Allowed
-  - [ ] Verification Priority
-  - [ ] Local Only
-  - [ ] Capability Session Enabled
-  - [ ] Cloud Helper Allowed
+  - [x] Web Allowed
+  - [x] Verification Priority
+  - [x] Local Only
+  - [x] Capability Session Enabled
+  - [x] Cloud Helper Allowed
 - [ ] Add state-reactive glow and focus styling.
 - [ ] Add keyboard shortcuts.
 - [ ] Keep disabled and busy states readable.
@@ -306,8 +306,8 @@
 - [x] Build a right-side operator drawer.
 - [x] Move evidence inspector into the drawer.
 - [x] Move macro/provenance inspector into the drawer.
-- [ ] Move compressor insights into the drawer.
-- [ ] Move optimizer suggestions into the drawer.
+- [x] Move compressor insights into the drawer.
+- [x] Move optimizer suggestions into the drawer.
 - [x] Move runtime health into the drawer.
 - [x] Move local-AI control plane into the drawer.
 - [ ] Keep each section readable in compact and expanded states.
@@ -330,33 +330,33 @@
 - [ ] Make timeline snapshots exportable into task history.
 
 ## Phase 15 - Long-Horizon Tray
-- [ ] Build a dedicated long-horizon session tray.
+- [x] Build a dedicated long-horizon session tray.
 - [ ] Show:
-  - [ ] elapsed time
-  - [ ] current cycle type
-  - [ ] checkpoint count
-  - [ ] candidate growth
-  - [ ] verification passes
-  - [ ] evidence refresh count
-  - [ ] confidence improvement trend
-  - [ ] advisory suggestions considered
-  - [ ] early-stop reason
-- [ ] Add pause/resume/cancel controls.
+  - [x] elapsed time
+  - [x] current cycle type
+  - [x] checkpoint count
+  - [x] candidate growth
+  - [x] verification passes
+  - [x] evidence refresh count
+  - [x] confidence improvement trend
+  - [x] advisory suggestions considered
+  - [x] early-stop reason
+- [x] Add pause/resume/cancel controls.
 - [ ] Add a duty-cycle visualization.
 - [ ] Add resource-throttle notices when long-horizon work is intentionally slowed.
-- [ ] Add "what extra time bought" summaries.
+- [x] Add "what extra time bought" summaries.
 
 ## Phase 16 - Local-AI Control Plane
 - [ ] Turn the existing model and routing surface into a flagship panel.
 - [ ] Show:
-  - [ ] installed local roles
-  - [ ] active routed roles
-  - [ ] current routing decision
-  - [ ] heavy-slot usage
+  - [x] installed local roles
+  - [x] active routed roles
+  - [x] current routing decision
+  - [x] heavy-slot usage
   - [ ] sidecar helpers
-  - [ ] fallback reasons
-  - [ ] readiness gaps
-  - [ ] route history
+  - [x] fallback reasons
+  - [x] readiness gaps
+  - [x] route history
   - [ ] optimizer suggestions relevant to routing
 - [ ] Add quick actions:
   - [ ] warm model
@@ -366,36 +366,36 @@
   - [ ] test ping
   - [ ] inspect fallback reason
   - [ ] open readiness guidance
-- [ ] Add structured route summaries to the active task card and answer card where relevant.
+- [x] Add structured route summaries to the active task card and answer card where relevant.
 
 ## Phase 17 - Capability and Session UX
-- [ ] Surface compact capability context in the main shell:
-  - [ ] active session badge
-  - [ ] target app/window badge
-  - [ ] pending approval pill
-  - [ ] observation tier badge
-  - [ ] last action preview
-  - [ ] policy state summary
+- [x] Surface compact capability context in the main shell:
+  - [x] active session badge
+  - [x] target app/window badge
+  - [x] pending approval pill
+  - [x] observation tier badge
+  - [x] last action preview
+  - [x] policy state summary
 - [ ] Keep full capability registry and audit trail in secondary views.
-- [ ] Build shell-consistent approval prompts.
-- [ ] Make approval prompts clearly explain:
-  - [ ] what action is requested
-  - [ ] why approval is needed
-  - [ ] what the target is
-  - [ ] what the risk level is
-- [ ] Keep approval state visible in the orb and activity strip.
+- [x] Build shell-consistent approval prompts.
+- [x] Make approval prompts clearly explain:
+  - [x] what action is requested
+  - [x] why approval is needed
+  - [x] what the target is
+  - [x] what the risk level is
+- [x] Keep approval state visible in the orb and activity strip.
 
 ## Phase 18 - Secondary Sheets and Views
 - [x] Build lower sheets or modal views for:
   - [x] task history
-  - [ ] run inspector
+  - [x] run inspector
   - [x] knowledge library
   - [x] settings
   - [x] readiness/preflight
   - [x] capability details
   - [x] debug/event log
 - [ ] Restyle existing surfaces to match the new shell without removing functionality.
-- [ ] Keep export and import actions reachable.
+- [x] Keep export and import actions reachable.
 - [ ] Keep debug raw-event access available but de-emphasized.
 
 ## Phase 19 - Shell-Wide Reactivity
@@ -417,31 +417,31 @@
 
 ## Phase 20 - Settings, Presets, and Accessibility
 - [ ] Add persisted visual settings:
-  - [ ] orb size
-  - [ ] animation intensity
-  - [ ] reduced motion
-  - [ ] ambient reactivity
-  - [ ] particle density
-  - [ ] side drawer defaults
-  - [ ] activity strip visibility
-  - [ ] task timeline visibility
-  - [ ] resource ribbon visibility
-  - [ ] notification visibility
+  - [x] orb size
+  - [x] animation intensity
+  - [x] reduced motion
+  - [x] ambient reactivity
+  - [x] particle density
+  - [x] side drawer defaults
+  - [x] activity strip visibility
+  - [x] task timeline visibility
+  - [x] resource ribbon visibility
+  - [x] notification visibility
 - [ ] Add persisted performance settings:
-  - [ ] low-resource mode
-  - [ ] reduced-effects mode
-  - [ ] animation frame cap
-  - [ ] simplified orb mode
+  - [x] low-resource mode
+  - [x] reduced-effects mode
+  - [x] animation frame cap
+  - [x] simplified orb mode
 - [ ] Add presets:
-  - [ ] Minimal
-  - [ ] Balanced
-  - [ ] Immersive
+  - [x] Minimal
+  - [x] Balanced
+  - [x] Immersive
 - [ ] Add accessibility controls:
-  - [ ] low motion
-  - [ ] higher contrast
-  - [ ] larger status text
-  - [ ] simpler accent behavior
-- [ ] Keep settings import/export compatible with existing profiles.
+  - [x] low motion
+  - [x] higher contrast
+  - [x] larger status text
+  - [x] simpler accent behavior
+- [x] Keep settings import/export compatible with existing profiles.
 
 ## Phase 21 - Performance and Rendering Bounds
 - [ ] Add a shared animation clock strategy rather than per-widget free-running loops.
@@ -456,65 +456,65 @@
 - [ ] Ensure resize, drawer animation, and event bursts remain responsive.
 
 ## Phase 22 - Packaging and Startup
-- [ ] Update packaged app entrypoints so the PySide6 shell becomes the default UI.
+- [x] Update packaged app entrypoints so the PySide6 shell becomes the default UI.
 - [ ] Keep source-from-repo workflow valid.
-- [ ] Ensure first-run onboarding matches the new shell language and layout.
-- [ ] Ensure preflight/readiness can be opened from the new shell.
+- [x] Ensure first-run onboarding matches the new shell language and layout.
+- [x] Ensure preflight/readiness can be opened from the new shell.
 - [ ] Ensure startup failures still degrade safely to stub mode with readable guidance.
-- [ ] Ensure diagnostics and support bundle export remain reachable.
+- [x] Ensure diagnostics and support bundle export remain reachable.
 - [ ] Ensure packaged build includes the required PySide6 runtime pieces.
 
 ## Phase 23 - Regression and Test Coverage
-- [ ] Keep all current backend tests green.
-- [ ] Add shell-state mapping tests for:
-  - [ ] idle
-  - [ ] listening
-  - [ ] planning
-  - [ ] local retrieval
-  - [ ] web retrieval
-  - [ ] fast reasoning
-  - [ ] deep reasoning
-  - [ ] critic verification
-  - [ ] compression
-  - [ ] responding
-  - [ ] speaking
-  - [ ] degraded mode
-  - [ ] approval pending
-  - [ ] error
-  - [ ] offline
+- [x] Keep all current backend tests green.
+- [x] Add shell-state mapping tests for:
+  - [x] idle
+  - [x] listening
+  - [x] planning
+  - [x] local retrieval
+  - [x] web retrieval
+  - [x] fast reasoning
+  - [x] deep reasoning
+  - [x] critic verification
+  - [x] compression
+  - [x] responding
+  - [x] speaking
+  - [x] degraded mode
+  - [x] approval pending
+  - [x] error
+  - [x] offline
 - [x] Add PySide6 widget tests for:
   - [x] shell launch
   - [x] shell shutdown
-  - [ ] orb demo states
-  - [ ] drawer open/close
-  - [ ] timeline population
+  - [x] orb demo states
+  - [x] drawer open/close
+  - [x] timeline population
   - [x] conversation/task cards
   - [x] resource ribbon
-  - [ ] settings persistence
-  - [ ] reduced-effects mode
-  - [ ] low-resource mode
-  - [ ] resize behavior
+  - [x] settings persistence
+  - [x] reduced-effects mode
+  - [x] low-resource mode
+  - [x] resize behavior
 - [ ] Add flow tests for:
-  - [ ] stub-mode launch
-  - [ ] real-mode launch
-  - [ ] fast task
-  - [ ] deep task
-  - [ ] long-horizon task
-  - [ ] degraded/fallback path
-  - [ ] web fallback
-  - [ ] critic rejection
-  - [ ] compressor activity
-  - [ ] optimizer advisory visibility
-  - [ ] task history access
-  - [ ] knowledge library access
-  - [ ] settings/profile round-trip
-  - [ ] readiness/preflight flow
-  - [ ] local-AI control plane flow
-  - [ ] capability session visibility
-  - [ ] approval flow
-  - [ ] packaged Windows launch
-  - [ ] event burst throttling
-- [ ] Run Qt tests in offscreen mode for CI stability.
+  - [x] stub-mode launch
+  - [x] real-mode launch
+  - [x] fast task
+  - [x] deep task
+  - [x] long-horizon task
+  - [x] degraded/fallback path
+  - [x] web fallback
+  - [x] critic rejection
+  - [x] compressor activity
+  - [x] optimizer advisory visibility
+  - [x] task history access
+  - [x] knowledge library access
+  - [x] settings/profile round-trip
+  - [x] readiness/preflight flow
+  - [x] local-AI control plane flow
+  - [x] capability session visibility
+  - [x] approval flow
+  - [x] packaged Windows launch
+  - [x] event burst throttling
+- [x] Run Qt tests in offscreen mode for CI stability.
 
 ## Phase 24 - Rollout Order
 - [ ] Step 1: finish the backend/UI host split.

@@ -4493,13 +4493,26 @@ class UserSettingsProfile(DictSerializable):
             "app_shell": "tkinter",
             "shell_variant": "classic_dashboard",
             "lightweight_mode": False,
+            "low_resource_mode": False,
             "show_utility_drawer": False,
             "reduced_motion": False,
+            "reduced_effects_mode": False,
+            "simple_orb_mode": False,
             "activity_strip_visible": True,
             "task_timeline_visible": True,
             "resource_ribbon_visible": True,
             "shell_notifications_visible": True,
+            "left_drawer_visible": True,
+            "right_drawer_visible": True,
             "shell_preset": "balanced",
+            "animation_frame_cap": 30,
+            "orb_size": 100,
+            "animation_intensity": 1.0,
+            "ambient_reactivity": True,
+            "particle_density": "balanced",
+            "status_text_scale": 1.0,
+            "higher_contrast": False,
+            "simple_accents": False,
         }
     )
     updated_at: datetime = field(default_factory=utc_now)
@@ -4604,13 +4617,26 @@ class UserSettingsProfile(DictSerializable):
             "app_shell": "tkinter",
             "shell_variant": "classic_dashboard",
             "lightweight_mode": False,
+            "low_resource_mode": False,
             "show_utility_drawer": False,
             "reduced_motion": False,
+            "reduced_effects_mode": False,
+            "simple_orb_mode": False,
             "activity_strip_visible": True,
             "task_timeline_visible": True,
             "resource_ribbon_visible": True,
             "shell_notifications_visible": True,
+            "left_drawer_visible": True,
+            "right_drawer_visible": True,
             "shell_preset": "balanced",
+            "animation_frame_cap": 30,
+            "orb_size": 100,
+            "animation_intensity": 1.0,
+            "ambient_reactivity": True,
+            "particle_density": "balanced",
+            "status_text_scale": 1.0,
+            "higher_contrast": False,
+            "simple_accents": False,
             **dict(self.ui),
         }
         object.__setattr__(self, "ui", canonical_ui)
@@ -4768,6 +4794,28 @@ class UserSettingsProfile(DictSerializable):
         _require(
             shell_preset in {"minimal", "balanced", "immersive"},
             "ui.shell_preset must be minimal, balanced, or immersive.",
+        )
+        particle_density = str(self.ui.get("particle_density", "balanced")).strip().lower()
+        _require(
+            particle_density in {"minimal", "balanced", "immersive"},
+            "ui.particle_density must be minimal, balanced, or immersive.",
+        )
+        animation_frame_cap = int(self.ui.get("animation_frame_cap", 30) or 30)
+        _require(
+            10 <= animation_frame_cap <= 120,
+            "ui.animation_frame_cap must stay between 10 and 120 FPS.",
+        )
+        orb_size = int(self.ui.get("orb_size", 100) or 100)
+        _require(60 <= orb_size <= 160, "ui.orb_size must stay between 60 and 160.")
+        animation_intensity = float(self.ui.get("animation_intensity", 1.0) or 1.0)
+        _require(
+            0.0 <= animation_intensity <= 1.5,
+            "ui.animation_intensity must stay between 0.0 and 1.5.",
+        )
+        status_text_scale = float(self.ui.get("status_text_scale", 1.0) or 1.0)
+        _require(
+            0.8 <= status_text_scale <= 1.6,
+            "ui.status_text_scale must stay between 0.8 and 1.6.",
         )
 
     @classmethod

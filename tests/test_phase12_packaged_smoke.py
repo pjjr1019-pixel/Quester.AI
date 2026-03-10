@@ -146,6 +146,9 @@ class Phase12PackagedSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater((bundle_dir / "events.jsonl").stat().st_size, 0)
         self.assertGreater((bundle_dir / "traces.jsonl").stat().st_size, 0)
         self.assertGreater((bundle_dir / "status.jsonl").stat().st_size, 0)
+        onboarding_text = (bundle_dir / "packaged_onboarding.txt").read_text(encoding="utf-8")
+        self.assertIn("PySide6 orb cockpit", onboarding_text)
+        self.assertIn("Coding Mode remains local-first", onboarding_text)
 
     async def test_packaged_first_run_uses_stub_mode_even_when_real_mode_is_requested_in_config(self) -> None:
         config, bundle_dir = _build_test_config(

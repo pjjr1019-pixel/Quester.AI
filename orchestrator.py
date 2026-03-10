@@ -892,6 +892,7 @@ class Orchestrator:
             recent_reasoning_logs = await self._load_recent_reasoning_logs(
                 limit=self.COMPRESSION_HISTORY_SCAN_LIMIT
             )
+            compression_trace = critique.fixed_trace or reasoning
 
             compression = await self._run_component(
                 "compressor",
@@ -899,7 +900,7 @@ class Orchestrator:
                 start_stage="pipeline.compressor_started",
                 done_stage="pipeline.compressor_done",
                 start_payload={"task_id": task_id},
-                run=lambda: self.compressor.propose(reasoning, logs=recent_reasoning_logs),
+                run=lambda: self.compressor.propose(compression_trace, logs=recent_reasoning_logs),
             )
             await self._emit_event("pipeline.compressor_done", {"task_id": task_id})
             await self._record_status(
@@ -3480,6 +3481,42 @@ class Orchestrator:
                     f"Exported settings profile '{profile_name}' to '{export_path}'.",
                     severity="info",
                 )
+            elif action == "readiness.refresh":
+                await self._publish_dashboard_readiness_report(
+                    active_profile=self.dashboard.app_state_snapshot().user_settings
+                )
+                await self._publish_dashboard_notice(
+                    "Refreshed readiness and packaged startup guidance.",
+                    severity="info",
+                )
+            elif action == "capabilities.refresh":
+                profile = self.dashboard.app_state_snapshot().user_settings
+                await self._publish_dashboard_capability_registry_view(active_profile=profile)
+                await self._publish_dashboard_notice(
+                    "Refreshed capability policy and registry details.",
+                    severity="info",
+                )
+            elif action == "models.refresh":
+                await self._publish_dashboard_model_registry_view()
+                await self._publish_dashboard_notice(
+                    "Refreshed the local AI control plane.",
+                    severity="info",
+                )
+            elif action == "support.export_bundle":
+                export_path_raw = str(payload.get("path", "")).strip()
+                export_path = (
+                    Path(export_path_raw)
+                    if export_path_raw
+                    else self.config.storage.logs_dir / "shell_support_bundle"
+                )
+                bundle = await self.export_packaged_support_bundle(
+                    export_path,
+                    active_profile=self.dashboard.app_state_snapshot().user_settings,
+                )
+                await self._publish_dashboard_notice(
+                    f"Exported support bundle to '{bundle.bundle_dir}'.",
+                    severity="info",
+                )
             elif action.startswith("model."):
                 await self._run_dashboard_model_action(action=action, payload=payload)
             elif action == "history.refresh":
@@ -5254,6 +5291,10 @@ class Orchestrator:
                 "history, knowledge management, and local task controls without heavy model dependencies."
             ),
             (
+                "When the desktop extra is installed, the packaged shell now prefers the PySide6 orb cockpit so "
+                "approvals, coding work, readiness, and diagnostics stay in one operator-facing surface."
+            ),
+            (
                 "Real mode stays opt-in and only becomes the effective packaged mode when both the pinned "
                 "generation and embedding backends are locally ready."
             ),
@@ -5266,6 +5307,10 @@ class Orchestrator:
             (
                 "Privacy boundary: the base runtime stays local-first; optional cloud helpers remain auxiliary-only "
                 "and can offload approved content only after the matching capability is explicitly enabled."
+            ),
+            (
+                "Coding Mode remains local-first too: keep the sandbox, tests, linters, and any security tooling "
+                "ready before trusting validated patch promotion."
             ),
             (
                 f"User data stays on this machine by default in '{data_paths['sqlite_path']}' plus "
@@ -5284,6 +5329,7 @@ class Orchestrator:
         models_dir = self._packaged_data_paths()["models_dir"]
         return (
             "Create a Python 3.11+ environment and install the repo with only the extras you need.",
+            "Install the desktop shell extra with `python -m pip install -e .[desktop]` if you want the PySide6 orb shell.",
             "Install the primary embedding dependency with `python -m pip install -e .[embeddings]`.",
             "Install the persistent vector dependency with `python -m pip install -e .[vector]` if you want the default Chroma store.",
             "Install the fallback generation dependency with `python -m pip install -e .[llama-cpp]` if you want local GGUF fallback.",
@@ -5295,6 +5341,7 @@ class Orchestrator:
                 f"Place the GGUF fallback model `{bundle['generation_fallback'].split(':', 1)[1]}` under "
                 f"`{models_dir}` or update the configured path."
             ),
+            "Install local coding validators such as `pytest`, `ruff`, and any security tooling you expect Coding Mode to surface before enabling validated patch promotion.",
             "Refresh the Readiness tab or export a packaged preflight report after setup changes so the effective launch mode is recalculated from the same shared checks.",
         )
 
@@ -6948,7 +6995,7 @@ class Orchestrator:
             },
             ui={
                 "show_debug_pane": True,
-                "app_shell": "tkinter",
+                "app_shell": "pyside6" if self._dependency_available("PySide6") else "tkinter",
             },
         )
 

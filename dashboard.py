@@ -308,6 +308,7 @@ class DashboardService:
                     shell_state_provider=self.shell_state_snapshot,
                     app_state_provider=self.app_state_snapshot,
                     submit_task=self.request_task_submission,
+                    save_settings=self.request_settings_save,
                     request_action=self.request_action,
                     startup_timeout_s=float(self.config.preflight.flags.startup_timeout_s),
                 )
@@ -1992,7 +1993,17 @@ class DashboardService:
         task = state.active_task
         session = state.local_task_session
         health = state.runtime_health
-        stage = task.running_stage or state.last_stage
+        transient_stage = str(state.last_stage or "")
+        if transient_stage in {
+            "researcher.web_lookup",
+            "researcher.local_lookup",
+            "dashboard.audio_input_loaded",
+            "dashboard.audio_output_loaded",
+            "dashboard.audio_transcript_imported",
+        }:
+            stage = transient_stage
+        else:
+            stage = task.running_stage or transient_stage
         coding_output = state.coding_output
         coding_practice = state.coding_practice
         active_effects = self._active_shell_effects()
@@ -2298,7 +2309,10 @@ class DashboardService:
             "activity_strip": bool(state.user_settings.ui.get("activity_strip_visible", True)),
             "task_timeline": bool(state.user_settings.ui.get("task_timeline_visible", True)),
             "notifications": bool(state.user_settings.ui.get("shell_notifications_visible", True)),
+            "left_drawer": bool(state.user_settings.ui.get("left_drawer_visible", True)),
+            "right_drawer": bool(state.user_settings.ui.get("right_drawer_visible", True)),
             "utility_drawer": bool(state.user_settings.ui.get("show_utility_drawer", False)),
+            "long_horizon_tray": bool(task.long_horizon_session_id or task.execution_mode == "long_horizon"),
         }
         resource_ribbon_flags = self._resource_ribbon_flags(
             coding_state=coding_state,
@@ -2356,8 +2370,16 @@ class DashboardService:
             add_chip("Coding Dojo", "accent", coding_practice.prompt or "practice task")
         if stage == "coding.regression_detected":
             add_chip("Regression Detected", "danger", "Tests or checks failed")
+        if workspace_mode == "coding_workspace" and quality_gate_state not in {"", "idle", "passed"}:
+            add_chip("Validator Gate", "warning", quality_gate_state)
         if deep_mode:
             add_chip("Deep Candidate Pass", "danger", f"{task.candidate_trace_count} candidates")
+        if task.long_horizon_session_id:
+            add_chip(
+                "Long Horizon",
+                "accent",
+                f"{task.long_horizon_completed_cycles}/{task.long_horizon_total_cycles or '?'} checkpoints",
+            )
         if compression_state != "idle":
             add_chip("Compression Review", "accent", compression_state)
         if optimizer_state != "idle":
@@ -2374,6 +2396,21 @@ class DashboardService:
             add_chip("Checkpoint Saved", "info", task.long_horizon_status)
         if resource_pressure_level != "nominal":
             add_chip("Resource Pressure", "warning", health.governor_summary or "Governor active")
+        if cloud_helper_state != "disabled":
+            add_chip("Cloud Helper", "info", cloud_mode)
+        if state.model_registry_view.last_route_decisions:
+            decision = state.model_registry_view.last_route_decisions[0]
+            route_detail = (
+                decision.selected_model_identifier
+                or decision.selected_registration_id
+                or decision.fallback_reason
+                or "route updated"
+            )
+            add_chip(
+                "Route Change",
+                "warning" if decision.used_fallback else "info",
+                route_detail,
+            )
 
         active_overlay = "approval_hold" if approval_pending else ""
         if not active_overlay and has_error:
