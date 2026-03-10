@@ -1,0 +1,11 @@
+name: ci
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - flake8
+  - pytest>=8,<9
+  - pip:
+      - -e .[dev,structured,telemetry,desktop]
