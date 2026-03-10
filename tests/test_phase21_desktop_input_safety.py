@@ -89,6 +89,7 @@ class Phase21DesktopInputSafetyTests(unittest.IsolatedAsyncioTestCase):
             metadata={"expected_window_title": "notes.txt"},
         )
         with (
+            patch.object(CapabilityExecutor, "_desktop_input_supported", return_value=True),
             patch.object(CapabilityExecutor, "_wait_for_window_match", return_value=matched_window),
             patch.object(CapabilityExecutor, "_focus_window", return_value=True),
             patch.object(CapabilityExecutor, "_foreground_window_title", return_value="notes.txt - Notepad"),
@@ -126,6 +127,7 @@ class Phase21DesktopInputSafetyTests(unittest.IsolatedAsyncioTestCase):
             pid=3333,
         )
         with (
+            patch.object(CapabilityExecutor, "_desktop_input_supported", return_value=True),
             patch.object(CapabilityExecutor, "_wait_for_window_match", return_value=matched_window),
             patch.object(CapabilityExecutor, "_focus_window", return_value=True),
             patch.object(
@@ -176,6 +178,7 @@ class Phase21DesktopInputSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.orchestrator._local_task_emergency_stop.set()
 
         with (
+            patch.object(CapabilityExecutor, "_desktop_input_supported", return_value=True),
             patch.object(CapabilityExecutor, "_wait_for_window_match", return_value=matched_window),
             patch.object(CapabilityExecutor, "_focus_window", return_value=True),
             patch.object(CapabilityExecutor, "_foreground_window_title", return_value="notes.txt - Notepad"),

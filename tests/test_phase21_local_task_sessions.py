@@ -114,6 +114,7 @@ class Phase21LocalTaskSessionTests(unittest.IsolatedAsyncioTestCase):
             pid=1111,
         )
         with (
+            patch.object(CapabilityExecutor, "_desktop_input_supported", return_value=True),
             patch.object(CapabilityExecutor, "_wait_for_window_match", return_value=matched_window),
             patch.object(CapabilityExecutor, "_focus_window", return_value=True),
             patch.object(CapabilityExecutor, "_foreground_window_title", return_value="Desktop validation - Notepad"),

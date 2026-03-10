@@ -4294,7 +4294,10 @@ class Orchestrator:
         )
 
     async def _publish_dashboard_coding_patterns(self) -> None:
-        patterns = await self.storage.list_coding_patterns(limit=8)
+        list_patterns = getattr(self.storage, "list_coding_patterns", None)
+        if list_patterns is None:
+            return
+        patterns = await list_patterns(limit=8)
         self.dashboard.publish_event(
             {
                 "stage": "dashboard.coding_patterns_loaded",
@@ -4303,8 +4306,12 @@ class Orchestrator:
         )
 
     async def _publish_dashboard_recent_coding_activity(self) -> None:
-        recent_results = await self.storage.list_coding_task_results(limit=1)
-        recent_practice = await self.storage.list_coding_practice_sessions(limit=1)
+        list_results = getattr(self.storage, "list_coding_task_results", None)
+        list_practice = getattr(self.storage, "list_coding_practice_sessions", None)
+        if list_results is None or list_practice is None:
+            return
+        recent_results = await list_results(limit=1)
+        recent_practice = await list_practice(limit=1)
         if recent_results:
             await self._publish_dashboard_coding_output(recent_results[0])
         if recent_practice:

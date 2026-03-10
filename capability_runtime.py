@@ -1482,7 +1482,7 @@ class CapabilityExecutor:
         spec = request.desktop_input
         if spec is None:
             raise ValueError("Desktop-input execution requires a desktop_input payload.")
-        if os.name != "nt":
+        if not self._desktop_input_supported():
             raise RuntimeError("Desktop-input execution currently requires Windows.")
         target_name = spec.target.strip()
         if not target_name:
@@ -1643,6 +1643,11 @@ class CapabilityExecutor:
                 completed_at=utc_now(),
             )
         raise ValueError(f"Unsupported desktop input action '{action}'.")
+
+    @staticmethod
+    def _desktop_input_supported() -> bool:
+        """Return whether live desktop-input execution is supported in this runtime."""
+        return os.name == "nt"
 
     def _allowlisted_roots(self, profile: UserSettingsProfile) -> tuple[Path, ...]:
         roots = []

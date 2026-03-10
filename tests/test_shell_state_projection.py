@@ -5,11 +5,12 @@ from __future__ import annotations
 import os
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 from config import APP_CONFIG
 from dashboard import DashboardService
 from data_structures import UserSettingsProfile
-from pyside_shell import pyside6_available
+from pyside_shell import PySideShellUnavailableError, pyside6_available
 
 
 def _build_headless_config():
@@ -335,12 +336,30 @@ class PySideDashboardServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         _cleanup_qt()
 
-    async def test_dashboard_service_can_start_and_stop_pyside_shell_when_requested(self) -> None:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        if pyside6_available():
-            from PySide6 import QtWidgets
+    async def test_dashboard_service_reports_clear_error_when_pyside_host_is_unavailable(self) -> None:
+        config = replace(APP_CONFIG, dashboard=replace(APP_CONFIG.dashboard, enable_ui=True))
+        dashboard = DashboardService(config=config)
+        dashboard.apply_user_settings(
+            UserSettingsProfile(
+                profile_name="desktop-shell",
+                ui={"app_shell": "pyside6"},
+            )
+        )
 
-            _ = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with mock.patch(
+            "pyside_shell.PySideShellHost",
+            side_effect=PySideShellUnavailableError("PySide6 is not installed."),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PySide6 shell requested"):
+                await dashboard.start()
+
+    async def test_dashboard_service_can_start_and_stop_pyside_shell_when_requested(self) -> None:
+        if not pyside6_available():
+            self.skipTest("PySide6 is not installed in this environment.")
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+
+        _ = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         config = replace(APP_CONFIG, dashboard=replace(APP_CONFIG.dashboard, enable_ui=True))
         dashboard = DashboardService(config=config)
         dashboard.apply_user_settings(
